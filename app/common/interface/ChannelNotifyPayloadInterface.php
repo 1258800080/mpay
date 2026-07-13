@@ -15,6 +15,13 @@ namespace app\common\interface;
 interface ChannelNotifyPayloadInterface
 {
     /**
+     * 获取网页流水监听运行能力。
+     *
+     * @return array{runtime:'direct'|'browser',prelogin_supported:bool} 监听能力
+     */
+    public function receiptWatcherInfo(): array;
+
+    /**
      * 根据数组载荷定位支付单。
      *
      * @param array<string, mixed> $payload 已归一化的通道通知载荷

@@ -195,6 +195,21 @@ abstract class BasePayment implements PayPluginInterface
     }
 
     /**
+     * 获取网页流水监听运行能力。
+     *
+     * 只有实现 ChannelNotifyPayloadInterface 的插件会使用该声明。具体插件只需在
+     * paymentInfo.receipt_watcher 中声明运行时和是否支持预登录。
+     *
+     * @return array<string, mixed> 网页流水监听能力
+     */
+    public function receiptWatcherInfo(): array
+    {
+        $info = $this->paymentInfo['receipt_watcher'] ?? [];
+
+        return is_array($info) ? $info : [];
+    }
+
+    /**
      * 获取进件主体类型声明。
      *
      * @return array<int, string> 主体类型编码

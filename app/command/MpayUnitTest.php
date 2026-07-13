@@ -7,6 +7,7 @@ use app\common\constant\RouteConstant;
 use app\common\constant\NotifyConstant;
 use app\common\constant\PaymentPluginStatusConstant;
 use app\common\util\RsaKeyPairGenerator;
+use app\common\payment\WechatReceiptPayment;
 use app\model\payment\PayOrder;
 use app\model\payment\PaymentChannel;
 use app\model\payment\PaymentPlugin;
@@ -53,6 +54,9 @@ class MpayUnitTest extends Command
             'epay.rsa_signer' => fn () => $this->testRsaSigner(),
             'plugin.pay_result_contract' => fn () => $this->testPaymentPluginPayResultContract(),
             'plugin.notify_result_contract' => fn () => $this->testPaymentPluginNotifyResultContract(),
+            'plugin.receipt_watcher_runtime_contract' => fn () => $this->testReceiptWatcherRuntimeContract(),
+            'plugin.receipt_watcher_stream_contract' => fn () => $this->testReceiptWatcherStreamContract(),
+            'plugin.wechat_receipt_amount_parser' => fn () => $this->testWechatReceiptAmountParser(),
             'transfer.money_parser' => fn () => $this->testTransferMoneyParser(),
             'route.amount_and_daily_limit' => fn () => $this->testRouteAmountAndDailyLimit(),
             'route.default_channel_selection' => fn () => $this->testRouteDefaultChannelSelection(),
@@ -176,6 +180,112 @@ class MpayUnitTest extends Command
             fn () => PaymentPluginNotifyResultValidator::make($invalid)->withScene('notify_result')->validate(),
             '插件回调状态只能是 success/failed/pending'
         );
+    }
+
+    /**
+     * 网页流水监听插件运行时声明契约。
+     *
+     * @return void
+     */
+    private function testReceiptWatcherRuntimeContract(): void
+    {
+        $expected = [
+            \app\common\payment\AlipayBillReceiptPayment::class => ['direct', false],
+            \app\common\payment\FubeiDirectReceiptPayment::class => ['direct', true],
+            \app\common\payment\FubeiReceiptPayment::class => ['browser', true],
+            \app\common\payment\FuiouReceiptPayment::class => ['browser', true],
+            \app\common\payment\HaikeMaqianReceiptPayment::class => ['browser', true],
+            \app\common\payment\LakalaDirectReceiptPayment::class => ['direct', true],
+            \app\common\payment\LakalaReceiptPayment::class => ['browser', true],
+            \app\common\payment\PostarDirectReceiptPayment::class => ['direct', true],
+            \app\common\payment\PostarReceiptPayment::class => ['browser', true],
+            \app\common\payment\ShouQianBaReceiptPayment::class => ['direct', true],
+            \app\common\payment\TianquePretranReceiptPayment::class => ['direct', true],
+            \app\common\payment\TianqueReceiptPayment::class => ['browser', true],
+            \app\common\payment\UsdtTrc20ReceiptPayment::class => ['direct', false],
+            \app\common\payment\WangpuDirectReceiptPayment::class => ['direct', true],
+            \app\common\payment\WangpuReceiptPayment::class => ['browser', true],
+            \app\common\payment\YeepayBossDirectReceiptPayment::class => ['direct', true],
+            \app\common\payment\YeepayBossReceiptPayment::class => ['browser', true],
+            \app\common\payment\YishengDirectReceiptPayment::class => ['direct', true],
+            \app\common\payment\YishengReceiptPayment::class => ['browser', true],
+        ];
+
+        foreach ($expected as $className => [$runtime, $preloginSupported]) {
+            $plugin = (new ReflectionClass($className))->newInstanceWithoutConstructor();
+            $this->assertTrue(
+                $plugin instanceof \app\common\interface\ChannelNotifyPayloadInterface,
+                $className . ' 必须实现 ChannelNotifyPayloadInterface'
+            );
+            $info = $plugin->receiptWatcherInfo();
+            $this->assertSame($runtime, (string) ($info['runtime'] ?? ''), $className . ' watcher runtime 不正确');
+            $this->assertSame(
+                $preloginSupported,
+                $info['prelogin_supported'] ?? null,
+                $className . ' prelogin_supported 不正确'
+            );
+        }
+    }
+
+    /**
+     * 网页流水监听四条 Stream 路由契约。
+     *
+     * @return void
+     */
+    private function testReceiptWatcherStreamContract(): void
+    {
+        $className = \app\service\payment\receipt\ReceiptWatcherService::class;
+        $service = (new ReflectionClass($className))->newInstanceWithoutConstructor();
+        $queryStreamKey = $this->privateMethod($className, 'queryStreamKey');
+        $preloginStreamKey = $this->privateMethod($className, 'preloginStreamKey');
+
+        $this->assertSame(
+            'receipt_watcher_direct_query_stream',
+            $queryStreamKey->invoke($service, 'direct'),
+            'direct 查单 Stream 不正确'
+        );
+        $this->assertSame(
+            'receipt_watcher_browser_query_stream',
+            $queryStreamKey->invoke($service, 'browser'),
+            'browser 查单 Stream 不正确'
+        );
+        $this->assertSame(
+            'receipt_watcher_direct_prelogin_stream',
+            $preloginStreamKey->invoke($service, 'direct'),
+            'direct 预登录 Stream 不正确'
+        );
+        $this->assertSame(
+            'receipt_watcher_browser_prelogin_stream',
+            $preloginStreamKey->invoke($service, 'browser'),
+            'browser 预登录 Stream 不正确'
+        );
+        $this->assertSame(null, $queryStreamKey->invoke($service, 'legacy'), '无效运行时不应获得查单 Stream');
+        $this->assertSame(null, $preloginStreamKey->invoke($service, 'legacy'), '无效运行时不应获得预登录 Stream');
+    }
+
+    /**
+     * 微信个人收款通知金额解析。
+     *
+     * @return void
+     */
+    private function testWechatReceiptAmountParser(): void
+    {
+        $plugin = (new ReflectionClass(WechatReceiptPayment::class))->newInstanceWithoutConstructor();
+        $amountFromPayload = $this->privateMethod(WechatReceiptPayment::class, 'amountFromPayload');
+
+        $this->assertSame(200, $amountFromPayload->invoke($plugin, [
+            'content' => json_encode([
+                'title' => '微信支付',
+                'msg' => '个人收款码到账¥2.00',
+            ], JSON_UNESCAPED_UNICODE),
+        ]), '个人收款码到账金额应支持 ¥ 符号');
+
+        $this->assertSame(123, $amountFromPayload->invoke($plugin, [
+            'content' => json_encode([
+                'title' => '微信收款助手',
+                'msg' => '收款到账1.23元',
+            ], JSON_UNESCAPED_UNICODE),
+        ]), '原有收款到账金额格式应继续支持');
     }
 
     /**

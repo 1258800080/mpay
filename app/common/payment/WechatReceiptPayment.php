@@ -761,7 +761,7 @@ class WechatReceiptPayment extends BasePayment implements PaymentInterface, PayP
             throw new PaymentException('未支持的微信通知标题', 40200, ['title' => $title]);
         }
 
-        if (preg_match('/(?:到账|收款|收款到账)\s*(\d+(?:\.\d{1,2})?)\s*元/u', $msg, $matches) === 1) {
+        if (preg_match('/(?:到账|收款|收款到账)\s*[¥￥]?\s*(\d+(?:\.\d{1,2})?)\s*(?:元)?/u', $msg, $matches) === 1) {
             return $this->moneyToCents((string) $matches[1]);
         }
 

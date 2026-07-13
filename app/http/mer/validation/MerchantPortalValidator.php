@@ -31,6 +31,8 @@ class MerchantPortalValidator extends Validator
         'stat_date' => 'sometimes|date',
         'id' => 'sometimes|integer|min:1',
         'keyword' => 'sometimes|string|max:128',
+        'money' => 'sometimes|numeric|min:0.01',
+        'device' => 'sometimes|string|in:auto,pc,mobile,qq,wechat,alipay,jump',
         'plugin_code' => 'sometimes|string|alpha_dash|min:2|max:32',
         'plugin_type' => 'sometimes|integer|in:1,2,3',
         'config' => 'nullable|array',
@@ -74,6 +76,8 @@ class MerchantPortalValidator extends Validator
         'stat_date' => '统计日期',
         'id' => '记录ID',
         'keyword' => '关键字',
+        'money' => '测试金额',
+        'device' => '支付环境',
         'plugin_code' => '支付插件',
         'plugin_type' => '插件类型',
         'config' => '插件配置',
@@ -121,6 +125,8 @@ class MerchantPortalValidator extends Validator
         'channelStore' => ['name', 'pay_type_id', 'plugin_code', 'api_config_id', 'daily_limit_amount', 'daily_limit_count', 'min_amount', 'max_amount', 'remark', 'status', 'sort_no'],
         'channelUpdate' => ['id', 'name', 'pay_type_id', 'plugin_code', 'api_config_id', 'daily_limit_amount', 'daily_limit_count', 'min_amount', 'max_amount', 'remark', 'status', 'sort_no'],
         'channelDestroy' => ['id'],
+        'channelTest' => ['id', 'name', 'money', 'device'],
+        'channelTestRecords' => ['id', 'keyword', 'page', 'page_size'],
         'routeConfigUpdate' => ['items'],
         'issueCredential' => ['rotate_v1', 'rotate_v2', 'status'],
     ];
@@ -137,8 +143,13 @@ class MerchantPortalValidator extends Validator
                 'id' => 'required|integer|min:1',
                 'plugin_code' => 'required|string|alpha_dash|min:2|max:32',
             ]),
-            'pluginConfigShow', 'pluginConfigDestroy', 'channelDestroy' => array_merge($rules, [
+            'pluginConfigShow', 'pluginConfigDestroy', 'channelDestroy', 'channelTestRecords' => array_merge($rules, [
                 'id' => 'required|integer|min:1',
+            ]),
+            'channelTest' => array_merge($rules, [
+                'id' => 'required|integer|min:1',
+                'name' => 'required|string|min:1|max:128',
+                'money' => 'required|numeric|min:0.01',
             ]),
             'channelStore' => array_merge($rules, [
                 'name' => 'required|string|min:2|max:100',

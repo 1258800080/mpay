@@ -129,6 +129,34 @@ class MerchantPortalService extends BaseService
         return $this->channelService->deleteChannel($merchantId, $id);
     }
 
+    /**
+     * 发起商户自建通道测试支付。
+     *
+     * @param int $merchantId 当前商户ID
+     * @param int $channelId 通道ID
+     * @param array $data 测试入参
+     * @return array 测试订单与支付页信息
+     */
+    public function testChannel(int $merchantId, int $channelId, array $data): array
+    {
+        return $this->channelService->testChannel($merchantId, $channelId, $data);
+    }
+
+    /**
+     * 查询商户自建通道测试记录。
+     *
+     * @param int $merchantId 当前商户ID
+     * @param int $channelId 通道ID
+     * @param array $filters 筛选条件
+     * @param int $page 页码
+     * @param int $pageSize 每页条数
+     * @return \Illuminate\Contracts\Pagination\LengthAwarePaginator 分页结果
+     */
+    public function channelTestRecords(int $merchantId, int $channelId, array $filters, int $page, int $pageSize)
+    {
+        return $this->channelService->channelTestRecords($merchantId, $channelId, $filters, $page, $pageSize);
+    }
+
     public function pluginSchema(string $pluginCode): array
     {
         return $this->channelService->pluginSchema($pluginCode);

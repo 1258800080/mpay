@@ -865,6 +865,8 @@ return [
                         'rule' => [
                             'receipt_watcher_license_code',
                             'receipt_watcher_plugin_codes',
+                            'receipt_watcher_ttshitu_username',
+                            'receipt_watcher_ttshitu_password',
                             'receipt_watcher_order_scan_interval_seconds',
                             'receipt_watcher_order_scan_batch_size',
                             'receipt_watcher_prelogin_interval_seconds',
@@ -888,13 +890,31 @@ return [
                 'type' => 'textarea',
                 'field' => 'receipt_watcher_plugin_codes',
                 'title' => '监听插件标识',
-                'value' => "shouqianba_receipt\nfubei_receipt\nusdt_trc20_receipt",
+                'value' => "shouqianba_receipt\nfubei_receipt\nfubei_direct_receipt\nusdt_trc20_receipt",
                 'props' => [
                     'placeholder' => '请输入支持网页流水监听的插件标识，多个用逗号或换行分隔',
                     'autoSize' => [
                         'minRows' => 2,
                         'maxRows' => 4,
                     ],
+                ],
+            ],
+            [
+                'type' => 'input',
+                'field' => 'receipt_watcher_ttshitu_username',
+                'title' => '图鉴账号',
+                'value' => '',
+                'props' => [
+                    'placeholder' => '请输入图鉴验证码识别账号，需要验证码的平台使用',
+                ],
+            ],
+            [
+                'type' => 'password',
+                'field' => 'receipt_watcher_ttshitu_password',
+                'title' => '图鉴密码',
+                'value' => '',
+                'props' => [
+                    'placeholder' => '请输入图鉴验证码识别密码，留空时验证码平台无法自动登录',
                 ],
             ],
             [

@@ -3,6 +3,7 @@
 namespace app\service\merchant\portal;
 
 use app\common\base\BaseService;
+use app\service\payment\config\PaymentChannelTestService;
 
 /**
  * 商户门户通道服务。
@@ -11,6 +12,7 @@ use app\common\base\BaseService;
  * @property MerchantPortalChannelCommandService $commandService 命令服务
  * @property MerchantPortalRoutePreviewService $routePreviewService 路由解析服务
  * @property MerchantPortalRouteConfigService $routeConfigService 路由偏好配置服务
+ * @property PaymentChannelTestService $channelTestService 通道测试服务
  */
 class MerchantPortalChannelService extends BaseService
 {
@@ -21,12 +23,14 @@ class MerchantPortalChannelService extends BaseService
      * @param MerchantPortalChannelCommandService $commandService 命令服务
      * @param MerchantPortalRoutePreviewService $routePreviewService 路由解析服务
      * @param MerchantPortalRouteConfigService $routeConfigService 路由偏好配置服务
+     * @param PaymentChannelTestService $channelTestService 通道测试服务
      */
     public function __construct(
         protected MerchantPortalChannelQueryService $queryService,
         protected MerchantPortalChannelCommandService $commandService,
         protected MerchantPortalRoutePreviewService $routePreviewService,
-        protected MerchantPortalRouteConfigService $routeConfigService
+        protected MerchantPortalRouteConfigService $routeConfigService,
+        protected PaymentChannelTestService $channelTestService
     ) {
     }
 
@@ -129,6 +133,34 @@ class MerchantPortalChannelService extends BaseService
     public function deleteChannel(int $merchantId, int $id): bool
     {
         return $this->commandService->deleteChannel($merchantId, $id);
+    }
+
+    /**
+     * 发起商户自建通道测试支付。
+     *
+     * @param int $merchantId 当前商户ID
+     * @param int $channelId 通道ID
+     * @param array $data 测试入参
+     * @return array 测试订单与支付页信息
+     */
+    public function testChannel(int $merchantId, int $channelId, array $data): array
+    {
+        return $this->channelTestService->submitForMerchant($merchantId, $channelId, $data);
+    }
+
+    /**
+     * 查询商户自建通道测试记录。
+     *
+     * @param int $merchantId 当前商户ID
+     * @param int $channelId 通道ID
+     * @param array $filters 筛选条件
+     * @param int $page 页码
+     * @param int $pageSize 每页条数
+     * @return \Illuminate\Contracts\Pagination\LengthAwarePaginator 分页结果
+     */
+    public function channelTestRecords(int $merchantId, int $channelId, array $filters, int $page, int $pageSize)
+    {
+        return $this->channelTestService->merchantRecords($merchantId, $channelId, $filters, $page, $pageSize);
     }
 
     public function pluginSchema(string $pluginCode): array

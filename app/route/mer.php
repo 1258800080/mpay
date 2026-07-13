@@ -50,6 +50,8 @@ Route::group('/merapi', function () {
             Route::get('', [MerchantPortalController::class, 'myChannels'])->name('merchantApiPortalMyChannels')->setParams(['real_name' => '我的通道']);
             Route::get('/create-meta', [MerchantPortalController::class, 'channelCreateMeta'])->name('merchantApiPortalChannelCreateMeta')->setParams(['real_name' => '商户通道配置元数据']);
             Route::post('', [MerchantPortalController::class, 'createChannel'])->name('merchantApiPortalChannelCreate')->setParams(['real_name' => '新增商户通道']);
+            Route::post('/{id}/test', [MerchantPortalController::class, 'testChannel'])->name('merchantApiPortalChannelTest')->setParams(['real_name' => '测试商户自建通道']);
+            Route::get('/{id}/test-records', [MerchantPortalController::class, 'channelTestRecords'])->name('merchantApiPortalChannelTestRecords')->setParams(['real_name' => '商户通道测试记录']);
             Route::put('/{id}', [MerchantPortalController::class, 'updateChannel'])->name('merchantApiPortalChannelUpdate')->setParams(['real_name' => '修改商户通道']);
             Route::delete('/{id}', [MerchantPortalController::class, 'deleteChannel'])->name('merchantApiPortalChannelDelete')->setParams(['real_name' => '删除商户通道']);
         });

@@ -60,8 +60,8 @@ return array_merge($webman, [
             ],
         ],
     ],
-    // 网页流水监听调度进程：只把需要查询流水的账号和订单快照同步到 Redis。
-    // 真正登录第三方后台、查询流水和投递队列由独立的 Python receipt_watcher 工具完成。
+    // 网页流水监听调度进程：维护账号、订单快照和预登录计划，并投放四条 v2 Stream。
+    // 第三方登录、流水查询和队列投递由 Go 直连与 Python 浏览器 watcher 按运行时分别完成。
     'receipt-watcher' => [
         'handler' => ReceiptWatcherProcess::class,
         // 单进程维护账号任务，避免重复写入查询任务。

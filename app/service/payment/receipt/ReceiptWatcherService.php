@@ -25,17 +25,21 @@ class ReceiptWatcherService extends BaseService
     /**
      * Redis Key 协议常量。
      *
-     * 这些名称必须与 Python receipt_watcher 保持一致，详细含义见
-     * watcher/docs/COMMON_CONSTANTS.md。修改时需要同步两端代码并清理旧 Redis 数据。
+     * 这些名称必须与 Go 直连、Python 浏览器 watcher 保持一致。修改时需要同步
+     * 三端代码，并按切换文档清理不再兼容的旧 Stream 和消费组。
      */
     private const ACCOUNTS_KEY = 'receipt_watcher_accounts';
     private const QUERY_ACCOUNTS_KEY = 'receipt_watcher_query_accounts';
     private const PRELOGIN_ACCOUNTS_KEY = 'receipt_watcher_prelogin_accounts';
-    private const ACCOUNT_STREAM_KEY = 'receipt_watcher_account_stream';
-    private const ACCOUNT_ENQUEUED_KEY_PREFIX = 'receipt_watcher_account_enqueued_';
+    private const DIRECT_QUERY_STREAM_KEY = 'receipt_watcher_direct_query_stream';
+    private const DIRECT_PRELOGIN_STREAM_KEY = 'receipt_watcher_direct_prelogin_stream';
+    private const BROWSER_QUERY_STREAM_KEY = 'receipt_watcher_browser_query_stream';
+    private const BROWSER_PRELOGIN_STREAM_KEY = 'receipt_watcher_browser_prelogin_stream';
+    private const QUERY_ENQUEUED_KEY_PREFIX = 'receipt_watcher_query_enqueued_';
     private const PRELOGIN_ENQUEUED_KEY_PREFIX = 'receipt_watcher_prelogin_enqueued_';
     private const ACCOUNT_TASK_KEY_PREFIX = 'receipt_watcher_account_';
     private const ORDERS_KEY_PREFIX = 'receipt_watcher_orders_';
+    private const SESSION_KEY_PREFIX = 'receipt_watcher_session_';
     private const LOCK_KEY_PREFIX = 'receipt_watcher_lock_';
     private const FLOW_SEEN_KEY_PREFIX = 'receipt_watcher_flow_seen_';
     private const FLOW_LOCK_KEY_PREFIX = 'receipt_watcher_flow_lock_';
@@ -69,9 +73,11 @@ class ReceiptWatcherService extends BaseService
     {
         $pluginCodes = $this->supportedPluginCodes();
         if ($pluginCodes === []) {
+            $previousAccountKeys = array_keys($this->accountMap());
             $this->clearQueryTasks();
             $this->clearPreloginTasks();
             Redis::del(self::ACCOUNTS_KEY);
+            $this->removeStaleSessions($previousAccountKeys, []);
             return [
                 'accounts' => 0,
                 'channels' => 0,
@@ -80,6 +86,14 @@ class ReceiptWatcherService extends BaseService
 
         $channels = $this->paymentChannelRepository->listReceiptWatcherChannels($pluginCodes);
 
+        $watcherInfoByCode = [];
+        foreach ($pluginCodes as $pluginCode) {
+            $info = $this->receiptWatcherLicenseService->watcherInfo($pluginCode);
+            if ($info !== null) {
+                $watcherInfoByCode[$pluginCode] = $info;
+            }
+        }
+
         $configIds = $channels->pluck('api_config_id')->map(fn ($id): int => (int) $id)->filter()->unique()->values()->all();
         $payTypeIds = $channels->pluck('pay_type_id')->map(fn ($id): int => (int) $id)->filter()->unique()->values()->all();
         $configs = $this->paymentPluginConfRepository->listByIds($configIds)->keyBy('id');
@@ -87,20 +101,24 @@ class ReceiptWatcherService extends BaseService
 
         $accounts = [];
         foreach ($channels as $channel) {
+            $pluginCode = (string) $channel->plugin_code;
             $config = $configs->get((int) $channel->api_config_id);
-            if (!$config || (string) $config->plugin_code !== (string) $channel->plugin_code) {
+            $watcherInfo = $watcherInfoByCode[$pluginCode] ?? null;
+            if (!$config || (string) $config->plugin_code !== $pluginCode || !is_array($watcherInfo)) {
                 continue;
             }
 
             $payType = $payTypes->get((int) $channel->pay_type_id);
-            $accountKey = $this->accountKey((string) $channel->plugin_code, (int) $channel->api_config_id);
+            $accountKey = $this->accountKey($pluginCode, (int) $channel->api_config_id);
             if (!isset($accounts[$accountKey])) {
                 $pluginConfig = (array) ($config->config ?? []);
                 $accounts[$accountKey] = [
                     'account_key' => $accountKey,
-                    'plugin_code' => (string) $channel->plugin_code,
+                    'plugin_code' => $pluginCode,
                     'api_config_id' => (int) $channel->api_config_id,
                     'merchant_id' => (int) $config->merchant_id,
+                    'watcher_runtime' => (string) $watcherInfo['runtime'],
+                    'prelogin_supported' => (bool) $watcherInfo['prelogin_supported'],
                     'config' => $pluginConfig,
                     'query_interval_seconds' => $this->queryIntervalSeconds($pluginConfig),
                     'channels' => [],
@@ -119,12 +137,20 @@ class ReceiptWatcherService extends BaseService
             ];
         }
 
+        $previousAccountKeys = array_keys($this->accountMap());
         Redis::del(self::ACCOUNTS_KEY);
         foreach ($accounts as $accountKey => $account) {
             Redis::hSet(self::ACCOUNTS_KEY, $accountKey, $this->jsonEncode($account));
         }
         $this->removeStaleQueryTasks(array_keys($accounts));
-        $this->syncPreloginTasks(array_keys($accounts));
+        $preloginAccountKeys = [];
+        foreach ($accounts as $accountKey => $account) {
+            if (!empty($account['prelogin_supported'])) {
+                $preloginAccountKeys[] = $accountKey;
+            }
+        }
+        $this->syncPreloginTasks($preloginAccountKeys);
+        $this->removeStaleSessions($previousAccountKeys, array_keys($accounts));
 
         return [
             'accounts' => count($accounts),
@@ -261,6 +287,14 @@ class ReceiptWatcherService extends BaseService
                 continue;
             }
 
+            $runtime = $this->normalizeWatcherRuntime($task['watcher_runtime'] ?? null);
+            $streamKey = $this->queryStreamKey($runtime);
+            if ($streamKey === null) {
+                $summary['stale']++;
+                $this->removeAccountQueryTask($accountKey);
+                continue;
+            }
+
             if ((bool) Redis::exists($this->lockKey($accountKey))) {
                 $summary['locked']++;
                 continue;
@@ -277,13 +311,17 @@ class ReceiptWatcherService extends BaseService
             try {
                 $streamId = $this->redisRaw(
                     'XADD',
-                    self::ACCOUNT_STREAM_KEY,
+                    $streamKey,
                     'MAXLEN',
                     '~',
                     '10000',
                     '*',
+                    'schema_version',
+                    '2',
                     'task_type',
                     self::TASK_TYPE_QUERY,
+                    'runtime',
+                    $runtime,
                     'account_key',
                     $accountKey,
                     'plugin_code',
@@ -383,7 +421,15 @@ class ReceiptWatcherService extends BaseService
         foreach ($accountKeys as $rawAccountKey) {
             $accountKey = (string) $rawAccountKey;
             $account = $accounts[$accountKey] ?? null;
-            if (!is_array($account)) {
+            if (!is_array($account) || empty($account['prelogin_supported'])) {
+                $summary['stale']++;
+                $this->removePreloginTask($accountKey);
+                continue;
+            }
+
+            $runtime = $this->normalizeWatcherRuntime($account['watcher_runtime'] ?? null);
+            $streamKey = $this->preloginStreamKey($runtime);
+            if ($streamKey === null) {
                 $summary['stale']++;
                 $this->removePreloginTask($accountKey);
                 continue;
@@ -404,13 +450,17 @@ class ReceiptWatcherService extends BaseService
             try {
                 $streamId = $this->redisRaw(
                     'XADD',
-                    self::ACCOUNT_STREAM_KEY,
+                    $streamKey,
                     'MAXLEN',
                     '~',
                     '10000',
                     '*',
+                    'schema_version',
+                    '2',
                     'task_type',
                     self::TASK_TYPE_PRELOGIN,
+                    'runtime',
+                    $runtime,
                     'account_key',
                     $accountKey,
                     'plugin_code',
@@ -523,11 +573,10 @@ class ReceiptWatcherService extends BaseService
     {
         $key = $this->flowLockKey($pluginCode, $apiConfigId, $record);
         $token = bin2hex(random_bytes(8));
-        if (!Redis::setNx($key, $token)) {
+        $locked = $this->redisRaw('SET', $key, $token, 'NX', 'EX', '30');
+        if ($locked !== true && strtoupper((string) $locked) !== 'OK') {
             return null;
         }
-
-        Redis::expire($key, 30);
         return $token;
     }
 
@@ -543,9 +592,13 @@ class ReceiptWatcherService extends BaseService
     public function releaseFlowLock(string $pluginCode, int $apiConfigId, array $record, string $token): void
     {
         $key = $this->flowLockKey($pluginCode, $apiConfigId, $record);
-        if ((string) Redis::get($key) === $token) {
-            Redis::del($key);
-        }
+        $script = <<<'LUA'
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+LUA;
+        $this->redisRaw('EVAL', $script, '1', $key, $token);
     }
 
     /**
@@ -639,6 +692,7 @@ class ReceiptWatcherService extends BaseService
             'account_key' => $accountKey,
             'plugin_code' => (string) $account['plugin_code'],
             'api_config_id' => (int) $account['api_config_id'],
+            'watcher_runtime' => (string) ($account['watcher_runtime'] ?? ''),
             'query_interval_seconds' => $this->queryIntervalSeconds((array) ($account['config'] ?? [])),
             'order_count' => count($orders),
             'expire_at' => $expireAt,
@@ -835,8 +889,8 @@ class ReceiptWatcherService extends BaseService
      * 提取 watcher 需要的订单扩展信息。
      *
      * 支付单 ext_json 可能包含前端承接参数、上游原始响应等内容。这里仅透传
-     * `receipt_watcher` 这个固定命名空间，新增监听插件需要给 Python watcher
-     * 提供订单级识别信息时，统一写入 `ext_json.receipt_watcher`。
+     * `receipt_watcher` 这个固定命名空间。新增监听插件需要给任一 watcher
+     * 运行时提供订单级识别信息时，统一写入 `ext_json.receipt_watcher`。
      *
      * @param PayOrder $order 支付单
      * @return array<string, mixed> 扩展快照
@@ -880,7 +934,7 @@ class ReceiptWatcherService extends BaseService
      */
     private function accountEnqueuedKey(string $accountKey): string
     {
-        return self::ACCOUNT_ENQUEUED_KEY_PREFIX . $this->safeKeyPart($accountKey);
+        return self::QUERY_ENQUEUED_KEY_PREFIX . $this->safeKeyPart($accountKey);
     }
 
     /**
@@ -914,6 +968,77 @@ class ReceiptWatcherService extends BaseService
     private function ordersKey(string $accountKey): string
     {
         return self::ORDERS_KEY_PREFIX . $this->safeKeyPart($accountKey);
+    }
+
+    /**
+     * 生成账号 Redis Session 键。
+     *
+     * @param string $accountKey 账号键
+     * @return string Session 键
+     */
+    private function sessionKey(string $accountKey): string
+    {
+        return self::SESSION_KEY_PREFIX . $this->safeKeyPart($accountKey);
+    }
+
+    /**
+     * 标准化插件声明的 watcher 运行时。
+     *
+     * @param mixed $runtime 原始运行时
+     * @return string 运行时编码
+     */
+    private function normalizeWatcherRuntime(mixed $runtime): string
+    {
+        $runtime = strtolower(trim((string) $runtime));
+
+        return in_array($runtime, ['direct', 'browser'], true) ? $runtime : '';
+    }
+
+    /**
+     * 获取指定运行时的查单任务流。
+     *
+     * @param string $runtime watcher 运行时
+     * @return string|null Stream 键
+     */
+    private function queryStreamKey(string $runtime): ?string
+    {
+        return match ($runtime) {
+            'direct' => self::DIRECT_QUERY_STREAM_KEY,
+            'browser' => self::BROWSER_QUERY_STREAM_KEY,
+            default => null,
+        };
+    }
+
+    /**
+     * 获取指定运行时的预登录任务流。
+     *
+     * @param string $runtime watcher 运行时
+     * @return string|null Stream 键
+     */
+    private function preloginStreamKey(string $runtime): ?string
+    {
+        return match ($runtime) {
+            'direct' => self::DIRECT_PRELOGIN_STREAM_KEY,
+            'browser' => self::BROWSER_PRELOGIN_STREAM_KEY,
+            default => null,
+        };
+    }
+
+    /**
+     * 删除已经移除账号的 Redis Session。
+     *
+     * @param array<int, string> $previousAccountKeys 原账号键
+     * @param array<int, string> $activeAccountKeys 当前账号键
+     * @return void
+     */
+    private function removeStaleSessions(array $previousAccountKeys, array $activeAccountKeys): void
+    {
+        $active = array_fill_keys($activeAccountKeys, true);
+        foreach ($previousAccountKeys as $accountKey) {
+            if (!isset($active[$accountKey])) {
+                Redis::del($this->sessionKey($accountKey));
+            }
+        }
     }
 
     /**

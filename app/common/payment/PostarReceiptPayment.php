@@ -34,6 +34,10 @@ class PostarReceiptPayment extends BasePayment implements PaymentInterface, PayP
         'version' => '1.0.0',
         'pay_types' => ['alipay', 'wxpay', 'unionpay'],
         'transfer_types' => [],
+        'receipt_watcher' => [
+            'runtime' => 'browser',
+            'prelogin_supported' => true,
+        ],
         'receipt_supports_remark' => true,
     ];
 }

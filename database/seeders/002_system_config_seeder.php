@@ -96,7 +96,9 @@ return new class {
             'receipt_watcher_order_scan_interval_seconds' => '3',
             'receipt_watcher_prelogin_interval_seconds' => '600',
             'receipt_watcher_login_retry_max' => '10',
-            'receipt_watcher_plugin_codes' => "shouqianba_receipt\nfubei_receipt\nusdt_trc20_receipt",
+            'receipt_watcher_plugin_codes' => "shouqianba_receipt\nfubei_receipt\nfubei_direct_receipt\nusdt_trc20_receipt",
+            'receipt_watcher_ttshitu_username' => '',
+            'receipt_watcher_ttshitu_password' => '',
         ],
         'storage' => [
             'file_storage_aliyun_oss_access_key_id' => '',

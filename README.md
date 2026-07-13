@@ -39,6 +39,10 @@
 | 文档 | 说明 |
 | --- | --- |
 | [项目 Wiki](https://gitee.com/technical-laohu/mpay_v2_webman/wikis) | 完整使用手册、接入指南、部署运维和排障文档 |
+| [MPAY V2 宝塔源码包部署教程](https://gitee.com/technical-laohu/mpay_v2_webman/wikis/MPAY-V2-%E5%AE%9D%E5%A1%94%E6%BA%90%E7%A0%81%E5%8C%85%E9%83%A8%E7%BD%B2%E6%95%99%E7%A8%8B) | 使用发行版 `mpay.zip`、宝塔、PHP CLI、MySQL、Redis 和 Nginx 部署 |
+| [MPAY V2 Docker 部署教程](https://gitee.com/technical-laohu/mpay_v2_webman/wikis/MPAY-V2-Docker%E9%83%A8%E7%BD%B2%E6%95%99%E7%A8%8B) | 使用 `mpay-docker.zip` 一键部署 MPAY、MySQL 和 Redis |
+| [直连版监听工具部署安装教程](https://gitee.com/technical-laohu/mpay_v2_webman/wikis/%E7%9B%B4%E8%BF%9E%E7%89%88%E7%9B%91%E5%90%AC%E5%B7%A5%E5%85%B7%E9%83%A8%E7%BD%B2%E5%AE%89%E8%A3%85%E6%95%99%E7%A8%8B) | 安装 Go 直连 watcher 客户镜像并连接 MPAY Redis |
+| [浏览器版监听工具安装部署教程](https://gitee.com/technical-laohu/mpay_v2_webman/wikis/%E6%B5%8F%E8%A7%88%E5%99%A8%E7%89%88%E7%9B%91%E5%90%AC%E5%B7%A5%E5%85%B7%E5%AE%89%E8%A3%85%E9%83%A8%E7%BD%B2%E6%95%99%E7%A8%8B) | 安装 Chromium 浏览器 watcher 客户镜像并完成运行监控 |
 | [码牌类插件配置使用教程](https://gitee.com/technical-laohu/mpay_v2_webman/wikis/%E7%A0%81%E7%89%8C%E7%B1%BB%E6%8F%92%E4%BB%B6%E9%85%8D%E7%BD%AE%E4%BD%BF%E7%94%A8%E6%95%99%E7%A8%8B) | receipt_watcher 网页流水/二维码牌监听场景，适用于收钱吧、付呗、USDT TRC20 等码牌类插件 |
 | [支付宝微信个人收款监听配置教程](https://gitee.com/technical-laohu/mpay_v2_webman/wikis/%E6%94%AF%E4%BB%98%E5%AE%9D%E5%BE%AE%E4%BF%A1%E4%B8%AA%E4%BA%BA%E6%94%B6%E6%AC%BE%E7%9B%91%E5%90%AC%E9%85%8D%E7%BD%AE%E6%95%99%E7%A8%8B#%E6%94%AF%E4%BB%98%E5%AE%9D%E5%BE%AE%E4%BF%A1%E4%B8%AA%E4%BA%BA%E6%94%B6%E6%AC%BE%E7%9B%91%E5%90%AC%E9%85%8D%E7%BD%AE%E6%95%99%E7%A8%8B) | SmsForwarder 手机通知栏监听场景，适用于支付宝/微信个人收款码 |
 
@@ -105,7 +109,7 @@
 
 | 类型 | 技术 |
 | --- | --- |
-| 运行环境 | PHP 8.2+ |
+| 运行环境 | PHP 8.1+，新部署推荐 PHP 8.2 |
 | 后端框架 | Webman 2.x、Workerman |
 | 数据库 | MySQL |
 | 缓存与队列 | Redis、webman/redis-queue |
@@ -177,7 +181,7 @@ tools/             辅助工具，例如 receipt_watcher
 
 | 依赖 | 要求 |
 | --- | --- |
-| PHP | 8.2 或更高版本 |
+| PHP | 最低 8.1，新部署推荐 8.2 |
 | MySQL | 5.7+ / 8.x |
 | Redis | 5.x+ |
 | PHP 扩展 | `pdo_mysql`、`redis`、`pcntl`、`fileinfo` |
@@ -227,13 +231,13 @@ https://gitee.com/technical-laohu/mpay_v2_webman/releases
 
 | 依赖 | 说明 |
 | --- | --- |
-| PHP | 8.2 或更高版本 |
+| PHP | 最低 8.1，新部署推荐 8.2 |
 | MySQL | 建议 5.7+ / 8.x |
 | Redis | 用于缓存、登录态、队列和运行时任务 |
 | 程序依赖 | 发行版已包含 `vendor`，通常不需要在服务器单独安装依赖 |
-| PHP 扩展 | `pdo_mysql`、`redis`、`pcntl`、`fileinfo` |
+| PHP 扩展 | 必需 `pdo_mysql`、`openssl`、`json`、`mbstring`、`redis`、`pcntl`；建议 `curl`、`fileinfo`、`event` |
 
-Webman 是常驻内存服务，不依赖 PHP-FPM 处理请求。
+Webman 是常驻内存服务，不依赖 PHP-FPM 或 OPcache 处理请求。请使用 `php -v` 和 `php -m` 检查 PHP CLI 的实际版本和扩展。
 
 ### 3. 设置目录权限
 
@@ -334,7 +338,7 @@ php webman restart
 
 ### 1. 安装基础运行环境
 
-进入宝塔面板的「软件商店」，先确认服务器已安装并启动 `Nginx`、`MySQL`、`Redis` 和 `PHP 8.2+`。MPAY V2 使用 Webman 常驻内存运行，动态请求最终会由 Nginx 反向代理到 Webman HTTP 服务。
+进入宝塔面板的「软件商店」，先确认服务器已安装并启动 `Nginx`、`MySQL`、`Redis` 和 `PHP 8.1+`，新部署推荐 PHP 8.2。MPAY V2 使用 Webman 常驻内存运行，动态请求最终会由 Nginx 反向代理到 Webman HTTP 服务。
 
 ![宝塔面板安装基础运行环境](https://foruda.gitee.com/images/1779353289805107112/e718dc7c_12697045.png)
 
@@ -622,6 +626,8 @@ app/common/payment
 | `WechatReceiptPayment` | `wxpay_receipt` | 微信个人收款监听 |
 | `ShouQianBaReceiptPayment` | `shouqianba_receipt` | 收钱吧二维码牌网页流水监听 |
 | `PostarReceiptPayment` | `postar_receipt` | 星驿付收款单网页流水监听 |
+| `PostarDirectReceiptPayment` | `postar_direct_receipt` | 星驿付收款单直连流水监听 |
+| `LakalaDirectReceiptPayment` | `lakala_direct_receipt` | 拉卡拉二维码牌直连流水监听 |
 
 插件常用方法：
 
@@ -702,7 +708,7 @@ app/common/payment
 | 进程 / 队列 | 说明 |
 | --- | --- |
 | `payment-runtime` | 商户通知重试、支付超时扫描、支付中订单主动查单 |
-| `receipt-watcher-sync` | 将需要查询流水的账号和订单同步到 Redis |
+| `receipt-watcher` | 刷新监听账号、同步待支付订单并向四条 watcher Stream 投放任务 |
 | `merchant_notify` | 商户通知投递 |
 | `refund_dispatch` | 退款上游派发 |
 | `transfer_dispatch` | 转账上游派发 |
@@ -714,18 +720,19 @@ Linux 生产环境使用 `php webman start` 会按 Webman 配置启动相关进�
 
 ## 👀 网页流水监听
 
-网页流水监听适用于第三方平台没有标准回调，但可以登录网页后台查询收款流水的场景。
+网页流水监听适用于第三方平台没有标准回调，但能通过接口或商户后台查询收款流水的场景。生产运行分为 Go 直连和 Python Chromium 两个独立 watcher。
 
 职责边界：
 
-- Webman 后端负责维护账号、订单任务、插件配置和订单匹配。
-- Python `receipt_watcher` 负责登录第三方网页后台并抓取流水。
-- 流水归一后投递 Redis 队列，再由 Webman 调用插件完成订单定位和支付确认。
+- Webman 后端负责维护账号、订单快照、预登录到期表、运行时路由和订单匹配。
+- Go `receipt-watcher-direct` 消费直连查单与预登录 Stream，优先承载可以稳定直连接口的平台。
+- Python `receipt-watcher-browser` 只消费浏览器查单与预登录 Stream，承载真正依赖 Chromium 的平台。
+- 两个 watcher 都只查询、归一化并投递流水，不访问业务数据库、不修改支付单。
+- 流水进入官方 `redis-queue` 的 `receipt_flow_notify` 后，再由 Webman 调用精确支付插件完成订单定位和支付确认。
 
-当前内置适配方向：
+支付插件通过 `$paymentInfo['receipt_watcher']` 固定声明 `runtime=direct|browser` 和 `prelogin_supported`。同一平台可以保留直连版与浏览器版，后台选择哪个精确插件编码，就只投放到对应运行时；系统不自动 fallback，也不建议同一上游账号同时启用两种实现。
 
-- 收钱吧二维码牌收款。
-- 星驿付收款单收款。
+四条 Stream、当前插件映射、Redis Session、授权和预登录口径见 [网页流水监听](https://gitee.com/technical-laohu/mpay_v2_webman/wikis/11-%E7%BD%91%E9%A1%B5%E6%B5%81%E6%B0%B4%E7%9B%91%E5%90%AC)。部署时分别使用 [直连版监听工具](https://gitee.com/technical-laohu/mpay_v2_webman/wikis/%E7%9B%B4%E8%BF%9E%E7%89%88%E7%9B%91%E5%90%AC%E5%B7%A5%E5%85%B7%E9%83%A8%E7%BD%B2%E5%AE%89%E8%A3%85%E6%95%99%E7%A8%8B) 和 [浏览器版监听工具](https://gitee.com/technical-laohu/mpay_v2_webman/wikis/%E6%B5%8F%E8%A7%88%E5%99%A8%E7%89%88%E7%9B%91%E5%90%AC%E5%B7%A5%E5%85%B7%E5%AE%89%E8%A3%85%E9%83%A8%E7%BD%B2%E6%95%99%E7%A8%8B)。旧 `watcher` 项目只保留历史调试资料，不作为 v2 新插件开发入口。
 
 ## 🚀 部署建议
 
@@ -797,6 +804,21 @@ location ~ /\. {
 - 商户开放 API 凭证只用于接口签名，不等同于商户后台登录密码。
 - 管理后台、商户后台和开放 API 是三套独立鉴权体系。
 - 个人收款监听、网页流水监听、代收和清算业务需要自行确认合规边界。
+
+## ❤️ 致谢
+
+MPAY V2 的开发离不开以下优秀开源项目。感谢这些项目的作者、维护者和所有贡献者，为开源社区提供了可靠的基础设施与开发工具。
+
+| 项目 | 对 MPAY 的帮助 | 项目地址 |
+| --- | --- | --- |
+| Webman | MPAY 后端核心框架，提供路由、中间件、自定义进程和插件机制 | [官网](https://www.workerman.net/doc/webman/) · [GitHub](https://github.com/walkor/webman) · [Gitee](https://gitee.com/walkor/webman) |
+| Workerman | 为 Webman 提供常驻内存、事件驱动和多进程运行基础 | [GitHub](https://github.com/walkor/workerman) |
+| SnowAdmin | 管理后台和商户后台前端以此为基础进行业务化改造 | [GitHub](https://github.com/WangFan-io/SnowAdmin) · [Gitee](https://gitee.com/wang_fan_w/SnowAdmin) |
+| Arco Design Vue | 为后台页面提供 UI 组件和交互设计体系 | [官网](https://arco.design/vue) · [GitHub](https://github.com/arco-design/arco-design-vue) |
+| form-create | 用于支付插件配置、商户进件配置等动态表单场景 | [官网](https://www.form-create.com/) · [GitHub](https://github.com/xaboy/form-create) |
+| Vue.js | 为管理后台、商户后台和收银台提供前端基础能力 | [官网](https://vuejs.org/) · [GitHub](https://github.com/vuejs/core) |
+
+如果 MPAY V2 对你有所帮助，也欢迎关注并支持这些优秀的上游开源项目。
 
 ## 📄 许可证
 

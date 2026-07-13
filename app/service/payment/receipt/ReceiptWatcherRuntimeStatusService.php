@@ -9,7 +9,7 @@ use Throwable;
 /**
  * 网页流水监听工具运行状态服务。
  *
- * 该服务只读取 Python receipt_watcher 写入 Redis 的能力心跳，用于管理后台运行监控。
+ * 该服务读取 Go 直连与 Python 浏览器 watcher 写入 Redis 的能力心跳，用于管理后台运行监控。
  * 业务订单同步、流水消费和支付确认仍由 ReceiptWatcherService 与队列消费链路负责。
  */
 class ReceiptWatcherRuntimeStatusService extends BaseService
@@ -108,7 +108,7 @@ class ReceiptWatcherRuntimeStatusService extends BaseService
     }
 
     /**
-     * 读取 Python watcher 实例列表。
+     * 读取全部 watcher 运行实例。
      *
      * @return array<int, array<string, mixed>>
      */
@@ -144,6 +144,8 @@ class ReceiptWatcherRuntimeStatusService extends BaseService
                 'instance_id' => $instanceId,
                 'hostname' => (string) ($data['hostname'] ?? ''),
                 'pid' => (int) ($data['pid'] ?? 0),
+                'runtime' => (string) ($data['runtime'] ?? 'unknown'),
+                'runtime_text' => $this->runtimeText((string) ($data['runtime'] ?? 'unknown')),
                 'status' => $running ? 'running' : 'timeout',
                 'status_text' => $running ? '在线' : '心跳超时',
                 'tone' => $running ? 'success' : 'warning',
@@ -152,9 +154,13 @@ class ReceiptWatcherRuntimeStatusService extends BaseService
                 'last_seen_at' => $lastSeenAt,
                 'last_seen_at_text' => $this->timestampText($lastSeenAt),
                 'heartbeat_age_text' => $age === null ? '未上报' : $this->durationText($age) . '前',
-                'poll_interval_seconds' => (float) ($data['poll_interval_seconds'] ?? 0),
-                'account_fetch_limit' => (int) ($data['account_fetch_limit'] ?? 0),
-                'account_concurrency' => (int) ($data['account_concurrency'] ?? 0),
+                'worker_index' => (int) ($data['worker_index'] ?? 0),
+                'worker_processes' => (int) ($data['worker_processes'] ?? 0),
+                'worker_text' => $this->workerText(
+                    (int) ($data['worker_index'] ?? 0),
+                    (int) ($data['worker_processes'] ?? 0)
+                ),
+                'stream' => is_array($data['stream'] ?? null) ? $data['stream'] : [],
                 'license' => is_array($data['license'] ?? null) ? $data['license'] : [],
                 'plugin_count' => count($plugins),
                 'plugins_text' => implode('、', array_column($plugins, 'code')),
@@ -170,19 +176,43 @@ class ReceiptWatcherRuntimeStatusService extends BaseService
     }
 
     /**
-     * 读取在线 watcher 上报的授权状态。
+     * 聚合在线 watcher 上报的授权状态。
      *
      * @param array<int, array<string, mixed>> $liveInstances 在线实例
      * @return array<string, mixed> 授权状态
      */
     private function runtimeLicense(array $liveInstances): array
     {
+        $licenses = [];
         foreach ($liveInstances as $instance) {
             $license = $instance['license'] ?? null;
             if (is_array($license) && $license !== []) {
-                $license['source'] = 'watcher';
-                return $license;
+                $licenses[] = $license;
             }
+        }
+
+        if ($licenses !== []) {
+            $authorized = [];
+            $free = [];
+            $blocked = [];
+            $statuses = [];
+            foreach ($licenses as $license) {
+                $authorized = array_merge($authorized, array_map('strval', (array) ($license['authorized_plugins'] ?? [])));
+                $free = array_merge($free, array_map('strval', (array) ($license['free_plugin_codes'] ?? [])));
+                $blocked = array_merge($blocked, array_map('strval', (array) ($license['blocked_plugins'] ?? [])));
+                $statuses[] = (string) ($license['status'] ?? 'unknown');
+            }
+            $authorized = array_values(array_unique(array_filter($authorized)));
+            $free = array_values(array_unique(array_filter($free)));
+            $blocked = array_values(array_diff(array_unique(array_filter($blocked)), $authorized));
+            $primary = $licenses[0];
+            $primary['source'] = 'watcher';
+            $primary['runtime_count'] = count($licenses);
+            $primary['runtime_statuses'] = array_values(array_unique($statuses));
+            $primary['authorized_plugins'] = $authorized;
+            $primary['free_plugin_codes'] = $free;
+            $primary['blocked_plugins'] = $blocked;
+            return $primary;
         }
 
         $license = $this->receiptWatcherLicenseService->status();
@@ -191,7 +221,7 @@ class ReceiptWatcherRuntimeStatusService extends BaseService
     }
 
     /**
-     * 判断授权信息是否来自 Python watcher 心跳。
+     * 判断授权信息是否来自 watcher 心跳。
      *
      * @param array<string, mixed> $license 授权信息
      * @return bool 是否有 watcher 授权结果
@@ -214,6 +244,8 @@ class ReceiptWatcherRuntimeStatusService extends BaseService
             'instance_id' => $instanceId,
             'hostname' => '',
             'pid' => 0,
+            'runtime' => 'unknown',
+            'runtime_text' => '未知运行时',
             'status' => 'stale',
             'status_text' => '已离线',
             'tone' => 'gray',
@@ -222,9 +254,10 @@ class ReceiptWatcherRuntimeStatusService extends BaseService
             'last_seen_at' => 0,
             'last_seen_at_text' => '已过期',
             'heartbeat_age_text' => '已过期',
-            'poll_interval_seconds' => 0,
-            'account_fetch_limit' => 0,
-            'account_concurrency' => 0,
+            'worker_index' => 0,
+            'worker_processes' => 0,
+            'worker_text' => '—',
+            'stream' => [],
             'plugin_count' => 0,
             'plugins_text' => '—',
             'plugins' => [],
@@ -427,7 +460,7 @@ class ReceiptWatcherRuntimeStatusService extends BaseService
                 'status_text' => '监听工具未上报',
                 'summary_value' => '离线',
                 'tone' => 'warning',
-                'message' => 'Webman 已启用网页流水监听，但 Python receipt_watcher 尚未上报能力心跳。',
+                'message' => 'Webman 已启用网页流水监听，但 Go 直连和 Python 浏览器 watcher 均未上报能力心跳。',
             ];
         }
 
@@ -437,7 +470,7 @@ class ReceiptWatcherRuntimeStatusService extends BaseService
                 'status_text' => '部分插件未授权',
                 'summary_value' => '未授权 ' . count($licenseBlockedCodes),
                 'tone' => 'danger',
-                'message' => 'Python receipt_watcher 授权未允许后台配置的插件：' . implode('、', $licenseBlockedCodes),
+                'message' => 'watcher 授权未允许后台配置的插件：' . implode('、', $licenseBlockedCodes),
             ];
         }
 
@@ -447,7 +480,7 @@ class ReceiptWatcherRuntimeStatusService extends BaseService
                 'status_text' => '部分插件未支持',
                 'summary_value' => '缺失 ' . count($missingCodes),
                 'tone' => 'warning',
-                'message' => '后台配置的插件未在 Python receipt_watcher 中上报支持：' . implode('、', $missingCodes),
+                'message' => '后台配置的插件未在对应 watcher 运行时中上报支持：' . implode('、', $missingCodes),
             ];
         }
 
@@ -456,8 +489,23 @@ class ReceiptWatcherRuntimeStatusService extends BaseService
             'status_text' => '能力正常',
             'summary_value' => '正常',
             'tone' => 'success',
-            'message' => 'Python receipt_watcher 已上报网页流水监听能力。',
+            'message' => 'Go 直连与 Python 浏览器 watcher 已上报所需监听能力。',
         ];
+    }
+
+    /**
+     * watcher 运行时编码转展示文案。
+     *
+     * @param string $runtime 运行时编码
+     * @return string 展示文案
+     */
+    private function runtimeText(string $runtime): string
+    {
+        return match ($runtime) {
+            'go-direct' => 'Go 直连',
+            'python-browser' => 'Python 浏览器',
+            default => $runtime !== '' ? $runtime : '未知运行时',
+        };
     }
 
     /**
@@ -562,6 +610,25 @@ class ReceiptWatcherRuntimeStatusService extends BaseService
             'browser_special' => '特殊页面',
             default => $mode !== '' ? $mode : '未知',
         };
+    }
+
+    /**
+     * 格式化当前进程在容器 worker 组中的序号。
+     *
+     * watcher 内部从 0 开始编号，管理后台按用户习惯从 1 开始展示。
+     * 旧心跳没有总进程数时只展示当前序号，避免伪造一个不准确的总数。
+     *
+     * @param int $workerIndex 从 0 开始的 worker 编号
+     * @param int $workerProcesses 当前容器配置的总 worker 数
+     * @return string Worker 展示文本
+     */
+    private function workerText(int $workerIndex, int $workerProcesses): string
+    {
+        $current = max(0, $workerIndex) + 1;
+
+        return $workerProcesses > 0
+            ? $current . ' / ' . max($current, $workerProcesses)
+            : '#' . $current;
     }
 
     /**

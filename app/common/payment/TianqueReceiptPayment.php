@@ -37,6 +37,10 @@ class TianqueReceiptPayment extends BasePayment implements PaymentInterface, Pay
         'version' => '1.0.0',
         'pay_types' => ['alipay', 'wxpay', 'unionpay'],
         'transfer_types' => [],
+        'receipt_watcher' => [
+            'runtime' => 'browser',
+            'prelogin_supported' => true,
+        ],
         'receipt_supports_remark' => true,
     ];
 }

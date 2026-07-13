@@ -11,7 +11,8 @@ use Workerman\Worker;
 /**
  * 网页流水监听调度进程。
  *
- * 该进程不访问第三方平台，只负责把当前需要查询流水的账号和订单同步到 Redis。
+ * 该进程不访问第三方平台，只维护账号、订单快照、查询/预登录到期表，
+ * 再按支付插件声明把任务投放到四条 v2 Redis Stream。
  */
 class ReceiptWatcherProcess
 {

@@ -37,6 +37,10 @@ class ShouQianBaReceiptPayment extends BasePayment implements PaymentInterface, 
         'version' => '1.0.0',
         'pay_types' => ['alipay', 'wxpay', 'unionpay'],
         'transfer_types' => [],
+        'receipt_watcher' => [
+            'runtime' => 'direct',
+            'prelogin_supported' => true,
+        ],
         'receipt_supports_remark' => true,
     ];
 }

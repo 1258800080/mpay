@@ -153,6 +153,56 @@ class MerchantPortalController extends BaseController
         return $this->success(true);
     }
 
+    /**
+     * 测试当前商户自建通道。
+     *
+     * @param Request $request 请求对象
+     * @param string $id 通道ID
+     * @return Response 响应对象
+     */
+    public function testChannel(Request $request, string $id): Response
+    {
+        $merchantId = $this->currentMerchantId($request);
+        if ($merchantId <= 0) {
+            return $this->fail('未获取到当前商户信息', 401);
+        }
+
+        $data = $this->validated(
+            array_merge($this->payload($request), ['id' => (int) $id]),
+            MerchantPortalValidator::class,
+            'channelTest'
+        );
+        $data['client_ip'] = (string) $request->getRealIp();
+        $data['user_agent'] = (string) $request->header('user-agent', '');
+
+        return $this->success($this->merchantPortalService->testChannel($merchantId, (int) $data['id'], $data));
+    }
+
+    /**
+     * 查询当前商户自建通道测试记录。
+     *
+     * @param Request $request 请求对象
+     * @param string $id 通道ID
+     * @return Response 响应对象
+     */
+    public function channelTestRecords(Request $request, string $id): Response
+    {
+        $merchantId = $this->currentMerchantId($request);
+        if ($merchantId <= 0) {
+            return $this->fail('未获取到当前商户信息', 401);
+        }
+
+        $payload = $this->validated(
+            array_merge($this->payload($request), ['id' => (int) $id]),
+            MerchantPortalValidator::class,
+            'channelTestRecords'
+        );
+        $page = max(1, (int) ($payload['page'] ?? 1));
+        $pageSize = max(1, (int) ($payload['page_size'] ?? 10));
+
+        return $this->success($this->merchantPortalService->channelTestRecords($merchantId, (int) $payload['id'], $payload, $page, $pageSize));
+    }
+
     public function pluginConfigs(Request $request): Response
     {
         $merchantId = $this->currentMerchantId($request);

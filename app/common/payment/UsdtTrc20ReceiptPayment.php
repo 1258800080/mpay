@@ -51,6 +51,10 @@ class UsdtTrc20ReceiptPayment extends BasePayment implements PaymentInterface, P
         'version' => '1.0.0',
         'pay_types' => ['usdt'],
         'transfer_types' => [],
+        'receipt_watcher' => [
+            'runtime' => 'direct',
+            'prelogin_supported' => false,
+        ],
     ];
 
     /**

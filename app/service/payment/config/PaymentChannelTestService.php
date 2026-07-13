@@ -13,6 +13,7 @@ use app\exception\ValidationException;
 use app\model\payment\PayOrder;
 use app\model\payment\PaymentChannel;
 use app\repository\payment\config\PaymentChannelRepository;
+use app\repository\payment\config\PaymentPluginConfRepository;
 use app\repository\payment\trade\BizOrderRepository;
 use app\repository\payment\trade\PayOrderRepository;
 use app\service\payment\order\PayOrderService;
@@ -25,8 +26,19 @@ use support\Log;
  */
 class PaymentChannelTestService extends BaseService
 {
+    /**
+     * 管理后台通道测试订单号前缀。
+     */
+    private const ADMIN_ORDER_PREFIX = 'CHTEST';
+
+    /**
+     * 商户后台自建通道测试订单号前缀。
+     */
+    private const MERCHANT_ORDER_PREFIX = 'MCHTEST';
+
     public function __construct(
         protected PaymentChannelRepository $paymentChannelRepository,
+        protected PaymentPluginConfRepository $paymentPluginConfRepository,
         protected BizOrderRepository $bizOrderRepository,
         protected PayOrderRepository $payOrderRepository,
         protected PayOrderService $payOrderService
@@ -51,17 +63,47 @@ class PaymentChannelTestService extends BaseService
             throw new ValidationException('请先在系统配置中填写测试商户ID');
         }
 
-        /** @var PaymentChannel|null $channel */
-        $channel = $this->paymentChannelRepository->find($channelId);
-        if (!$channel) {
-            throw new ValidationException('支付通道不存在', ['channel_id' => $channelId]);
+        $channel = $this->resolveAdminChannel($channelId);
+
+        return $this->submitByChannel($merchantId, $channel, $data, self::ADMIN_ORDER_PREFIX);
+    }
+
+    /**
+     * 发起商户自建通道测试支付。
+     *
+     * 商户后台只能测试当前商户自己的自收通道，测试仍会创建真实支付单。
+     *
+     * @param int $merchantId 当前商户ID
+     * @param int $channelId 支付通道ID
+     * @param array<string, mixed> $data 测试入参
+     * @return array<string, mixed> 测试订单与支付页信息
+     */
+    public function submitForMerchant(int $merchantId, int $channelId, array $data): array
+    {
+        if (!$this->boolConfig('channel_test_enabled', true)) {
+            throw new ValidationException('通道测试已关闭');
         }
-        if ((int) $channel->merchant_id !== 0 || (int) $channel->channel_mode !== RouteConstant::CHANNEL_MODE_COLLECT) {
-            throw new ValidationException('商户自建通道不能在管理后台测试', [
-                'channel_id' => $channelId,
-                'merchant_id' => (int) $channel->merchant_id,
-            ]);
+        if ($merchantId <= 0) {
+            throw new ValidationException('未获取到当前商户信息');
         }
+
+        $channel = $this->resolveMerchantChannel($merchantId, $channelId);
+
+        return $this->submitByChannel($merchantId, $channel, $data, self::MERCHANT_ORDER_PREFIX);
+    }
+
+    /**
+     * 按指定通道创建测试支付单。
+     *
+     * @param int $merchantId 测试商户ID
+     * @param PaymentChannel $channel 指定测试通道
+     * @param array<string, mixed> $data 测试入参
+     * @param string $orderPrefix 测试订单号前缀
+     * @return array<string, mixed> 测试订单与支付页信息
+     */
+    private function submitByChannel(int $merchantId, PaymentChannel $channel, array $data, string $orderPrefix): array
+    {
+        $channelId = (int) $channel->id;
 
         $money = trim((string) ($data['money'] ?? ''));
         $payAmount = $this->parseMoneyToAmount($money);
@@ -76,7 +118,7 @@ class PaymentChannelTestService extends BaseService
 
         $this->assertChannelAmountAllowed($channel, $payAmount);
 
-        $merchantOrderNo = $this->generateNo('CHTEST' . $channelId);
+        $merchantOrderNo = $this->generateNo($orderPrefix . $channelId);
 
         try {
             $attempt = $this->payOrderService->preparePayAttemptByChannel([
@@ -128,13 +170,50 @@ class PaymentChannelTestService extends BaseService
      */
     public function records(array $filters = [], int $page = 1, int $pageSize = 10)
     {
+        return $this->recordsByScope(self::ADMIN_ORDER_PREFIX, null, $filters, $page, $pageSize);
+    }
+
+    /**
+     * 查询商户自建通道测试记录。
+     *
+     * @param int $merchantId 当前商户ID
+     * @param int $channelId 通道ID
+     * @param array<string, mixed> $filters 筛选条件
+     * @param int $page 页码
+     * @param int $pageSize 每页条数
+     * @return \Illuminate\Contracts\Pagination\LengthAwarePaginator 分页结果
+     */
+    public function merchantRecords(int $merchantId, int $channelId, array $filters = [], int $page = 1, int $pageSize = 10)
+    {
+        if ($merchantId <= 0) {
+            throw new ValidationException('未获取到当前商户信息');
+        }
+
+        $channel = $this->resolveMerchantChannel($merchantId, $channelId);
+        $filters['channel_id'] = (int) $channel->id;
+
+        return $this->recordsByScope(self::MERCHANT_ORDER_PREFIX, $merchantId, $filters, $page, $pageSize);
+    }
+
+    /**
+     * 按测试单号前缀查询测试记录。
+     *
+     * @param string $orderPrefix 测试单号前缀
+     * @param int|null $merchantId 指定商户ID，空表示不限制
+     * @param array<string, mixed> $filters 筛选条件
+     * @param int $page 页码
+     * @param int $pageSize 每页条数
+     * @return \Illuminate\Contracts\Pagination\LengthAwarePaginator 分页结果
+     */
+    private function recordsByScope(string $orderPrefix, ?int $merchantId, array $filters, int $page, int $pageSize)
+    {
         $query = $this->payOrderRepository->query()
             ->from('ma_pay_order as po')
             ->leftJoin('ma_biz_order as bo', 'bo.biz_no', '=', 'po.biz_no')
             ->leftJoin('ma_merchant as m', 'm.id', '=', 'po.merchant_id')
             ->leftJoin('ma_payment_channel as c', 'c.id', '=', 'po.channel_id')
             ->leftJoin('ma_payment_type as t', 't.id', '=', 'po.pay_type_id')
-            ->where('bo.merchant_order_no', 'like', 'CHTEST%')
+            ->where('bo.merchant_order_no', 'like', $orderPrefix . '%')
             ->select([
                 'po.id',
                 'po.pay_no',
@@ -161,6 +240,10 @@ class PaymentChannelTestService extends BaseService
             ->selectRaw("COALESCE(c.plugin_code, '') AS channel_plugin_code")
             ->selectRaw("COALESCE(t.name, '') AS pay_type_name");
 
+        if ($merchantId !== null) {
+            $query->where('po.merchant_id', $merchantId);
+        }
+
         $channelId = (string) ($filters['channel_id'] ?? '');
         if ($channelId !== '') {
             $query->where('po.channel_id', (int) $channelId);
@@ -185,6 +268,66 @@ class PaymentChannelTestService extends BaseService
         });
 
         return $paginator;
+    }
+
+    /**
+     * 解析管理后台可测试的通道。
+     *
+     * @param int $channelId 通道ID
+     * @return PaymentChannel 平台代收通道
+     */
+    private function resolveAdminChannel(int $channelId): PaymentChannel
+    {
+        /** @var PaymentChannel|null $channel */
+        $channel = $this->paymentChannelRepository->find($channelId);
+        if (!$channel) {
+            throw new ValidationException('支付通道不存在', ['channel_id' => $channelId]);
+        }
+        if ((int) $channel->merchant_id !== 0 || (int) $channel->channel_mode !== RouteConstant::CHANNEL_MODE_COLLECT) {
+            throw new ValidationException('商户自建通道不能在管理后台测试', [
+                'channel_id' => $channelId,
+                'merchant_id' => (int) $channel->merchant_id,
+            ]);
+        }
+
+        return $channel;
+    }
+
+    /**
+     * 解析商户后台可测试的自建通道。
+     *
+     * @param int $merchantId 当前商户ID
+     * @param int $channelId 通道ID
+     * @return PaymentChannel 商户自收通道
+     */
+    private function resolveMerchantChannel(int $merchantId, int $channelId): PaymentChannel
+    {
+        /** @var PaymentChannel|null $channel */
+        $channel = $this->paymentChannelRepository->findByMerchantAndId($merchantId, $channelId);
+        if (!$channel) {
+            throw new ValidationException('支付通道不存在', ['channel_id' => $channelId]);
+        }
+        if ((int) $channel->channel_mode !== RouteConstant::CHANNEL_MODE_SELF) {
+            throw new ValidationException('系统分配通道不允许在商户端测试', [
+                'channel_id' => $channelId,
+                'channel_mode' => (int) $channel->channel_mode,
+            ]);
+        }
+
+        $configId = (int) $channel->api_config_id;
+        if ($configId <= 0) {
+            throw new ValidationException('当前通道未绑定商户插件配置', ['channel_id' => $channelId]);
+        }
+
+        $config = $this->paymentPluginConfRepository->findByMerchantAndId($merchantId, $configId);
+        if (!$config || (string) $config->plugin_code !== (string) $channel->plugin_code) {
+            throw new ValidationException('当前通道绑定的插件配置无权使用', [
+                'channel_id' => $channelId,
+                'api_config_id' => $configId,
+            ]);
+        }
+
+        return $channel;
     }
 
     /**

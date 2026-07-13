@@ -29,7 +29,7 @@ use support\Response;
  * 适用场景：
  * - 商户使用个人支付宝收款码收款。
  * - 支付宝不会把这类线下收款主动回调到本系统。
- * - Python receipt_watcher 通过支付宝账务明细接口查询流水，再把归一化流水投递到 Redis 队列。
+ * - Go 直连 watcher 通过支付宝账务明细接口查询流水，再把归一化流水投递到 Redis 队列。
  *
  * 职责边界：
  * - 本插件负责生成收银台二维码承接参数、分配金额/备注识别信息、根据流水定位支付单。
@@ -74,6 +74,10 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
         'version' => '1.0.0',
         'pay_types' => ['alipay'],
         'transfer_types' => [],
+        'receipt_watcher' => [
+            'runtime' => 'direct',
+            'prelogin_supported' => false,
+        ],
         'config_schema' => [
             [
                 'type' => 'input',
@@ -274,7 +278,7 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
      * 主动查单由 receipt_watcher 完成，这里保持支付中。
      *
      * 支付运行时的主动查单会调用插件 query()，但账单流水由 receipt_watcher 查询。
-     * 真正的流水查询由 Python receipt_watcher 负责，本方法只返回 pending，避免误推进状态。
+     * 真正的流水查询由 Go 直连 watcher 负责，本方法只返回 pending，避免主动查单误推进状态。
      *
      * @param array<string, mixed> $order 订单参数
      * @return array<string, mixed>
@@ -422,11 +426,13 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
         $amount = FormatHelper::amount((int) $prepared['pay_amount']);
         $remarkCode = (string) $prepared['remark_code'];
         $transferUrl = $this->alipayTransferUrl($amount, $remarkCode);
+        $pcTransferUrl = $this->alipayTransferPcUrl($amount, $remarkCode);
 
         return [
             '_page' => 'alipayTransfer',
             'transfer_url' => $transferUrl,
-            'qrcode' => $transferUrl,
+            'pc_transfer_url' => $pcTransferUrl,
+            'qrcode' => $pcTransferUrl,
             'amount' => $amount,
             'original_amount' => FormatHelper::amount((int) $prepared['original_amount']),
             'receipt_match_mode' => 'alipay_transfer',
@@ -449,10 +455,7 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
      */
     private function alipayTransferUrl(string $amount, string $remarkCode): string
     {
-        $userId = trim((string) $this->getConfig('bill_user_id', ''));
-        if ($userId === '') {
-            throw new PaymentException('支付宝账单插件未配置支付宝用户ID', 40200);
-        }
+        $userId = $this->alipayBillUserId();
 
         $innerScheme = 'alipays://platformapi/startapp?' . http_build_query([
             'appId' => '20000116',
@@ -476,6 +479,50 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
         return 'https://render.alipay.com/p/c/mdeduct-landing?' . http_build_query([
             'scheme' => $middleRenderUrl,
         ], '', '&', PHP_QUERY_RFC3986);
+    }
+
+    /**
+     * 生成支付宝 PC 端扫码免输转账 URL。
+     *
+     * PC 页面把该 scheme 渲染为二维码，用户使用支付宝扫码后由支付宝客户端自动填入金额、
+     * 收款人和备注码。备注码仍用于 receipt_watcher 流水匹配。
+     *
+     * @param string $amount 金额，单位元
+     * @param string $remarkCode 转账备注
+     * @return string 支付宝 PC 扫码转账 URL
+     */
+    private function alipayTransferPcUrl(string $amount, string $remarkCode): string
+    {
+        $bizData = json_encode([
+            'a' => $amount,
+            'm' => $remarkCode,
+            's' => 'money',
+            'u' => $this->alipayBillUserId(),
+        ], JSON_UNESCAPED_UNICODE);
+        if (!is_string($bizData)) {
+            throw new PaymentException('支付宝转账二维码参数生成失败', 40200);
+        }
+
+        return 'alipays://platformapi/startapp?' . http_build_query([
+            'appId' => '20000123',
+            'actionType' => 'scan',
+            'biz_data' => $bizData,
+        ], '', '&', PHP_QUERY_RFC3986);
+    }
+
+    /**
+     * 读取支付宝账单收款用户 ID。
+     *
+     * @return string 支付宝用户 ID
+     */
+    private function alipayBillUserId(): string
+    {
+        $userId = trim((string) $this->getConfig('bill_user_id', ''));
+        if ($userId === '') {
+            throw new PaymentException('支付宝账单插件未配置支付宝用户ID', 40200);
+        }
+
+        return $userId;
     }
 
     /**

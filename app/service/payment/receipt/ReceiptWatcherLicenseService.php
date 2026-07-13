@@ -7,12 +7,14 @@ use app\common\constant\CommonConstant;
 use app\common\interface\ChannelNotifyPayloadInterface;
 use app\model\payment\PaymentPlugin;
 use app\repository\payment\config\PaymentPluginRepository;
+use support\Log;
+use Throwable;
 
 /**
  * receipt_watcher 授权码配置和插件能力识别服务。
  *
  * Webman 只保存离线授权码，并把系统配置刷新到 `system_config:all` 缓存。
- * 正式授权验签和插件拦截由 Python watcher 二进制完成。
+ * 正式授权验签和插件拦截分别由 Go 直连与 Python 浏览器 watcher 二进制完成。
  */
 class ReceiptWatcherLicenseService extends BaseService
 {
@@ -89,6 +91,24 @@ class ReceiptWatcherLicenseService extends BaseService
         }
 
         return $this->pluginRecordSupportsReceiptWatcher(
+            $this->paymentPluginRepository->findByCode($pluginCode, ['code', 'class_name', 'status'])
+        );
+    }
+
+    /**
+     * 读取支付插件声明的 watcher 运行能力。
+     *
+     * @param string $pluginCode 插件编码
+     * @return array{runtime:string,prelogin_supported:bool}|null watcher 能力
+     */
+    public function watcherInfo(string $pluginCode): ?array
+    {
+        $pluginCode = trim($pluginCode);
+        if ($pluginCode === '') {
+            return null;
+        }
+
+        return $this->pluginRecordWatcherInfo(
             $this->paymentPluginRepository->findByCode($pluginCode, ['code', 'class_name', 'status'])
         );
     }
@@ -182,16 +202,56 @@ class ReceiptWatcherLicenseService extends BaseService
      */
     private function pluginRecordSupportsReceiptWatcher(?PaymentPlugin $plugin): bool
     {
+        return $this->pluginRecordWatcherInfo($plugin) !== null;
+    }
+
+    /**
+     * 实例化插件并校验 watcher 能力声明。
+     *
+     * @param PaymentPlugin|null $plugin 插件记录
+     * @return array{runtime:string,prelogin_supported:bool}|null watcher 能力
+     */
+    private function pluginRecordWatcherInfo(?PaymentPlugin $plugin): ?array
+    {
         if (!$plugin || (int) $plugin->status !== CommonConstant::STATUS_ENABLED) {
-            return false;
+            return null;
         }
 
         $className = $this->resolvePluginClassName((string) $plugin->class_name);
         if ($className === '' || !class_exists($className)) {
-            return false;
+            return null;
         }
 
-        return is_subclass_of($className, ChannelNotifyPayloadInterface::class);
+        try {
+            $instance = container_make($className, []);
+        } catch (Throwable $e) {
+            Log::warning(sprintf(
+                '[ReceiptWatcherLicenseService] watcher 插件实例化失败 plugin=%s error=%s',
+                (string) $plugin->code,
+                $e->getMessage()
+            ));
+            return null;
+        }
+        if (!$instance instanceof ChannelNotifyPayloadInterface) {
+            return null;
+        }
+
+        $info = $instance->receiptWatcherInfo();
+        $runtime = strtolower(trim((string) ($info['runtime'] ?? '')));
+        $preloginSupported = $info['prelogin_supported'] ?? null;
+        if (!in_array($runtime, ['direct', 'browser'], true) || !is_bool($preloginSupported)) {
+            Log::warning(sprintf(
+                '[ReceiptWatcherLicenseService] watcher 能力声明无效 plugin=%s runtime=%s',
+                (string) $plugin->code,
+                $runtime
+            ));
+            return null;
+        }
+
+        return [
+            'runtime' => $runtime,
+            'prelogin_supported' => $preloginSupported,
+        ];
     }
 
     /**
