@@ -14,11 +14,15 @@ use app\common\sdk\passpay\PasspaySdkException;
 use app\common\trait\DirectPaymentProductSelectorTrait;
 use app\common\util\FormatHelper;
 use app\exception\PaymentException;
+use app\exception\PaymentUncertainException;
+use app\exception\UnsupportedPaymentOperationException;
 use support\Request;
 use support\Response;
 
 /**
  * 精秀支付 API 插件。
+ *
+ * 负责微信、支付宝、QQ 与银联直连产品的下单、退款和异步通知适配；当前协议未接入主动查单与关单能力。
  */
 class PasspayApiPayment extends BasePayment implements PaymentInterface, PayPluginInterface
 {
@@ -84,7 +88,8 @@ class PasspayApiPayment extends BasePayment implements PaymentInterface, PayPlug
      * 发起支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准待支付结果
      */
     public function pay(array $order): array
     {
@@ -154,7 +159,8 @@ class PasspayApiPayment extends BasePayment implements PaymentInterface, PayPlug
      *
      * @param array<string, mixed> $order 标准插件下单参数
      * @param string $tradeType 精秀支付产品
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准待支付结果
      */
     private function tradePay(array $order, string $tradeType): array
     {
@@ -176,25 +182,25 @@ class PasspayApiPayment extends BasePayment implements PaymentInterface, PayPlug
     }
 
     /**
-     * 精秀旧插件未提供主动查单链路。
+     * 当前适配协议未提供可确认的主动查单接口。
      *
      * @param array<string, mixed> $order 标准插件查单参数
      * @return array<string, mixed>
      */
     public function query(array $order): array
     {
-        return ['success' => false, 'status' => PaymentPluginStatusConstant::PENDING, 'msg' => '精秀支付插件暂不支持主动查单'];
+        throw new UnsupportedPaymentOperationException('精秀支付插件暂不支持主动查单', 40200);
     }
 
     /**
-     * 精秀旧插件未提供关单链路。
+     * 当前适配协议未提供可确认的关单接口。
      *
      * @param array<string, mixed> $order 标准插件关单参数
      * @return array<string, mixed>
      */
     public function close(array $order): array
     {
-        return ['success' => false, 'msg' => '精秀支付插件暂不支持关单'];
+        throw new UnsupportedPaymentOperationException('精秀支付插件暂不支持关单', 40200);
     }
 
     /**
@@ -213,23 +219,31 @@ class PasspayApiPayment extends BasePayment implements PaymentInterface, PayPlug
                 'trade_no' => (string) ($order['chan_trade_no'] ?? ''),
             ]);
         } catch (PasspaySdkException $e) {
-            return ['success' => false, 'msg' => $e->getMessage()];
+            throw new PaymentUncertainException('精秀支付退款结果不确定：' . $e->getMessage(), 40200);
         }
 
+        $refundAmount = isset($data['refund_amount'])
+            ? $this->yuanToCents($data['refund_amount'], '精秀支付退款金额')
+            : (int) $order['refund_amount'];
+
         return [
-            'success' => true,
-            'msg' => '退款申请成功',
-            'chan_refund_no' => (string) ($data['trade_no'] ?? $order['refund_no']),
-            'refund_amount' => (int) round(((float) ($data['refund_amount'] ?? 0)) * 100),
-            'raw_data' => $data,
+            'status' => PaymentPluginStatusConstant::SUCCESS,
+            'refund_no' => (string) $order['refund_no'],
+            'pay_no' => (string) $order['pay_no'],
+            'refund_amount' => $refundAmount,
+            'chan_refund_no' => (string) ($data['trade_no'] ?? ''),
+            'message' => '退款申请成功',
         ];
     }
 
     /**
      * 解析支付回调。
      *
+     * 回调参数须通过平台公钥验签，只有 SUCCESS 状态才返回实付金额。
+     *
      * @param Request $request 回调请求
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准支付通知结果
      */
     public function notify(Request $request): array
     {
@@ -242,9 +256,11 @@ class PasspayApiPayment extends BasePayment implements PaymentInterface, PayPlug
 
         return [
             'status' => $success ? PaymentPluginStatusConstant::SUCCESS : PaymentPluginStatusConstant::PENDING,
+            'pay_no' => trim((string) ($payload['out_trade_no'] ?? '')),
+            'paid_amount' => $success ? $this->yuanToCents($payload['total_amount'] ?? null, '精秀支付回调金额') : null,
             'message' => (string) ($payload['order_status'] ?? ''),
-            'channel_order_no' => (string) ($payload['out_trade_no'] ?? ''),
-            'channel_trade_no' => (string) ($payload['trade_no'] ?? $payload['channel_order_sn'] ?? ''),
+            'chan_order_no' => (string) ($payload['out_trade_no'] ?? ''),
+            'chan_trade_no' => (string) ($payload['trade_no'] ?? $payload['channel_order_sn'] ?? ''),
             'channel_status' => (string) ($payload['order_status'] ?? ''),
         ];
     }
@@ -266,10 +282,27 @@ class PasspayApiPayment extends BasePayment implements PaymentInterface, PayPlug
     }
 
     /**
-     * JSAPI 支付。
+     * 将上游元金额严格换算为分，拒绝负数及超过两位的小数。
+     *
+     * @param mixed $value 上游金额原值
+     * @param string $field 用于异常提示的字段名称
+     */
+    private function yuanToCents(mixed $value, string $field): int
+    {
+        $text = trim((string) $value);
+        if (preg_match('/^(0|[1-9]\d*)(?:\.(\d{1,2}))?$/', $text, $matches) !== 1) {
+            throw new PaymentException($field . '格式无效', 40200);
+        }
+
+        return ((int) $matches[1] * 100) + (int) str_pad((string) ($matches[2] ?? ''), 2, '0');
+    }
+
+    /**
+     * 根据支付方式补充用户标识并发起 JSAPI 下单。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准待支付结果
      */
     private function jsapiPay(array $order): array
     {
@@ -297,10 +330,11 @@ class PasspayApiPayment extends BasePayment implements PaymentInterface, PayPlug
     }
 
     /**
-     * 构造通用下单参数。
+     * 构造精秀各支付产品共享的下单参数。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 上游下单请求参数
      */
     private function basePayload(array $order): array
     {
@@ -316,16 +350,21 @@ class PasspayApiPayment extends BasePayment implements PaymentInterface, PayPlug
     }
 
     /**
-     * 包装标准支付结果。
+     * 将上游支付凭据包装为标准待支付结果。
      *
+     * @param string $page 收银台承接页类型
+     * @param string $payType 标准支付方式代码
+     * @param string $product 已选精秀支付产品
+     * @param string $action 实际调用的上游接口
      * @param array<string, mixed> $payParams 承接页参数
      * @param array<string, mixed> $data 上游响应
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准待支付结果
      */
     private function payResult(string $page, string $payType, string $product, string $action, array $payParams, array $data, array $order): array
     {
-        return [
+        return $this->pendingPaymentResult($order, [
             'pay_page' => $page,
             'pay_type' => $payType,
             'pay_product' => $product,
@@ -333,11 +372,11 @@ class PasspayApiPayment extends BasePayment implements PaymentInterface, PayPlug
             'pay_params' => $payParams,
             'chan_order_no' => (string) ($data['out_trade_no'] ?? $order['pay_no']),
             'chan_trade_no' => (string) ($data['trade_no'] ?? ''),
-        ];
+        ]);
     }
 
     /**
-     * 获取 SDK 客户端。
+     * 获取复用商户密钥初始化的 SDK 客户端。
      */
     private function client(): PasspayClient
     {
@@ -354,7 +393,9 @@ class PasspayApiPayment extends BasePayment implements PaymentInterface, PayPlug
     }
 
     /**
-     * 获取字符串配置。
+     * 读取字符串配置，缺失时返回空字符串。
+     *
+     * @param string $key 配置键
      */
     private function configText(string $key): string
     {

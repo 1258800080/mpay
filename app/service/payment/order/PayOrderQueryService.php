@@ -5,6 +5,7 @@ namespace app\service\payment\order;
 use app\common\base\BaseService;
 use app\common\constant\CommonConstant;
 use app\common\constant\NotifyConstant;
+use app\common\constant\PaymentExceptionConstant;
 use app\exception\ResourceNotFoundException;
 use app\exception\ValidationException;
 use app\model\payment\PayOrder;
@@ -116,13 +117,40 @@ class PayOrderQueryService extends BaseService
             $query->where('po.callback_status', (int) $filters['callback_status']);
         }
 
+        if (!empty($filters['late_duplicate'])) {
+            $openStatuses = [
+                PaymentExceptionConstant::STATUS_OPEN,
+                PaymentExceptionConstant::STATUS_HANDLING,
+            ];
+            if ($includeActions) {
+                $query->whereIn('pe.status', $openStatuses);
+            } else {
+                $query->whereExists(function ($subQuery) use ($openStatuses): void {
+                    $subQuery->selectRaw('1')
+                        ->from('ma_payment_exception as pe_filter')
+                        ->whereColumn('pe_filter.subject_no', 'po.pay_no')
+                        ->where('pe_filter.subject_type', PaymentExceptionConstant::SUBJECT_PAY)
+                        ->where('pe_filter.exception_type', PaymentExceptionConstant::TYPE_PAY_LATE_DUPLICATE)
+                        ->whereIn('pe_filter.status', $openStatuses);
+                });
+            }
+        }
+
         $paginator = $query
             ->orderByDesc('po.id')
             ->paginate(max(1, $pageSize), ['*'], 'page', max(1, $page));
 
         $list = [];
         foreach ($paginator->items() as $item) {
-            $list[] = $this->payOrderReportService->formatPayOrderRow($item->toArray());
+            $row = $item->toArray();
+            if ($merchantId !== null && !$includeActions) {
+                $row = $this->withoutInternalRecoveryMetadata($row);
+            }
+            $row = $this->payOrderReportService->formatPayOrderRow($row);
+            if ($includeActions) {
+                $row = $this->withLateDuplicatePresentation($row);
+            }
+            $list[] = $row;
         }
         if ($includeActions) {
             $list = $this->payOrderActionResolverService->resolveForRows($list);
@@ -190,7 +218,17 @@ class PayOrderQueryService extends BaseService
             $channelQueryLogs,
             $operationLogs
         );
-        $payOrderView = $detailRow ? $this->payOrderReportService->formatPayOrderRow($detailRow->toArray()) : null;
+        $payOrderView = null;
+        if ($detailRow) {
+            $row = $detailRow->toArray();
+            if ($merchantId !== null && !$includeActions) {
+                $row = $this->withoutInternalRecoveryMetadata($row);
+            }
+            $payOrderView = $this->payOrderReportService->formatPayOrderRow($row);
+            if ($includeActions) {
+                $payOrderView = $this->withLateDuplicatePresentation($payOrderView);
+            }
+        }
         if ($includeActions && $payOrderView) {
             $payOrderView = $this->payOrderActionResolverService->resolveForRow($payOrderView);
         }
@@ -366,11 +404,28 @@ class PayOrderQueryService extends BaseService
 
         if ($includeActionColumns) {
             // 通知地址只用于后台按钮判断，避免影响商户/API 侧原有列表输出面。
+            $query->leftJoin('ma_payment_exception as pe', function ($join): void {
+                $join->on('pe.subject_no', '=', 'po.pay_no')
+                    ->where('pe.subject_type', PaymentExceptionConstant::SUBJECT_PAY)
+                    ->where('pe.exception_type', PaymentExceptionConstant::TYPE_PAY_LATE_DUPLICATE);
+            });
             $query->addSelect([
                 'po.notify_url',
                 'po.return_url',
                 'bo.notify_url as biz_notify_url',
                 'bo.return_url as biz_return_url',
+                'pe.exception_no as payment_exception_no',
+                'pe.exception_type as payment_exception_type',
+                'pe.severity as payment_exception_severity',
+                'pe.status as payment_exception_status',
+                'pe.source_type as payment_exception_source_type',
+                'pe.source_id as payment_exception_source_id',
+                'pe.summary as payment_exception_summary',
+                'pe.detail_json as payment_exception_detail_json',
+                'pe.resolution as payment_exception_resolution',
+                'pe.resolution_ref_no as payment_exception_resolution_ref_no',
+                'pe.detected_at as payment_exception_detected_at',
+                'pe.resolved_at as payment_exception_resolved_at',
             ]);
         }
 
@@ -545,7 +600,88 @@ class PayOrderQueryService extends BaseService
             'manual_success' => '手动补单',
             'freeze' => '冻结订单',
             'unfreeze' => '解冻订单',
+            'late_duplicate_payment' => '重复支付异常',
+            'late_duplicate_refunded' => '重复支付退款完成',
         ][$action] ?? $action;
+    }
+
+    /**
+     * 为管理后台附加重复支付异常展示字段。
+     *
+     * 该方法只在 includeActions=true 的管理后台路径调用，避免改变 V1/V2 或商户侧既有响应字段。
+     *
+     * @param array<string, mixed> $row 支付单展示行
+     * @return array<string, mixed> 管理后台展示行
+     */
+    private function withLateDuplicatePresentation(array $row): array
+    {
+        $exceptionNo = trim((string) ($row['payment_exception_no'] ?? ''));
+        $status = $exceptionNo === '' ? null : (int) ($row['payment_exception_status'] ?? 0);
+        $detail = $row['payment_exception_detail_json'] ?? [];
+        if (is_string($detail)) {
+            $decoded = json_decode($detail, true);
+            $detail = is_array($decoded) ? $decoded : [];
+        }
+
+        $state = match ($status) {
+            PaymentExceptionConstant::STATUS_OPEN,
+            PaymentExceptionConstant::STATUS_HANDLING => 'pending_refund',
+            PaymentExceptionConstant::STATUS_RESOLVED => 'refunded',
+            default => '',
+        };
+        $row['is_late_duplicate'] = $exceptionNo !== '';
+        $row['late_duplicate'] = $exceptionNo === '' ? [] : array_merge((array) $detail, [
+            'exception_no' => $exceptionNo,
+            'state' => $state,
+            'severity' => (int) ($row['payment_exception_severity'] ?? 0),
+            'source_type' => (string) ($row['payment_exception_source_type'] ?? ''),
+            'source_id' => (int) ($row['payment_exception_source_id'] ?? 0),
+            'summary' => (string) ($row['payment_exception_summary'] ?? ''),
+            'resolution' => (string) ($row['payment_exception_resolution'] ?? ''),
+            'refund_no' => (string) ($row['payment_exception_resolution_ref_no'] ?? ''),
+            'detected_at' => (string) ($row['payment_exception_detected_at'] ?? ''),
+            'resolved_at' => (string) ($row['payment_exception_resolved_at'] ?? ''),
+        ]);
+        $row['exception_status_text'] = match ($status) {
+            PaymentExceptionConstant::STATUS_OPEN => '重复支付待退款',
+            PaymentExceptionConstant::STATUS_HANDLING => '重复支付处理中',
+            PaymentExceptionConstant::STATUS_RESOLVED => '重复支付已退款',
+            PaymentExceptionConstant::STATUS_IGNORED => '重复支付已忽略',
+            default => '',
+        };
+
+        foreach (array_keys($row) as $key) {
+            if (str_starts_with((string) $key, 'payment_exception_')) {
+                unset($row[$key]);
+            }
+        }
+
+        return $row;
+    }
+
+    /**
+     * 从商户/V2 查询结果中移除临时支付上下文。
+     *
+     * 临时支付上下文在正式结果返回前不对外暴露。
+     *
+     * @param array<string, mixed> $row 支付单查询行
+     * @return array<string, mixed> 公开查询行
+     */
+    private function withoutInternalRecoveryMetadata(array $row): array
+    {
+        $extJson = $row['ext_json'] ?? [];
+        if (!is_array($extJson)) {
+            return $row;
+        }
+
+        $paymentContext = (array) ($extJson['payment_context'] ?? []);
+        if (!empty($paymentContext['_provisional'])) {
+            unset($extJson['payment_context']);
+        }
+
+        $row['ext_json'] = $extJson;
+
+        return $row;
     }
 
     /**

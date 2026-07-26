@@ -49,7 +49,6 @@ class EpayV1ProtocolService extends BaseService
 
     /**
      * 构造方法。
-     *
      * @param MerchantApiCredentialService $merchantApiCredentialService 商户 API 凭证服务
      * @param PaymentTypeService $paymentTypeService 支付类型服务
      * @param PayOrderService $payOrderService 支付订单服务
@@ -532,11 +531,12 @@ class EpayV1ProtocolService extends BaseService
         $payOrder = $attempt['pay_order'];
         $payParams = (array) ($attempt['pay_params'] ?? []);
         $paymentResult = (array) ($attempt['payment_result'] ?? []);
+        $presentation = (array) ($paymentResult['presentation'] ?? []);
         $paymentPageUrl = (string) ($attempt['payment_page_url'] ?? $this->buildPaymentPageUrl((string) $payOrder->pay_no));
         $payNo = (string) $payOrder->pay_no;
         $response = ['code' => self::SUCCESS_CODE, 'msg' => '提交成功', 'trade_no' => $payNo];
         $device = strtolower(trim((string) ($payOrder->device ?? '')));
-        $type = strtolower(trim((string) ($paymentResult['pay_page'] ?? '')));
+        $type = strtolower(trim((string) ($presentation['pay_page'] ?? '')));
 
         if ($device === 'jump') {
             $response['payurl'] = $paymentPageUrl;
@@ -652,7 +652,6 @@ class EpayV1ProtocolService extends BaseService
 
     /**
      * 将元金额转成分。
-     *
      * @param string $money 金额字符串
      * @return int 金额分值，非法时返回 0
      */
@@ -726,7 +725,6 @@ class EpayV1ProtocolService extends BaseService
 
     /**
      * 将任意值规范化为字符串。
-     *
      * @param array|object|bool|float|int|string|null $value 待转换值
      * @return string 规范化后的字符串
      */

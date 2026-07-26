@@ -87,7 +87,7 @@ class AdminAuthService extends BaseService
         $admin->last_login_ip = $ip;
         $admin->save();
 
-        return $this->issueToken((int) $admin->id, 86400, $ip, $userAgent);
+        return $this->issueToken((int) $admin->id, $ip, $userAgent);
     }
 
     /**
@@ -105,13 +105,12 @@ class AdminAuthService extends BaseService
      * 签发新的管理员登录 token。
      *
      * @param int $adminId 管理员ID
-     * @param int $ttlSeconds 过期秒数
      * @param string $ip 请求 IP
      * @param string $userAgent 用户代理
      * @return array{token: string, expires_in: int, admin: AdminUser} 登录结果
      * @throws ValidationException
      */
-    public function issueToken(int $adminId, int $ttlSeconds = 86400, string $ip = '', string $userAgent = ''): array
+    public function issueToken(int $adminId, string $ip = '', string $userAgent = ''): array
     {
         /** @var AdminUser|null $admin */
         $admin = $this->adminUserRepository->find($adminId);
@@ -131,7 +130,7 @@ class AdminAuthService extends BaseService
             'is_super' => (int) $admin->is_super,
             'last_login_ip' => $ip,
             'user_agent' => $userAgent,
-        ], $ttlSeconds);
+        ]);
 
         return [
             'token' => $issued['token'],
@@ -140,6 +139,3 @@ class AdminAuthService extends BaseService
         ];
     }
 }
-
-
-

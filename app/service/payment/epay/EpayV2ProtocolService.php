@@ -11,6 +11,7 @@ use app\common\constant\TradeConstant;
 use app\common\util\FormatHelper;
 use app\exception\ResourceNotFoundException;
 use app\exception\ValidationException;
+use app\exception\PaymentException;
 use app\model\merchant\Merchant;
 use app\model\payment\BizOrder;
 use app\model\payment\PayOrder;
@@ -23,6 +24,7 @@ use app\repository\payment\trade\RefundOrderRepository;
 use app\service\merchant\MerchantService;
 use app\service\payment\order\PayOrderQueryService;
 use app\service\payment\order\PayOrderService;
+use app\service\payment\order\PaymentPluginCloseResultValidator;
 use app\service\payment\order\RefundDispatchService;
 use app\service\payment\order\RefundService;
 use app\service\payment\transfer\TransferService;
@@ -160,17 +162,9 @@ class EpayV2ProtocolService extends BaseService
             /** @var PayOrder $payOrder */
             $payOrder = $attempt['pay_order'];
             $paymentResult = (array) ($attempt['payment_result'] ?? []);
-            $payPage = strtolower(trim((string) ($paymentResult['pay_page'] ?? '')));
-            $payAction = strtolower(trim((string) ($paymentResult['pay_action'] ?? $payPage)));
             $payParams = (array) ($attempt['pay_params'] ?? []);
 
-            return $this->signResponse([
-                'code' => self::SUCCESS_CODE,
-                'msg' => 'success',
-                'trade_no' => (string) $payOrder->pay_no,
-                'pay_type' => $payAction,
-                'pay_info' => $this->buildCreatePayInfo($payPage, $payParams),
-            ]);
+            return $this->signResponse($this->buildCreateResponse($payOrder, $paymentResult, $payParams));
         } catch (Throwable $e) {
             return $this->signResponse([
                 'code' => self::FAILURE_CODE,
@@ -229,7 +223,7 @@ class EpayV2ProtocolService extends BaseService
             ]);
 
             $refundOrder = $this->refundDispatchService->dispatch($refundOrder);
-            if ((int) $refundOrder->status !== TradeConstant::REFUND_STATUS_SUCCESS) {
+            if ((int) $refundOrder->status === TradeConstant::REFUND_STATUS_FAILED) {
                 throw new ValidationException((string) ($refundOrder->last_error ?: '退款失败'));
             }
 
@@ -254,6 +248,7 @@ class EpayV2ProtocolService extends BaseService
         try {
             $merchant = $this->authorizeMerchant($payload);
             $refundOrder = $this->resolveRefundOrder((int) $merchant->id, $payload);
+            $refundOrder = $this->refundDispatchService->queryStatus($refundOrder);
             $payOrder = $this->payOrderRepository->findByPayNo((string) $refundOrder->pay_no);
             $bizOrder = $this->bizOrderRepository->findByBizNo((string) $refundOrder->biz_no);
 
@@ -301,20 +296,35 @@ class EpayV2ProtocolService extends BaseService
 
             $plugin = $this->paymentPluginManager->createByPayOrder($payOrder, true);
             $pluginResult = $plugin->close([
-                'order_id' => (string) $payOrder->pay_no,
                 'pay_no' => (string) $payOrder->pay_no,
                 'biz_no' => (string) $payOrder->biz_no,
                 'chan_order_no' => (string) $payOrder->channel_order_no,
                 'chan_trade_no' => (string) $payOrder->channel_trade_no,
-                'out_trade_no' => (string) ($payOrder->channel_order_no ?: $payOrder->pay_no),
-                'extra' => (array) ($payOrder->ext_json ?? []),
-            ]);
-
-            if (array_key_exists('success', $pluginResult) && !(bool) $pluginResult['success']) {
-                throw new ValidationException((string) ($pluginResult['msg'] ?? $pluginResult['message'] ?? '渠道关单失败'));
+                'amount' => (int) $payOrder->pay_amount,
+                'pay_created_at' => (string) ($payOrder->created_at ?? ''),
+                'client_ip' => (string) ($payOrder->client_ip ?? ''),
+                '_env' => (string) (($payOrder->device ?? '') ?: 'pc'),
+                'pay_type_id' => (int) $payOrder->pay_type_id,
+            ] + $this->paymentContext($payOrder));
+            $pluginResult = PaymentPluginCloseResultValidator::make($pluginResult)
+                ->withScene('close_result')
+                ->withException(PaymentException::class)
+                ->validate();
+            if (!hash_equals((string) $payOrder->pay_no, (string) $pluginResult['pay_no'])) {
+                throw new ValidationException('插件关单返回的支付单号不匹配');
+            }
+            foreach (['chan_order_no' => 'channel_order_no', 'chan_trade_no' => 'channel_trade_no'] as $field => $modelField) {
+                $stored = trim((string) ($payOrder->{$modelField} ?? ''));
+                $actual = trim((string) ($pluginResult[$field] ?? ''));
+                if ($stored !== '' && $actual !== '' && !hash_equals($stored, $actual)) {
+                    throw new ValidationException('插件关单返回的渠道流水与支付单不匹配');
+                }
+            }
+            if ((string) $pluginResult['status'] !== 'closed') {
+                throw new ValidationException((string) ($pluginResult['message'] ?? '渠道关单结果尚未确认'));
             }
 
-            $closeReason = (string) ($pluginResult['msg'] ?? 'ePay V2 手动关闭');
+            $closeReason = (string) ($pluginResult['message'] ?? 'ePay V2 手动关闭');
             $this->payOrderService->closePayOrder((string) $payOrder->pay_no, [
                 'closed_at' => $this->now(),
                 'reason' => $closeReason,
@@ -596,6 +606,37 @@ class EpayV2ProtocolService extends BaseService
     }
 
     /**
+     * 读取支付单实际使用的渠道产品上下文。
+     *
+     * @param PayOrder $payOrder 支付单
+     * @return array{pay_type_code:string,pay_product:string,pay_action:string,channel_context:array<string,mixed>}
+     */
+    private function paymentContext(PayOrder $payOrder): array
+    {
+        $extJson = (array) ($payOrder->ext_json ?? []);
+        $context = (array) ($extJson['payment_context'] ?? []);
+        if ($context === []) {
+            throw new PaymentException('支付单缺少插件支付上下文', 40200, [
+                'pay_no' => (string) $payOrder->pay_no,
+            ]);
+        }
+        $payType = trim((string) ($context['pay_type'] ?? ''));
+        $payProduct = trim((string) ($context['pay_product'] ?? ''));
+        if ($payType === '' || $payProduct === '') {
+            throw new PaymentException('支付单插件支付上下文不完整', 40200, [
+                'pay_no' => (string) $payOrder->pay_no,
+            ]);
+        }
+
+        return [
+            'pay_type_code' => $payType,
+            'pay_product' => $payProduct,
+            'pay_action' => trim((string) ($context['pay_action'] ?? '')),
+            'channel_context' => (array) ($context['channel_context'] ?? []),
+        ];
+    }
+
+    /**
      * V2 API 返回协议字段，不能暴露承接页内部的 `page/_page` 结构。
      *
      * @param string $payPage 承接页类型
@@ -604,15 +645,58 @@ class EpayV2ProtocolService extends BaseService
      */
     private function buildCreatePayInfo(string $payPage, array $payParams): mixed
     {
-        return match ($payPage) {
+        $payInfo = match ($payPage) {
             'qrcode' => (string) ($payParams['qrcode'] ?? ''),
             'html' => (string) ($payParams['html'] ?? ''),
             'jump' => (string) ($payParams['url'] ?? ''),
             'urlscheme' => (string) ($payParams['urlscheme'] ?? ''),
-            'jsapi' => array_diff_key($payParams, ['raw' => true]),
-            'page' => $payParams['params'] ?? array_diff_key($payParams, ['_page' => true, 'raw' => true]),
-            default => array_diff_key($payParams, ['raw' => true]),
+            'jsapi' => $payParams,
+            'page' => $payParams['params'] ?? array_diff_key($payParams, ['_page' => true]),
+            default => $payParams,
         };
+
+        return is_array($payInfo) ? $this->publicPayInfo($payInfo) : $payInfo;
+    }
+
+    /**
+     * 移除协议响应中仅供服务端诊断的原始渠道数据。
+     *
+     * @param array<string, mixed> $payInfo 支付参数
+     * @return array<string, mixed> 可公开给协议调用方的支付参数
+     */
+    private function publicPayInfo(array $payInfo): array
+    {
+        unset($payInfo['raw']);
+        foreach ($payInfo as $key => $value) {
+            if (is_array($value)) {
+                $payInfo[$key] = $this->publicPayInfo($value);
+            }
+        }
+
+        return $payInfo;
+    }
+
+    /**
+     * 将标准支付结果映射为 V2 创建订单响应。
+     *
+     * @param PayOrder $payOrder 支付订单
+     * @param array<string, mixed> $paymentResult 标准支付结果
+     * @param array<string, mixed> $payParams 支付承接参数
+     * @return array<string, mixed> 未签名的 V2 响应
+     */
+    private function buildCreateResponse(PayOrder $payOrder, array $paymentResult, array $payParams): array
+    {
+        $presentation = (array) ($paymentResult['presentation'] ?? []);
+        $payPage = strtolower(trim((string) ($presentation['pay_page'] ?? '')));
+        $payAction = strtolower(trim((string) ($paymentResult['pay_action'] ?? $payPage)));
+
+        return [
+            'code' => self::SUCCESS_CODE,
+            'msg' => 'success',
+            'trade_no' => (string) $payOrder->pay_no,
+            'pay_type' => $payAction,
+            'pay_info' => $this->buildCreatePayInfo($payPage, $payParams),
+        ];
     }
 
     /**
@@ -639,7 +723,6 @@ class EpayV2ProtocolService extends BaseService
 
     /**
      * 解析支付上下文。
-     *
      * @param int $merchantId 商户ID
      * @param array $payload 请求参数
      * @return array{pay_order: PayOrder, biz_order: BizOrder|null}|null
@@ -866,7 +949,6 @@ class EpayV2ProtocolService extends BaseService
 
     /**
      * 构建支付页地址。
-     *
      * @param string $payNo 支付单号
      * @return string
      */

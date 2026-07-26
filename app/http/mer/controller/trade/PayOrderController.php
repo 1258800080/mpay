@@ -38,7 +38,7 @@ class PayOrderController extends BaseController
     {
         $merchantId = $this->currentMerchantId($request);
         if ($merchantId <= 0) {
-            return $this->fail('未获取到当前商户信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         $data = $this->validated($request->all(), PayOrderValidator::class, 'index');

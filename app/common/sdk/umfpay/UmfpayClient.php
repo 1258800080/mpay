@@ -12,7 +12,7 @@ use GuzzleHttp\Exception\GuzzleException;
  */
 class UmfpayClient
 {
-    private const GATEWAY = 'http://pay.soopay.net/spay/pay/payservice.do';
+    private const GATEWAY = 'https://pay.soopay.net/spay/pay/payservice.do';
 
     /**
      * SDK 配置。
@@ -38,7 +38,7 @@ class UmfpayClient
             'timeout' => 15,
             'connect_timeout' => 10,
             'http_errors' => false,
-            'verify' => false,
+            'verify' => true,
         ]);
     }
 

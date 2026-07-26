@@ -5,13 +5,14 @@ declare(strict_types=1);
 namespace app\common\trait;
 
 use app\common\constant\EpayProtocolConstant;
+use app\exception\PaymentDefinitiveException;
 use app\exception\PaymentException;
+use app\exception\PaymentUncertainException;
 
 /**
  * 直连聚合插件支付产品候选选择。
  *
- * 该 trait 只负责按订单环境排出候选能力并执行插件已有方法，不承载旧 ePay 的 `$channel['apptype']` 等渠道字段。
- * 插件仍需自行声明 `PRODUCT_*`、`enabled_products` 和 h5/jsapi/qrcode/urlscheme/auth_code 等具体产品调用。
+ * 插件通过 `PRODUCT_*`、`enabled_products` 和处理器声明可用产品。
  */
 trait DirectPaymentProductSelectorTrait
 {
@@ -52,16 +53,13 @@ trait DirectPaymentProductSelectorTrait
      */
     private function executeDirectPaymentProduct(array $order, array $handlers, string $gatewayName): array
     {
-        // 先用本地通道配置过滤一次，避免高频交易时反复尝试后台明确未开通的产品。
+        $declaredHandlers = $handlers;
         $handlers = $this->directPaymentUsableHandlers($order, $handlers);
-
-        // 候选列表只基于“当前插件真实可用的 handler key”排序，后续循环不会再碰未开通产品。
         $candidates = $this->directPaymentProductCandidates($order, array_keys($handlers));
         $attempts = [];
 
         foreach ($candidates as $index => $product) {
             try {
-                // handler 被执行时才真正进入插件私有方法并请求第三方接口。
                 return $handlers[$product]();
             } catch (PaymentException $e) {
                 $attempts[] = [
@@ -72,12 +70,18 @@ trait DirectPaymentProductSelectorTrait
 
                 // 只有产品未开通、权限不足、缺少 JSAPI 身份等可换产品的错误才继续兜底。
                 if ($index === count($candidates) - 1 || !$this->directPaymentCanFallback($e)) {
-                    throw $this->withDirectPaymentAttempts($e, $order, $candidates, $attempts);
+                    throw $this->withDirectPaymentAttempts(
+                        $e,
+                        $order,
+                        $candidates,
+                        $attempts,
+                        $this->directPaymentSelectedProduct($order, $declaredHandlers[$product] ?? null, $product)
+                    );
                 }
             }
         }
 
-        throw new PaymentException($gatewayName . '没有适合当前环境的支付产品', 40200, [
+        throw new PaymentDefinitiveException($gatewayName . '没有适合当前环境的支付产品', 40200, [
             'env' => $this->directPaymentEnv($order),
             'pay_type' => (string) ($order['pay_type_code'] ?? ''),
             'candidate_products' => $candidates,
@@ -171,6 +175,31 @@ trait DirectPaymentProductSelectorTrait
     }
 
     /**
+     * 解析已选处理器对应的真实插件产品编码。
+     *
+     * @param array<string, mixed> $order 标准插件下单参数
+     * @param mixed $definition 处理器声明
+     * @param string $handlerKey 处理器键
+     * @return string 产品编码
+     */
+    private function directPaymentSelectedProduct(array $order, mixed $definition, string $handlerKey): string
+    {
+        if (is_array($definition) && array_key_exists('products', $definition)) {
+            $matched = true;
+            $products = $this->directPaymentRequiredProducts(
+                $definition['products'],
+                (string) ($order['pay_type_code'] ?? ''),
+                $matched
+            );
+            if ($matched && $products !== []) {
+                return (string) $products[0];
+            }
+        }
+
+        return $handlerKey;
+    }
+
+    /**
      * 判断 handler 依赖的插件产品是否已经在当前通道开通。
      *
      * @param array<int, string> $requiredProducts handler 依赖的插件产品
@@ -226,11 +255,11 @@ trait DirectPaymentProductSelectorTrait
         $payment = $this->directPaymentPayload($order);
 
         // 付款码支付是独立业务形态，不自动降级到普通扫码，避免用户拿付款码时生成二维码。
-        if ($this->directPaymentHasAuthCode($payment) && in_array('auth_code', $available, true)) {
-            return ['auth_code'];
+        if ($this->directPaymentHasAuthCode($payment)) {
+            return in_array('auth_code', $available, true) ? ['auth_code'] : [];
         }
 
-        // payment.method 是调用方显式偏好，只能放到最前面，不能越过环境合理性和插件实现能力。
+        // 显式偏好仍受环境和插件能力约束。
         $preferred = $this->directPaymentPreferredProducts($payType, $env);
         $methodProduct = $this->directPaymentMethodProduct((string) ($payment['method'] ?? ''));
         if ($methodProduct !== ''
@@ -240,7 +269,6 @@ trait DirectPaymentProductSelectorTrait
             array_unshift($preferred, $methodProduct);
         }
 
-        // 最终候选必须同时满足：环境排序里存在、当前插件注册了 handler、本地开通产品已过滤通过。
         return array_values(array_filter(
             array_unique($preferred),
             static fn (string $product): bool => in_array($product, $available, true)
@@ -316,9 +344,7 @@ trait DirectPaymentProductSelectorTrait
     }
 
     /**
-     * 读取显式 method。
-     *
-     * 当前开发阶段只接受 MPAY 标准能力名，不做旧字段别名兼容。
+     * 读取标准支付产品偏好。
      */
     private function directPaymentMethodProduct(string $method): string
     {
@@ -327,7 +353,7 @@ trait DirectPaymentProductSelectorTrait
             return '';
         }
 
-        return in_array($method, ['jsapi', 'h5', 'jump', 'web', 'urlscheme', 'qrcode', 'html'], true)
+        return in_array($method, ['jsapi', 'h5', 'jump', 'web', 'urlscheme', 'qrcode', 'html', 'page'], true)
             ? $method
             : '';
     }
@@ -362,6 +388,10 @@ trait DirectPaymentProductSelectorTrait
      */
     private function directPaymentCanFallback(PaymentException $e): bool
     {
+        if ($e instanceof PaymentUncertainException) {
+            return false;
+        }
+
         $data = method_exists($e, 'getData') ? $e->getData() : [];
         $errorCode = strtoupper((string) ($data['channel_error_code'] ?? $data['sub_code'] ?? ''));
         $message = strtoupper($e->getMessage());
@@ -403,14 +433,20 @@ trait DirectPaymentProductSelectorTrait
         PaymentException $e,
         array $order,
         array $candidates,
-        array $attempts
+        array $attempts,
+        string $payProduct = ''
     ): PaymentException {
         $data = method_exists($e, 'getData') ? $e->getData() : [];
         $data['env'] = $this->directPaymentEnv($order);
         $data['pay_type'] = (string) ($order['pay_type_code'] ?? '');
         $data['candidate_products'] = $candidates;
         $data['product_attempts'] = $attempts;
+        if ($payProduct !== '') {
+            $data['pay_product'] = $payProduct;
+        }
 
-        return new PaymentException($e->getMessage(), (int) ($e->getCode() ?: 40200), $data);
+        $exception = $e::class;
+
+        return new $exception($e->getMessage(), (int) ($e->getCode() ?: 40200), $data);
     }
 }

@@ -5,6 +5,7 @@ namespace app\service\payment\order;
 use app\common\base\BaseService;
 use app\common\constant\NotifyConstant;
 use app\common\constant\EventConstant;
+use app\common\constant\PaymentRecoveryTaskConstant;
 use app\common\constant\RouteConstant;
 use app\common\constant\TradeConstant;
 use app\exception\BusinessStateException;
@@ -12,6 +13,9 @@ use app\exception\ResourceNotFoundException;
 use app\model\payment\PayOrder;
 use app\repository\payment\trade\BizOrderRepository;
 use app\repository\payment\trade\PayOrderRepository;
+use app\repository\ops\log\PayOrderOperationLogRepository;
+use app\service\payment\runtime\PaymentExceptionService;
+use app\service\payment\runtime\PaymentRecoveryTaskService;
 use support\Log;
 use Webman\Event\Event;
 
@@ -32,11 +36,17 @@ class PayOrderLifecycleService extends BaseService
      * @param PayOrderFeeService $payOrderFeeService 支付单平台服务费服务
      * @param BizOrderRepository $bizOrderRepository 业务订单仓库
      * @param PayOrderRepository $payOrderRepository 支付订单仓库
+     * @param PayOrderOperationLogRepository $operationLogRepository 支付异常处置日志仓库
+     * @param PaymentExceptionService $paymentExceptionService 支付业务异常服务
+     * @param PaymentRecoveryTaskService $recoveryTaskService 支付恢复任务服务
      */
     public function __construct(
         protected PayOrderFeeService $payOrderFeeService,
         protected BizOrderRepository $bizOrderRepository,
-        protected PayOrderRepository $payOrderRepository
+        protected PayOrderRepository $payOrderRepository,
+        protected PayOrderOperationLogRepository $operationLogRepository,
+        protected PaymentExceptionService $paymentExceptionService,
+        protected PaymentRecoveryTaskService $recoveryTaskService
     ) {
     }
 
@@ -129,6 +139,15 @@ class PayOrderLifecycleService extends BaseService
         if ((int) $payOrder->channel_type === RouteConstant::CHANNEL_MODE_COLLECT && !$shouldNotifyMerchant) {
             $payOrder->settlement_status = TradeConstant::SETTLEMENT_STATUS_NONE;
         }
+        if ($shouldNotifyMerchant) {
+            $this->markSuccessSideEffectsPending($payOrder);
+        } else {
+            $this->recordLateDuplicatePayment(
+                $payOrder,
+                $currentStatus,
+                isset($input['callback_type']) ? 'PAY_CALLBACK' : 'SYSTEM'
+            );
+        }
         $payOrder->save();
 
         return $payOrder->refresh();
@@ -173,6 +192,15 @@ class PayOrderLifecycleService extends BaseService
         $payOrder->settlement_status = (int) $payOrder->channel_type === RouteConstant::CHANNEL_MODE_COLLECT && $shouldNotifyMerchant
             ? TradeConstant::SETTLEMENT_STATUS_PENDING
             : TradeConstant::SETTLEMENT_STATUS_NONE;
+        if ($shouldNotifyMerchant) {
+            $this->markSuccessSideEffectsPending($payOrder);
+        } else {
+            $this->recordLateDuplicatePayment(
+                $payOrder,
+                $previousStatus,
+                isset($input['callback_type']) ? 'PAY_CALLBACK' : 'SYSTEM'
+            );
+        }
         $payOrder->save();
 
         if (!$shouldNotifyMerchant) {
@@ -185,6 +213,70 @@ class PayOrderLifecycleService extends BaseService
         }
 
         return $payOrder->refresh();
+    }
+
+    /**
+     * 建立晚到重复支付的可检索异常处置记录。
+     *
+     * 这里只建立人工退款闭环，不擅自发起外部退款；原支付单仍保持真实成功状态，
+     * 同时禁止正常商户成功通知和平台代收清算。
+     *
+     * @param PayOrder $payOrder 支付单
+     * @param int $previousStatus 成功前状态
+     * @param string $sourceType 异常发现来源
+     * @return void
+     */
+    private function recordLateDuplicatePayment(PayOrder $payOrder, int $previousStatus, string $sourceType): void
+    {
+        $this->paymentExceptionService->openLateDuplicateInCurrentTransaction(
+            $payOrder,
+            $previousStatus,
+            $sourceType
+        );
+
+        $this->operationLogRepository->create([
+            'pay_no' => (string) $payOrder->pay_no,
+            'biz_no' => (string) $payOrder->biz_no,
+            'action' => 'late_duplicate_payment',
+            'admin_id' => 0,
+            'reason' => '业务单已由其他支付单完成，需对本次晚到成功执行退款处置',
+            'result_status' => 'pending_refund',
+            'result_message' => '已阻止商户成功通知和平台代收清算，等待退款闭环',
+            'result_payload' => [
+                'previous_status' => $previousStatus,
+                'pay_amount' => (int) $payOrder->pay_amount,
+                'channel_type' => (int) $payOrder->channel_type,
+                'channel_id' => (int) $payOrder->channel_id,
+                'channel_trade_no' => (string) $payOrder->channel_trade_no,
+            ],
+            'created_at' => $this->now(),
+        ]);
+
+        Log::critical(sprintf(
+            '[PayOrderLifecycle] 检测到晚到重复支付，已进入退款处置队列 pay_no=%s biz_no=%s amount=%d previous_status=%d',
+            (string) $payOrder->pay_no,
+            (string) $payOrder->biz_no,
+            (int) $payOrder->pay_amount,
+            $previousStatus
+        ));
+    }
+
+    /**
+     * 在支付成功事务内建立通知/清算可靠恢复任务。
+     *
+     * @param PayOrder $payOrder 支付单
+     * @return void
+     */
+    private function markSuccessSideEffectsPending(PayOrder $payOrder): void
+    {
+        $this->recoveryTaskService->scheduleInCurrentTransaction(
+            PaymentRecoveryTaskConstant::TYPE_PAY_SUCCESS_SIDE_EFFECT,
+            (string) $payOrder->pay_no,
+            0,
+            0,
+            10,
+            true
+        );
     }
 
     /**
@@ -541,7 +633,7 @@ class PayOrderLifecycleService extends BaseService
             }
         }
 
-        foreach (['merchant', 'payment', 'presentation', 'personal_receipt'] as $key) {
+        foreach (['merchant', 'payment', 'presentation', 'payment_context', 'personal_receipt'] as $key) {
             if (isset($extJson[$key]) && is_array($extJson[$key]) && $extJson[$key] !== []) {
                 $supported[$key] = $extJson[$key];
             }

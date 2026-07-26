@@ -49,50 +49,42 @@ final class PaymentPluginStatusConstant
     }
 
     /**
-     * 插件查单成功状态别名。
+     * 插件查单允许返回的状态。
      *
      * @return array<int, string>
      */
-    public static function successQueryAliases(): array
+    public static function queryStatuses(): array
     {
-        return [
-            self::SUCCESS,
-            'paid',
-            'pay_success',
-            'trade_success',
-            'trade_finished',
-            'finished',
-            'successful',
-        ];
+        return [self::SUCCESS, self::FAILED, self::CLOSED, self::PENDING, self::UNKNOWN];
     }
 
     /**
-     * 插件查单失败状态别名。
+     * 插件关单允许返回的状态。
      *
      * @return array<int, string>
      */
-    public static function failedQueryAliases(): array
+    public static function closeStatuses(): array
     {
-        return [
-            self::FAILED,
-            'fail',
-            'error',
-            'pay_error',
-            'trade_fail',
-        ];
+        return [self::CLOSED, self::PENDING, self::UNKNOWN];
     }
 
     /**
-     * 插件查单关闭状态别名。
+     * 插件退款请求允许返回的状态。
      *
      * @return array<int, string>
      */
-    public static function closedQueryAliases(): array
+    public static function refundStatuses(): array
     {
-        return [
-            self::CLOSED,
-            'close',
-            'trade_closed',
-        ];
+        return [self::SUCCESS, self::PENDING, self::UNKNOWN];
+    }
+
+    /**
+     * 插件退款查询和通知允许返回的状态。
+     *
+     * @return array<int, string>
+     */
+    public static function refundStatusStatuses(): array
+    {
+        return [self::SUCCESS, self::FAILED, self::PENDING, self::UNKNOWN];
     }
 }

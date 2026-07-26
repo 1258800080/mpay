@@ -5,8 +5,8 @@ declare(strict_types=1);
 namespace app\common\sdk\unionpay;
 
 use GuzzleHttp\Client;
+use GuzzleHttp\ClientInterface;
 use GuzzleHttp\Exception\GuzzleException;
-use SimpleXMLElement;
 
 /**
  * 银联前置 Swiftpass 协议轻量客户端。
@@ -14,6 +14,18 @@ use SimpleXMLElement;
 class UnionpayClient
 {
     private const GATEWAY = 'https://qra.95516.com/pay/gateway';
+
+    private const MAX_XML_BYTES = 1048576;
+
+    private const SERVICES = [
+        'unified.trade.native',
+        'pay.weixin.jspay',
+        'pay.alipay.jspay',
+        'pay.unionpay.userid',
+        'pay.unionpay.jspay',
+        'pay.weixin.wappay',
+        'unified.trade.refund',
+    ];
 
     /**
      * SDK 配置。
@@ -25,21 +37,42 @@ class UnionpayClient
     /**
      * HTTP 客户端。
      */
-    private Client $httpClient;
+    private ClientInterface $httpClient;
 
     /**
      * 构造方法。
      *
      * @param array<string, string> $config SDK 配置
      */
-    public function __construct(array $config)
+    public function __construct(array $config, ?ClientInterface $httpClient = null)
     {
-        $this->config = $config;
-        $this->httpClient = new Client([
+        $mchId = trim((string) ($config['mch_id'] ?? ''));
+        $key = trim((string) ($config['key'] ?? ''));
+        if ($mchId === '' || $key === '') {
+            throw new UnionpaySdkException('银联前置商户号和商户密钥不能为空');
+        }
+
+        $gateway = trim((string) ($config['gateway_url'] ?? '')) ?: self::GATEWAY;
+        $parts = parse_url($gateway);
+        if (!is_array($parts)
+            || strtolower((string) ($parts['scheme'] ?? '')) !== 'https'
+            || trim((string) ($parts['host'] ?? '')) === ''
+            || isset($parts['user'])
+            || isset($parts['pass'])) {
+            throw new UnionpaySdkException('银联前置网关必须是无用户凭据的 HTTPS 地址');
+        }
+
+        $this->config = [
+            'mch_id' => $mchId,
+            'sub_mch_id' => trim((string) ($config['sub_mch_id'] ?? '')),
+            'key' => $key,
+            'gateway_url' => $gateway,
+        ];
+        $this->httpClient = $httpClient ?? new Client([
             'timeout' => 15,
             'connect_timeout' => 10,
             'http_errors' => false,
-            'verify' => false,
+            'verify' => true,
         ]);
     }
 
@@ -51,33 +84,49 @@ class UnionpayClient
      */
     public function request(array $payload): array
     {
-        $payload = array_merge([
+        $service = trim((string) ($payload['service'] ?? ''));
+        if (!in_array($service, self::SERVICES, true)) {
+            throw new UnionpaySdkException('银联前置 service 未获当前适配合同支持');
+        }
+
+        foreach (['mch_id', 'sub_mch_id', 'key', 'version', 'charset', 'sign_type', 'nonce_str', 'sign'] as $field) {
+            unset($payload[$field]);
+        }
+        $common = [
             'mch_id' => $this->config['mch_id'],
             'version' => '2.0',
+            'charset' => 'UTF-8',
             'sign_type' => 'MD5',
             'nonce_str' => bin2hex(random_bytes(16)),
-        ], $payload);
+        ];
+        if ($this->config['sub_mch_id'] !== '') {
+            $common['sub_mch_id'] = $this->config['sub_mch_id'];
+        }
+        $payload = array_merge($common, $payload);
         $payload['sign'] = $this->sign($payload);
 
         try {
-            $response = $this->httpClient->post($this->config['gateway_url'] ?: self::GATEWAY, [
-                'headers' => ['Content-Type' => 'text/xml; charset=utf-8'],
-                'body' => $this->toXml($payload),
+            $response = $this->httpClient->request('POST', $this->config['gateway_url'], [
+                'headers' => ['Content-Type' => 'application/xml; charset=UTF-8'],
+                'body' => $this->encodeXml($payload),
             ]);
         } catch (GuzzleException $e) {
-            throw new UnionpaySdkException('银联前置网关请求失败：' . $e->getMessage(), 0, $e);
+            throw new UnionpaySdkException('银联前置网关通信失败', true, $e);
         }
 
-        $data = $this->fromXml((string) $response->getBody());
+        if ($response->getStatusCode() < 200 || $response->getStatusCode() >= 300) {
+            throw new UnionpaySdkException('银联前置网关返回非成功 HTTP 状态', true);
+        }
+
+        try {
+            $data = $this->parseXml((string) $response->getBody());
+        } catch (UnionpaySdkException $e) {
+            throw new UnionpaySdkException($e->getMessage(), true, $e);
+        }
         if (!$this->verify($data)) {
-            throw new UnionpaySdkException('银联前置响应验签失败');
+            throw new UnionpaySdkException('银联前置响应验签失败', true);
         }
-        if ((string) ($data['status'] ?? '') !== '0') {
-            throw new UnionpaySdkException((string) ($data['message'] ?? '银联前置请求失败'));
-        }
-        if ((string) ($data['result_code'] ?? '') !== '0') {
-            throw new UnionpaySdkException('[' . (string) ($data['err_code'] ?? '') . ']' . (string) ($data['err_msg'] ?? '银联前置业务失败'));
-        }
+        $this->assertAcceptedResponse($data);
 
         return $data;
     }
@@ -89,7 +138,7 @@ class UnionpayClient
      */
     public function notify(string $xml): array
     {
-        $data = $this->fromXml($xml);
+        $data = $this->parseXml($xml);
         if (!$this->verify($data)) {
             throw new UnionpaySdkException('银联前置回调验签失败');
         }
@@ -104,12 +153,12 @@ class UnionpayClient
      */
     public function verify(array $payload): bool
     {
-        $sign = (string) ($payload['sign'] ?? '');
-        if ($sign === '') {
+        $sign = trim((string) ($payload['sign'] ?? ''));
+        if (preg_match('/^[A-F0-9]{32}$/D', $sign) !== 1) {
             return false;
         }
 
-        return hash_equals($this->sign($payload), strtoupper($sign));
+        return hash_equals($this->sign($payload), $sign);
     }
 
     /**
@@ -117,54 +166,167 @@ class UnionpayClient
      *
      * @param array<string, mixed> $payload 参数
      */
-    private function sign(array $payload): string
+    public function sign(array $payload): string
     {
-        ksort($payload);
-        $pieces = [];
-        foreach ($payload as $key => $value) {
-            if ($key === 'sign' || $value === '' || $value === null) {
-                continue;
-            }
-            $pieces[] = $key . '=' . (string) $value;
-        }
-
-        return strtoupper(md5(implode('&', $pieces) . '&key=' . $this->config['key']));
+        return strtoupper(md5($this->signingContent($payload) . '&key=' . $this->config['key']));
     }
 
     /**
-     * 数组转 XML。
+     * 生成不含密钥的待签名原文。
      *
      * @param array<string, mixed> $payload 参数
      */
-    private function toXml(array $payload): string
+    public function signingContent(array $payload): string
+    {
+        ksort($payload, SORT_STRING);
+        $pieces = [];
+        foreach ($payload as $key => $value) {
+            if ($key === 'sign' || $value === null) {
+                continue;
+            }
+            if (!is_scalar($value) && !$value instanceof \Stringable) {
+                throw new UnionpaySdkException('银联前置签名字段必须是标量');
+            }
+            $text = (string) $value;
+            if (trim($text) === '') {
+                continue;
+            }
+            $pieces[] = (string) $key . '=' . $text;
+        }
+
+        return implode('&', $pieces);
+    }
+
+    /**
+     * 将一层标量数组编码为 XML。
+     *
+     * @param array<string, mixed> $payload 参数
+     */
+    public function encodeXml(array $payload): string
     {
         $xml = '<xml>';
         foreach ($payload as $key => $value) {
-            $value = (string) $value;
-            $xml .= is_numeric($value)
-                ? "<{$key}>{$value}</{$key}>"
-                : "<{$key}><![CDATA[{$value}]]></{$key}>";
+            $key = (string) $key;
+            if (preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/D', $key) !== 1) {
+                throw new UnionpaySdkException('银联前置 XML 字段名无效');
+            }
+            if ($value === null) {
+                continue;
+            }
+            if (!is_scalar($value) && !$value instanceof \Stringable) {
+                throw new UnionpaySdkException('银联前置 XML 字段必须是标量');
+            }
+            $text = (string) $value;
+            if (trim($text) === '') {
+                continue;
+            }
+            $xml .= sprintf('<%1$s><![CDATA[%2$s]]></%1$s>', $key, str_replace(']]>', ']]]]><![CDATA[>', $text));
         }
 
         return $xml . '</xml>';
     }
 
     /**
-     * XML 转数组。
+     * 安全解析银联前置一层 XML。
      *
-     * @return array<string, mixed>
+     * @return array<string, string>
      */
-    private function fromXml(string $xml): array
+    public function parseXml(string $xml): array
     {
+        $xml = trim($xml);
         if ($xml === '') {
             throw new UnionpaySdkException('银联前置响应为空');
         }
-
-        $element = simplexml_load_string($xml, SimpleXMLElement::class, LIBXML_NOCDATA);
-        if (!$element instanceof SimpleXMLElement) {
-            throw new UnionpaySdkException('银联前置 XML 解析失败');
+        if (strlen($xml) > self::MAX_XML_BYTES) {
+            throw new UnionpaySdkException('银联前置 XML 超过允许大小');
+        }
+        if (stripos($xml, '<!DOCTYPE') !== false || stripos($xml, '<!ENTITY') !== false) {
+            throw new UnionpaySdkException('银联前置 XML 不允许包含 DOCTYPE 或 ENTITY');
         }
 
-        return (array) json_decode(json_encode($element, JSON_UNESCAPED_UNICODE), true);
+        $previous = libxml_use_internal_errors(true);
+        $element = simplexml_load_string($xml, 'SimpleXMLElement', LIBXML_NOCDATA | LIBXML_NONET);
+        $errors = libxml_get_errors();
+        libxml_clear_errors();
+        libxml_use_internal_errors($previous);
+        if ($element === false) {
+            $message = trim((string) ($errors[0]->message ?? '未知 XML 错误'));
+            throw new UnionpaySdkException('银联前置 XML 解析失败：' . $message);
+        }
+        if ($element->getName() !== 'xml' || count($element->attributes()) > 0) {
+            throw new UnionpaySdkException('银联前置 XML 根节点必须是无属性的 xml');
+        }
+
+        $result = [];
+        foreach ($element->children() as $child) {
+            $key = $child->getName();
+            if ($key === '' || array_key_exists($key, $result)) {
+                throw new UnionpaySdkException('银联前置 XML 包含空字段名或重复字段');
+            }
+            if ($child->count() > 0 || count($child->attributes()) > 0) {
+                throw new UnionpaySdkException('银联前置 XML 字段不允许嵌套或携带属性');
+            }
+            $result[$key] = (string) $child;
+        }
+
+        return $result;
+    }
+
+    /**
+     * 校验已验签响应的通信和业务受理结果。
+     *
+     * 兼容合同使用 status=0，商户当前合同可能使用 return_code=SUCCESS；
+     * 两种口径必须由响应字段显式区分，不能把缺失字段当成功。
+     *
+     * @param array<string, string> $data 响应数据
+     */
+    private function assertAcceptedResponse(array $data): void
+    {
+        if (array_key_exists('return_code', $data)) {
+            if (strtoupper(trim($data['return_code'])) !== 'SUCCESS') {
+                throw new UnionpaySdkException($this->safeMessage($data['return_msg'] ?? '', '银联前置通信失败'));
+            }
+            $resultCode = trim((string) ($data['result_code'] ?? ''));
+            if ($resultCode === '') {
+                throw new UnionpaySdkException('银联前置响应缺少业务状态', true);
+            }
+            $businessSuccess = strtoupper($resultCode) === 'SUCCESS';
+        } elseif (array_key_exists('status', $data)) {
+            if (trim($data['status']) !== '0') {
+                throw new UnionpaySdkException($this->safeMessage($data['message'] ?? '', '银联前置通信失败'));
+            }
+            $resultCode = trim((string) ($data['result_code'] ?? ''));
+            if ($resultCode === '') {
+                throw new UnionpaySdkException('银联前置响应缺少业务状态', true);
+            }
+            $businessSuccess = $resultCode === '0';
+        } else {
+            throw new UnionpaySdkException('银联前置响应缺少通信状态', true);
+        }
+
+        if (!$businessSuccess) {
+            $code = trim((string) ($data['err_code'] ?? ''));
+            if (preg_match('/^[A-Za-z0-9_.-]{1,64}$/D', $code) !== 1) {
+                $code = '';
+            }
+            $message = $this->safeMessage($data['err_msg'] ?? '', '银联前置业务拒绝');
+            throw new UnionpaySdkException($code === '' ? $message : '[' . $code . ']' . $message);
+        }
+    }
+
+    private function safeMessage(mixed $message, string $default): string
+    {
+        $message = trim((string) $message);
+        if ($message === '' || stripos($message, '<xml') !== false || stripos($message, '<?xml') !== false) {
+            return $default;
+        }
+        $message = strip_tags($message);
+        $message = preg_replace(
+            '/\b(key|sign|openid|sub_openid|mini_openid|buyer_id|user_id|user_auth_code)\b\s*[:=]\s*[^&\s,;]+/i',
+            '$1=[REDACTED]',
+            $message
+        ) ?? $default;
+
+        return $message === '' ? $default : mb_strcut($message, 0, 240, 'UTF-8');
     }
 }

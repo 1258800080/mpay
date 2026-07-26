@@ -513,6 +513,78 @@ class MerchantAccountCommandService extends BaseService
     }
 
     /**
+     * 在当前事务中最多扣减指定金额的可用余额。
+     *
+     * 仅用于上游退款已经不可逆成功、但商户余额不足以一次性完成本地冲减的补偿场景。
+     * 返回实际扣减金额；余额为零时不创建零金额流水。
+     *
+     * @param int $merchantId 商户ID
+     * @param int $maxAmount 最大扣减金额（分）
+     * @param string $bizNo 业务单号
+     * @param string $idempotencyKey 幂等键
+     * @param array<string, mixed> $extJson 扩展字段
+     * @param string $traceNo 追踪号
+     * @return int 实际扣减金额
+     */
+    public function debitAvailableUpToInCurrentTransaction(
+        int $merchantId,
+        int $maxAmount,
+        string $bizNo,
+        string $idempotencyKey,
+        array $extJson = [],
+        string $traceNo = ''
+    ): int {
+        $this->assertPositiveAmount($maxAmount);
+        if ($idempotencyKey === '') {
+            throw new ValidationException('幂等键不能为空');
+        }
+
+        if ($existing = $this->findLedgerByIdempotencyKey($idempotencyKey)) {
+            if ((int) $existing->merchant_id !== $merchantId
+                || (int) $existing->biz_type !== LedgerConstant::BIZ_TYPE_REFUND_REVERSE
+                || (string) $existing->biz_no !== $bizNo
+                || (int) $existing->direction !== LedgerConstant::DIRECTION_OUT
+                || (int) $existing->amount > $maxAmount) {
+                throw new ConflictException('幂等冲突', [
+                    'ledger_no' => (string) $existing->ledger_no,
+                    'biz_no' => $bizNo,
+                ]);
+            }
+
+            return (int) $existing->amount;
+        }
+
+        $account = $this->ensureAccountInCurrentTransaction($merchantId);
+        $availableBefore = (int) $account->available_balance;
+        $actualAmount = min($maxAmount, max(0, $availableBefore));
+        if ($actualAmount <= 0) {
+            return 0;
+        }
+
+        $frozenBefore = (int) $account->frozen_balance;
+        $account->available_balance = $availableBefore - $actualAmount;
+        $account->save();
+
+        $this->createLedger([
+            'merchant_id' => $merchantId,
+            'biz_type' => LedgerConstant::BIZ_TYPE_REFUND_REVERSE,
+            'biz_no' => $bizNo,
+            'trace_no' => $this->normalizeTraceNo($traceNo, $bizNo),
+            'event_type' => LedgerConstant::EVENT_TYPE_REVERSE,
+            'direction' => LedgerConstant::DIRECTION_OUT,
+            'amount' => $actualAmount,
+            'available_before' => $availableBefore,
+            'available_after' => (int) $account->available_balance,
+            'frozen_before' => $frozenBefore,
+            'frozen_after' => (int) $account->frozen_balance,
+            'idempotency_key' => $idempotencyKey,
+            'remark' => $extJson['remark'] ?? '退款成功余额不足部分冲减',
+        ]);
+
+        return $actualAmount;
+    }
+
+    /**
      * 按指定业务类型冻结可用余额。
      *
      * @param int $merchantId 商户ID

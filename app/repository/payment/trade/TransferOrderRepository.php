@@ -46,5 +46,6 @@ class TransferOrderRepository extends BaseRepository
             ->lockForUpdate()
             ->first($columns);
     }
+
 }
 

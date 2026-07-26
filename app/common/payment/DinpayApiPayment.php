@@ -14,11 +14,16 @@ use app\common\sdk\dinpay\DinpaySdkException;
 use app\common\trait\DirectPaymentProductSelectorTrait;
 use app\common\util\FormatHelper;
 use app\exception\PaymentException;
+use app\exception\PaymentUncertainException;
+use app\exception\UnsupportedPaymentOperationException;
 use support\Request;
 use support\Response;
 
 /**
  * 智付支付 API 插件。
+ *
+ * 对接 PUBLIC、WAP 和 SCAN 三类支付产品，负责报文转换、回调验签和退款结果归一化。
+ * 当前适配协议没有可确认的主动查单与关单接口，因此这两项能力明确返回不支持。
  */
 class DinpayApiPayment extends BasePayment implements PaymentInterface, PayPluginInterface
 {
@@ -73,7 +78,7 @@ class DinpayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      * 发起支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付结果
      */
     public function pay(array $order): array
     {
@@ -120,7 +125,7 @@ class DinpayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      * 扫码支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付结果
      */
     private function scanPay(array $order): array
     {
@@ -140,32 +145,32 @@ class DinpayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     }
 
     /**
-     * 智付旧插件未提供主动查单链路。
+     * 当前适配协议未提供可确认的主动查单接口。
      *
      * @param array<string, mixed> $order 标准插件查单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付状态结果
      */
     public function query(array $order): array
     {
-        return ['success' => false, 'status' => PaymentPluginStatusConstant::PENDING, 'msg' => '智付插件暂不支持主动查单'];
+        throw new UnsupportedPaymentOperationException('智付插件暂不支持主动查单', 40200);
     }
 
     /**
-     * 智付旧插件未提供关单链路。
+     * 当前适配协议未提供可确认的关单接口。
      *
      * @param array<string, mixed> $order 标准插件关单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准关单结果
      */
     public function close(array $order): array
     {
-        return ['success' => false, 'msg' => '智付插件暂不支持关单'];
+        throw new UnsupportedPaymentOperationException('智付插件暂不支持关单', 40200);
     }
 
     /**
      * 申请退款。
      *
      * @param array<string, mixed> $order 标准插件退款参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准退款结果
      */
     public function refund(array $order): array
     {
@@ -177,23 +182,30 @@ class DinpayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
                 'refundAmount' => FormatHelper::amount((int) $order['refund_amount']),
             ]);
         } catch (DinpaySdkException $e) {
-            return ['success' => false, 'msg' => $e->getMessage()];
+            throw new PaymentUncertainException('智付退款结果不确定：' . $e->getMessage(), 40200);
         }
 
+        $refundAmount = isset($data['refundAmount'])
+            ? $this->yuanToCents($data['refundAmount'], '智付退款金额')
+            : (int) $order['refund_amount'];
+
         return [
-            'success' => true,
-            'msg' => '退款申请成功',
-            'chan_refund_no' => (string) ($data['refundChannelNumber'] ?? $order['refund_no']),
-            'refund_amount' => (int) round(((float) ($data['refundAmount'] ?? 0)) * 100),
-            'raw_data' => $data,
+            'status' => PaymentPluginStatusConstant::SUCCESS,
+            'refund_no' => (string) $order['refund_no'],
+            'pay_no' => (string) $order['pay_no'],
+            'refund_amount' => $refundAmount,
+            'chan_refund_no' => (string) ($data['refundChannelNumber'] ?? ''),
+            'message' => '退款申请成功',
         ];
     }
 
     /**
      * 解析支付回调。
      *
+     * 回调 data 必须先通过平台公钥验签；只有 SUCCESS 状态才返回支付成功和实付金额。
+     *
      * @param Request $request 回调请求
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付通知结果
      */
     public function notify(Request $request): array
     {
@@ -207,9 +219,11 @@ class DinpayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
 
         return [
             'status' => $success ? PaymentPluginStatusConstant::SUCCESS : PaymentPluginStatusConstant::PENDING,
+            'pay_no' => trim((string) ($data['orderNo'] ?? '')),
+            'paid_amount' => $success ? $this->yuanToCents($data['payAmount'] ?? null, '智付回调金额') : null,
             'message' => (string) ($data['orderStatus'] ?? ''),
-            'channel_order_no' => (string) ($data['orderNo'] ?? ''),
-            'channel_trade_no' => (string) ($data['channelNumber'] ?? ''),
+            'chan_order_no' => (string) ($data['orderNo'] ?? ''),
+            'chan_trade_no' => (string) ($data['channelNumber'] ?? ''),
             'channel_status' => (string) ($data['orderStatus'] ?? ''),
         ];
     }
@@ -231,10 +245,27 @@ class DinpayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     }
 
     /**
+     * 将渠道元金额转换为整数分。
+     *
+     * @param mixed $value 渠道金额
+     * @param string $field 金额字段说明
+     * @return int 金额，单位分
+     */
+    private function yuanToCents(mixed $value, string $field): int
+    {
+        $text = trim((string) $value);
+        if (preg_match('/^(0|[1-9]\d*)(?:\.(\d{1,2}))?$/', $text, $matches) !== 1) {
+            throw new PaymentException($field . '格式无效', 40200);
+        }
+
+        return ((int) $matches[1] * 100) + (int) str_pad((string) ($matches[2] ?? ''), 2, '0');
+    }
+
+    /**
      * H5 支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付结果
      */
     private function h5Pay(array $order): array
     {
@@ -260,7 +291,7 @@ class DinpayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      * JSAPI 支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付结果
      */
     private function jsapiPay(array $order): array
     {
@@ -289,7 +320,7 @@ class DinpayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      * 构造通用下单参数。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 渠道下单参数
      */
     private function basePayload(array $order): array
     {
@@ -309,7 +340,10 @@ class DinpayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     }
 
     /**
-     * 支付方式映射。
+     * 将平台支付方式映射为智付 paymentType。
+     *
+     * @param string $payType 平台支付方式编码
+     * @return string 智付支付方式编码
      */
     private function channelPayType(string $payType): string
     {
@@ -323,14 +357,18 @@ class DinpayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     /**
      * 包装标准支付结果。
      *
+     * @param string $page 平台承接页类型
+     * @param string $payType 平台支付方式编码
+     * @param string $product 智付产品编码
+     * @param string $action 智付接口动作
      * @param array<string, mixed> $payParams 承接页参数
      * @param array<string, mixed> $data 上游响应
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付结果
      */
     private function payResult(string $page, string $payType, string $product, string $action, array $payParams, array $data, array $order): array
     {
-        return [
+        return $this->pendingPaymentResult($order, [
             'pay_page' => $page,
             'pay_type' => $payType,
             'pay_product' => $product,
@@ -338,11 +376,13 @@ class DinpayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
             'pay_params' => $payParams,
             'chan_order_no' => (string) ($data['orderNo'] ?? $order['pay_no']),
             'chan_trade_no' => (string) ($data['channelNumber'] ?? ''),
-        ];
+        ]);
     }
 
     /**
-     * 获取 SDK 客户端。
+     * 获取当前通道的 SDK 客户端。
+     *
+     * @return DinpayClient
      */
     private function client(): DinpayClient
     {
@@ -360,6 +400,9 @@ class DinpayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
 
     /**
      * 获取字符串配置。
+     *
+     * @param string $key 配置键
+     * @return string 配置值
      */
     private function configText(string $key): string
     {

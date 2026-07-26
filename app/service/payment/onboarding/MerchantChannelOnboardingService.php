@@ -498,8 +498,9 @@ class MerchantChannelOnboardingService extends BaseService
         $plugin = $this->pluginManager->createByConfig($config);
         try {
             $result = $plugin->notifyOnboarding($request);
-            // 优先用平台申请单号匹配，兼容上游仅回传合同号的场景。
-            $model = $this->findByUpstreamResult($result);
+            // 回调路由已经锁定插件与配置，匹配申请单时继续带上相同边界，
+            // 避免不同通道恰好使用相同上游申请号/合同号时串单。
+            $model = $this->findByUpstreamResult($result, $pluginCode, $configId);
             if (!$model) {
                 throw new PaymentException('未匹配到进件申请单', 40300, $result);
             }
@@ -890,18 +891,26 @@ class MerchantChannelOnboardingService extends BaseService
      * 根据插件回调解析结果匹配本地申请。
      *
      * @param array<string, mixed> $result 插件标准通知结果
+     * @param string $pluginCode 回调路由插件编码
+     * @param int $configId 回调路由进件配置ID
      */
-    private function findByUpstreamResult(array $result): ?MerchantChannelOnboarding
+    private function findByUpstreamResult(array $result, string $pluginCode, int $configId): ?MerchantChannelOnboarding
     {
         $onboardingNo = trim((string) ($result['onboarding_no'] ?? ''));
         if ($onboardingNo !== '') {
-            return $this->onboardingRepository->findByNo($onboardingNo);
+            return $this->onboardingRepository->query()
+                ->where('onboarding_no', $onboardingNo)
+                ->where('plugin_code', $pluginCode)
+                ->where('onboarding_config_id', $configId)
+                ->first();
         }
 
         $applyId = trim((string) ($result['upstream_apply_id'] ?? $result['apply_id'] ?? ''));
         if ($applyId !== '') {
             return $this->onboardingRepository->query()
                 ->where('upstream_apply_id', $applyId)
+                ->where('plugin_code', $pluginCode)
+                ->where('onboarding_config_id', $configId)
                 ->first();
         }
 
@@ -909,6 +918,8 @@ class MerchantChannelOnboardingService extends BaseService
         if ($contractId !== '') {
             return $this->onboardingRepository->query()
                 ->where('upstream_contract_id', $contractId)
+                ->where('plugin_code', $pluginCode)
+                ->where('onboarding_config_id', $configId)
                 ->first();
         }
 

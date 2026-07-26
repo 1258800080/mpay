@@ -13,11 +13,14 @@ use app\common\sdk\xsy\XsyClient;
 use app\common\sdk\xsy\XsySdkException;
 use app\common\trait\DirectPaymentProductSelectorTrait;
 use app\exception\PaymentException;
+use app\exception\PaymentUncertainException;
 use support\Request;
 use support\Response;
 
 /**
  * 新生易支付 API 插件。
+ *
+ * 负责支付宝、微信和银联的扫码、JSAPI、付款码支付，以及查单、关单、退款和异步通知适配。
  */
 class XsyApiPayment extends BasePayment implements PaymentInterface, PayPluginInterface
 {
@@ -73,7 +76,8 @@ class XsyApiPayment extends BasePayment implements PaymentInterface, PayPluginIn
      * 发起支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准支付结果
      */
     public function pay(array $order): array
     {
@@ -112,7 +116,8 @@ class XsyApiPayment extends BasePayment implements PaymentInterface, PayPluginIn
      * 二维码支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准二维码待支付结果
      */
     private function qrcodePay(array $order): array
     {
@@ -142,7 +147,8 @@ class XsyApiPayment extends BasePayment implements PaymentInterface, PayPluginIn
      * 查询订单。
      *
      * @param array<string, mixed> $order 标准插件查单参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准支付查询结果
      */
     public function query(array $order): array
     {
@@ -152,23 +158,27 @@ class XsyApiPayment extends BasePayment implements PaymentInterface, PayPluginIn
                 'orderNo' => (string) $order['pay_no'],
             ]);
         } catch (XsySdkException $e) {
-            return ['success' => false, 'status' => PaymentPluginStatusConstant::PENDING, 'message' => $e->getMessage()];
+            throw new PaymentUncertainException('新生易查单失败：' . $e->getMessage(), 40200);
         }
 
         $status = match ((string) ($data['tranSts'] ?? '')) {
             'SUCCESS' => PaymentPluginStatusConstant::SUCCESS,
-            'CLOSED', 'FAIL' => PaymentPluginStatusConstant::FAILED,
+            'CLOSED' => PaymentPluginStatusConstant::CLOSED,
+            'FAIL' => PaymentPluginStatusConstant::FAILED,
             default => PaymentPluginStatusConstant::PENDING,
         };
+        $responsePayNo = trim((string) ($data['orderNo'] ?? ''));
 
         return [
-            'success' => true,
             'status' => $status,
-            'channel_order_no' => (string) ($data['orderNo'] ?? $order['pay_no']),
-            'channel_trade_no' => (string) ($data['outOrderNo'] ?? $data['transactionId'] ?? ''),
+            'pay_no' => $responsePayNo,
+            'paid_amount' => $status === PaymentPluginStatusConstant::SUCCESS
+                ? $this->integerCents($data['amt'] ?? null, '新生易查单金额')
+                : null,
+            'chan_order_no' => $responsePayNo,
+            'chan_trade_no' => (string) ($data['outOrderNo'] ?? $data['transactionId'] ?? ''),
             'channel_status' => (string) ($data['tranSts'] ?? ''),
             'message' => (string) ($data['tranSts'] ?? ''),
-            'raw_data' => $data,
         ];
     }
 
@@ -187,10 +197,16 @@ class XsyApiPayment extends BasePayment implements PaymentInterface, PayPluginIn
                 'payType' => $this->channelPayType((string) $order['pay_type_code']),
             ]);
         } catch (XsySdkException $e) {
-            return ['success' => false, 'msg' => $e->getMessage()];
+            throw new PaymentUncertainException('新生易关单结果不确定：' . $e->getMessage(), 40200);
         }
 
-        return ['success' => true, 'msg' => '关单成功', 'raw_data' => $data];
+        return [
+            'status' => PaymentPluginStatusConstant::CLOSED,
+            'pay_no' => (string) $order['pay_no'],
+            'chan_order_no' => (string) ($order['chan_order_no'] ?? ''),
+            'chan_trade_no' => (string) ($order['chan_trade_no'] ?? ''),
+            'message' => '关单成功',
+        ];
     }
 
     /**
@@ -209,23 +225,27 @@ class XsyApiPayment extends BasePayment implements PaymentInterface, PayPluginIn
                 'amt' => (int) $order['refund_amount'],
             ]);
         } catch (XsySdkException $e) {
-            return ['success' => false, 'msg' => $e->getMessage()];
+            throw new PaymentUncertainException('新生易退款结果不确定：' . $e->getMessage(), 40200);
         }
 
         return [
-            'success' => true,
-            'msg' => '退款申请成功',
-            'chan_refund_no' => (string) ($data['orderNo'] ?? $order['refund_no']),
+            'status' => PaymentPluginStatusConstant::SUCCESS,
+            'refund_no' => (string) $order['refund_no'],
+            'pay_no' => (string) $order['pay_no'],
             'refund_amount' => (int) ($data['amt'] ?? $order['refund_amount']),
-            'raw_data' => $data,
+            'chan_refund_no' => (string) ($data['orderNo'] ?? ''),
+            'message' => '退款申请成功',
         ];
     }
 
     /**
-     * 解析支付回调。
+     * 验签并解析支付回调。
+     *
+     * 签名覆盖原始请求体，验签通过后再读取 respData 中的订单、金额和渠道编号。
      *
      * @param Request $request 回调请求
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准支付通知结果
      */
     public function notify(Request $request): array
     {
@@ -239,9 +259,11 @@ class XsyApiPayment extends BasePayment implements PaymentInterface, PayPluginIn
 
         return [
             'status' => PaymentPluginStatusConstant::SUCCESS,
+            'pay_no' => trim((string) ($data['orderNo'] ?? '')),
+            'paid_amount' => $this->integerCents($data['amt'] ?? null, '新生易回调金额'),
             'message' => (string) ($data['tranSts'] ?? 'SUCCESS'),
-            'channel_order_no' => (string) ($data['orderNo'] ?? ''),
-            'channel_trade_no' => (string) ($data['outOrderNo'] ?? $data['transactionId'] ?? ''),
+            'chan_order_no' => (string) ($data['orderNo'] ?? ''),
+            'chan_trade_no' => (string) ($data['outOrderNo'] ?? $data['transactionId'] ?? ''),
             'channel_status' => (string) ($data['tranSts'] ?? 'SUCCESS'),
         ];
     }
@@ -263,10 +285,27 @@ class XsyApiPayment extends BasePayment implements PaymentInterface, PayPluginIn
     }
 
     /**
-     * JSAPI 支付。
+     * 解析渠道以整数分表示的金额，拒绝小数及非数字内容。
+     *
+     * @param mixed $value 渠道金额原值
+     * @param string $field 用于异常提示的字段名称
+     */
+    private function integerCents(mixed $value, string $field): int
+    {
+        $text = trim((string) $value);
+        if (preg_match('/^\d+$/', $text) !== 1) {
+            throw new PaymentException($field . '格式无效', 40200);
+        }
+
+        return (int) $text;
+    }
+
+    /**
+     * 根据支付方式补充用户与子应用标识并发起 JSAPI 下单。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准 JSAPI 待支付结果
      */
     private function jsapiPay(array $order): array
     {
@@ -302,7 +341,8 @@ class XsyApiPayment extends BasePayment implements PaymentInterface, PayPluginIn
      * 付款码支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准同步支付结果
      */
     private function scanPay(array $order): array
     {
@@ -315,14 +355,22 @@ class XsyApiPayment extends BasePayment implements PaymentInterface, PayPluginIn
             throw new PaymentException('新生易付款码下单失败：' . $e->getMessage(), 40200);
         }
 
-        return $this->payResult('ok', (string) $order['pay_type_code'], 'reverseScan', 'reverseScan', ['raw' => $data], $data, $order);
+        return $this->successfulPaymentResult($order, [
+            'paid_amount' => (int) ($order['amount'] ?? 0),
+            'pay_type' => (string) $order['pay_type_code'],
+            'pay_product' => 'reverseScan',
+            'pay_action' => 'reverseScan',
+            'chan_order_no' => (string) ($data['orderNo'] ?? $order['pay_no']),
+            'chan_trade_no' => (string) ($data['outOrderNo'] ?? $data['transactionId'] ?? ''),
+        ]);
     }
 
     /**
-     * 构造通用下单参数。
+     * 构造新生易各支付产品共享的下单参数。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 上游下单请求参数
      */
     private function basePayload(array $order): array
     {
@@ -338,7 +386,9 @@ class XsyApiPayment extends BasePayment implements PaymentInterface, PayPluginIn
     }
 
     /**
-     * 统一支付方式映射。
+     * 将标准支付方式映射为新生易支付类型。
+     *
+     * @param string $payType 标准支付方式代码
      */
     private function channelPayType(string $payType): string
     {
@@ -350,16 +400,21 @@ class XsyApiPayment extends BasePayment implements PaymentInterface, PayPluginIn
     }
 
     /**
-     * 包装标准支付结果。
+     * 将上游支付凭据包装为标准待支付结果。
      *
+     * @param string $page 收银台承接页类型
+     * @param string $payType 标准支付方式代码
+     * @param string $product 新生易支付类型
+     * @param string $action 支付动作标识
      * @param array<string, mixed> $payParams 承接页参数
      * @param array<string, mixed> $data 上游响应
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准待支付结果
      */
     private function payResult(string $page, string $payType, string $product, string $action, array $payParams, array $data, array $order): array
     {
-        return [
+        return $this->pendingPaymentResult($order, [
             'pay_page' => $page,
             'pay_type' => $payType,
             'pay_product' => $product,
@@ -367,11 +422,11 @@ class XsyApiPayment extends BasePayment implements PaymentInterface, PayPluginIn
             'pay_params' => $payParams,
             'chan_order_no' => (string) ($data['orderNo'] ?? $order['pay_no']),
             'chan_trade_no' => (string) ($data['outOrderNo'] ?? $data['transactionId'] ?? ''),
-        ];
+        ]);
     }
 
     /**
-     * 获取 SDK 客户端。
+     * 获取按机构、商户密钥和环境配置初始化的 SDK 客户端。
      */
     private function client(): XsyClient
     {
@@ -388,7 +443,9 @@ class XsyApiPayment extends BasePayment implements PaymentInterface, PayPluginIn
     }
 
     /**
-     * 获取字符串配置。
+     * 读取字符串配置，缺失时返回空字符串。
+     *
+     * @param string $key 配置键
      */
     private function configText(string $key): string
     {

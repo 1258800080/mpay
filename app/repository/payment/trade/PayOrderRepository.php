@@ -378,4 +378,3 @@ class PayOrderRepository extends BaseRepository
             ->get($columns);
     }
 }
-

@@ -6,19 +6,19 @@ namespace app\common\payment;
 
 use app\common\base\BasePayment;
 use app\common\constant\FileConstant;
-use app\common\constant\PaymentPluginStatusConstant;
 use app\common\constant\PaymentPluginTypeConstant;
 use app\common\interface\OnboardingPluginInterface;
 use app\common\interface\PaymentInterface;
 use app\common\interface\PayPluginInterface;
 use app\exception\PaymentException;
+use app\exception\UnsupportedPaymentOperationException;
 use support\Request;
 use support\Response;
 
 /**
- * 星驿付 API 支付插件预留。
+ * 星驿付 API 支付与进件能力声明插件。
  *
- * 一期用于声明进件能力和后续 API 支付接入位置；是否启用由插件表状态控制。
+ * 当前仅提供配置、进件资料结构和本地取消语义，未实现任何可确认的上游支付或进件请求。
  */
 class PostarApiPayment extends BasePayment implements PaymentInterface, PayPluginInterface, OnboardingPluginInterface
 {
@@ -95,7 +95,7 @@ class PostarApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      */
     public function getOnboardingFormSchema(): array
     {
-        // 字段命名保持与拉卡拉统一，后续接星驿付正式接口时只在插件内转换上游字段。
+        // 字段命名与平台进件标准结构保持一致，上游字段转换统一收口在插件边界。
         return [
             ['type' => 'input', 'field' => 'merchant_name', 'title' => '商户主体名称', 'value' => '', 'validate' => [['required' => true, 'message' => '商户主体名称不能为空']]],
             ['type' => 'input', 'field' => 'merchant_short_name', 'title' => '商户简称', 'value' => ''],
@@ -116,45 +116,63 @@ class PostarApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     /**
      * 发起支付。
      *
-     * @throws PaymentException 当前插件未启用真实支付能力
+     * @param array<string, mixed> $order 标准插件下单参数
+     *
+     * @return array<string, mixed>
+     * @throws UnsupportedPaymentOperationException 当前插件未启用真实支付能力
      */
     public function pay(array $order): array
     {
-        throw new PaymentException('星驿付 API 支付能力尚未启用', 40200);
+        throw new UnsupportedPaymentOperationException('星驿付 API 支付能力尚未启用', 40200);
     }
 
     /**
-     * 查询支付订单。
+     * 当前插件未实现主动查单。
+     *
+     * @param array<string, mixed> $order 标准插件查单参数
+     *
+     * @return array<string, mixed>
      */
     public function query(array $order): array
     {
-        return ['success' => false, 'status' => PaymentPluginStatusConstant::PENDING, 'msg' => '星驿付 API 查单能力尚未启用'];
+        throw new UnsupportedPaymentOperationException('星驿付 API 查单能力尚未启用', 40200);
     }
 
     /**
-     * 关闭支付订单。
+     * 当前插件未实现关单。
+     *
+     * @param array<string, mixed> $order 标准插件关单参数
+     *
+     * @return array<string, mixed>
      */
     public function close(array $order): array
     {
-        return ['success' => false, 'msg' => '星驿付 API 关单能力尚未启用'];
+        throw new UnsupportedPaymentOperationException('星驿付 API 关单能力尚未启用', 40200);
     }
 
     /**
-     * 申请退款。
+     * 当前插件未实现退款。
+     *
+     * @param array<string, mixed> $order 标准插件退款参数
+     *
+     * @return array<string, mixed>
      */
     public function refund(array $order): array
     {
-        return ['success' => false, 'msg' => '星驿付 API 退款能力尚未启用'];
+        throw new UnsupportedPaymentOperationException('星驿付 API 退款能力尚未启用', 40200);
     }
 
     /**
-     * 解析支付回调。
+     * 当前插件未实现支付回调解析。
      *
-     * @throws PaymentException 当前插件未启用真实支付回调能力
+     * @param Request $request 回调请求
+     *
+     * @return array<string, mixed>
+     * @throws UnsupportedPaymentOperationException 当前插件未启用真实支付回调能力
      */
     public function notify(Request $request): array
     {
-        throw new PaymentException('星驿付 API 支付回调能力尚未启用', 40200);
+        throw new UnsupportedPaymentOperationException('星驿付 API 支付回调能力尚未启用', 40200);
     }
 
     /**
@@ -174,14 +192,15 @@ class PostarApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     }
 
     /**
-     * 提交进件占位。
+     * 接收标准进件上下文并明确返回未提交状态。
      *
      * @param array<string, mixed> $payload 标准进件上下文
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 不包含上游成功事实的待处理结果
      */
     public function submitOnboarding(array $payload): array
     {
-        // 上游进件尚未接入，返回 pending 可保护主流程不误判签约成功。
+        // 当前仅保存进件申请，不形成上游成功事实，因此返回 pending，避免主流程误判签约成功。
         return [
             'success' => false,
             'status' => 'pending',
@@ -191,10 +210,11 @@ class PostarApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     }
 
     /**
-     * 查询进件占位。
+     * 返回未接入上游查询能力的待处理状态。
      *
      * @param array<string, mixed> $payload 标准进件上下文
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 待处理的进件查询结果
      */
     public function queryOnboarding(array $payload): array
     {
@@ -207,10 +227,11 @@ class PostarApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     }
 
     /**
-     * 取消进件占位。
+     * 在本地确认取消尚未提交上游的进件申请。
      *
      * @param array<string, mixed> $payload 标准进件上下文
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 本地取消结果
      */
     public function cancelOnboarding(array $payload): array
     {
@@ -222,8 +243,11 @@ class PostarApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     }
 
     /**
-     * 解析进件回调占位。
+     * 当前插件未实现进件回调解析。
      *
+     * @param Request $request 回调请求
+     *
+     * @return array<string, mixed>
      * @throws PaymentException 当前插件未启用真实进件回调能力
      */
     public function notifyOnboarding(Request $request): array

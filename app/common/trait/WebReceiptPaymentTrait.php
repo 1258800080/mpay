@@ -79,7 +79,10 @@ trait WebReceiptPaymentTrait
             $params['qrcode_image'] = $image;
         }
 
-        return $this->payResult($params, $payNo, (string) ($order['pay_type_code'] ?? ''));
+        return $this->pendingPaymentResult(
+            $order,
+            $this->payResult($params, $payNo, (string) ($order['pay_type_code'] ?? ''))
+        );
     }
 
     /**
@@ -91,10 +94,11 @@ trait WebReceiptPaymentTrait
     public function query(array $order): array
     {
         return [
-            'success' => true,
             'status' => PaymentPluginStatusConstant::PENDING,
-            'channel_order_no' => (string) ($order['channel_order_no'] ?? $order['pay_no'] ?? ''),
-            'channel_trade_no' => (string) ($order['channel_trade_no'] ?? $order['pay_no'] ?? ''),
+            'pay_no' => (string) ($order['pay_no'] ?? ''),
+            'paid_amount' => null,
+            'chan_order_no' => (string) ($order['chan_order_no'] ?? ''),
+            'chan_trade_no' => (string) ($order['chan_trade_no'] ?? ''),
             'message' => '等待 receipt_watcher 查询' . $this->getName() . '流水',
         ];
     }
@@ -108,8 +112,11 @@ trait WebReceiptPaymentTrait
     public function close(array $order): array
     {
         return [
-            'success' => true,
-            'msg' => $this->getName() . '收款无需上游关单',
+            'status' => PaymentPluginStatusConstant::CLOSED,
+            'pay_no' => (string) ($order['pay_no'] ?? ''),
+            'chan_order_no' => (string) ($order['chan_order_no'] ?? ''),
+            'chan_trade_no' => (string) ($order['chan_trade_no'] ?? ''),
+            'message' => $this->getName() . '收款无需上游关单',
         ];
     }
 
@@ -159,14 +166,15 @@ trait WebReceiptPaymentTrait
         $tradeNo = $this->channelTradeNo($record);
         $notifiedAmount = isset($record['price']) ? $this->moneyToCents((string) $record['price']) : null;
 
-        $this->restoreOriginalPayAmount($payNo, $record, $tradeNo, $notifiedAmount);
+        $paidAmount = $this->restoreOriginalPayAmount($payNo, $record, $tradeNo, $notifiedAmount);
 
         return [
             'status' => PaymentPluginStatusConstant::SUCCESS,
             'pay_no' => $payNo,
+            'paid_amount' => $paidAmount,
             'message' => 'receipt_watcher 已确认' . $this->getName() . '收款流水',
-            'channel_order_no' => $tradeNo,
-            'channel_trade_no' => $tradeNo,
+            'chan_order_no' => $tradeNo,
+            'chan_trade_no' => $tradeNo,
             'channel_status' => 'receipt_watcher_received',
             'paid_at' => $this->paidAtFromRecord($record),
         ];
@@ -380,7 +388,7 @@ trait WebReceiptPaymentTrait
             'pay_product' => 'receipt_plate',
             'pay_action' => 'web_watcher',
             'pay_params' => $params,
-            'chan_order_no' => $payNo,
+            'chan_order_no' => '',
             'chan_trade_no' => '',
         ];
     }
@@ -560,9 +568,9 @@ trait WebReceiptPaymentTrait
      *
      * @param array<string, mixed> $record
      */
-    private function restoreOriginalPayAmount(string $payNo, array $record, string $tradeNo, ?int $notifiedAmount): void
+    private function restoreOriginalPayAmount(string $payNo, array $record, string $tradeNo, ?int $notifiedAmount): int
     {
-        Db::transaction(function () use ($payNo, $record, $tradeNo, $notifiedAmount): void {
+        return Db::transaction(function () use ($payNo, $record, $tradeNo, $notifiedAmount): int {
             $payOrder = $this->lockedPayOrder($payNo);
             $extJson = (array) ($payOrder->ext_json ?? []);
             $receiptMeta = (array) ($extJson['personal_receipt'] ?? []);
@@ -581,6 +589,8 @@ trait WebReceiptPaymentTrait
             $extJson['personal_receipt'] = $receiptMeta;
             $payOrder->ext_json = $extJson;
             $payOrder->save();
+
+            return $originalAmount > 0 ? $originalAmount : (int) $payOrder->pay_amount;
         });
     }
 

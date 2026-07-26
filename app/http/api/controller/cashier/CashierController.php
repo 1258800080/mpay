@@ -15,6 +15,11 @@ use support\Response;
  */
 class CashierController extends BaseController
 {
+    /**
+     * 构造方法。
+     *
+     * @param CashierService $cashierService 收银台服务
+     */
     public function __construct(
         protected CashierService $cashierService
     ) {
@@ -90,9 +95,9 @@ class CashierController extends BaseController
     {
         $payload = $this->validated($request->all(), CashierValidator::class, 'identity_resume');
 
-        return $this->success(
-            $this->cashierService->resumeIdentity($payload, $request)
-        );
+        return $this->noStore($this->success(
+            $this->cashierService->resumeIdentity($payload)
+        ));
     }
 
     /**
@@ -105,9 +110,9 @@ class CashierController extends BaseController
     {
         $payload = $this->validated($request->all(), CashierValidator::class, 'identity_context');
 
-        return $this->success(
+        return $this->noStore($this->success(
             $this->cashierService->identityContext((string) ($payload['token'] ?? $payload['resume_token'] ?? ''))
-        );
+        ));
     }
 
     /**
@@ -120,6 +125,47 @@ class CashierController extends BaseController
     {
         $payload = $this->validated($request->all(), CashierValidator::class, 'identity_wechat_callback');
 
-        return $this->cashierService->wechatIdentityCallback($payload, $request);
+        return $this->cashierService->wechatIdentityCallback($payload);
+    }
+
+    /**
+     * 支付宝生活号网页授权回调。
+     *
+     * @param Request $request 请求对象
+     * @return Response 响应对象
+     */
+    public function identityAlipayCallback(Request $request): Response
+    {
+        $payload = $this->validated($request->all(), CashierValidator::class, 'identity_alipay_callback');
+
+        return $this->cashierService->alipayIdentityCallback($payload);
+    }
+
+    /**
+     * 云闪付 userAuth 回调。
+     *
+     * @param Request $request 请求对象
+     * @return Response 响应对象
+     */
+    public function identityUnionpayCallback(Request $request): Response
+    {
+        $payload = $this->validated($request->all(), CashierValidator::class, 'identity_unionpay_callback');
+
+        return $this->cashierService->unionpayIdentityCallback($payload);
+    }
+
+    /**
+     * 为身份流程响应设置禁止缓存的安全响应头。
+     *
+     * @param Response $response 原始响应
+     * @return Response 禁止缓存的响应
+     */
+    private function noStore(Response $response): Response
+    {
+        return $response->withHeaders([
+            'Cache-Control' => 'no-store, no-cache, must-revalidate, private',
+            'Pragma' => 'no-cache',
+            'Referrer-Policy' => 'no-referrer',
+        ]);
     }
 }

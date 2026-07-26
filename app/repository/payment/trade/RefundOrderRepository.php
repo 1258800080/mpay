@@ -186,6 +186,5 @@ class RefundOrderRepository extends BaseRepository
             ->where('merchant_id', $merchantId)
             ->count();
     }
+
 }
-
-

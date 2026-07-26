@@ -6,6 +6,7 @@ namespace app\common\sdk\lakala;
 
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
+use Psr\Http\Message\ResponseInterface;
 
 /**
  * 拉卡拉 OpenAPI 轻量客户端。
@@ -16,13 +17,19 @@ use GuzzleHttp\Exception\GuzzleException;
 class LakalaOpenApiClient
 {
     private const SCHEMA = 'LKLAPI-SHA256withRSA';
-    public const MMS_UPLOAD_PATH = '/api/v2/mms/openApi/uploadFile';
-    public const MMS_SUBMIT_PATH = '/api/v2/mms/openApi/addMer';
-    public const MMS_QUERY_PATH = '/api/v2/mms/openApi/queryContract';
-    public const MMS_VERIFY_PATH = '/api/v2/mms/openApi/verifyContractInfo';
-    public const MMS_RECONSIDER_PATH = '/api/v2/mms/openApi/reconsiderSubmit';
-    public const MMS_CARD_BIN_PATH = '/api/v2/mms/openApi/cardBin';
-    public const MMS_REPLENISH_PATH = '/api/v2/mms/openApi/replenishFile';
+    public const LABS_PREORDER_PATH = '/labs/txn/labs_order_pre_orderpay';
+    public const LABS_QUERY_PATH = '/labs/txn/labs_order_query';
+    public const LABS_CLOSE_PATH = '/labs/txn/labs_order_close';
+    public const LABS_MICROPAY_PATH = '/labs/txn/labs_order_micropay';
+    public const LABS_MICROPAY_REVERSE_PATH = '/labs/txn/labs_order_micropay_reverse';
+    public const LABS_REFUND_PATH = '/labs/txn/labs_order_refund';
+    public const MMS_UPLOAD_PATH = '/mms/openApi/uploadFile';
+    public const MMS_SUBMIT_PATH = '/mms/openApi/addMer';
+    public const MMS_QUERY_PATH = '/mms/openApi/queryContract';
+    public const MMS_VERIFY_PATH = '/mms/openApi/verifyContractInfo';
+    public const MMS_RECONSIDER_PATH = '/mms/openApi/reconsiderSubmit';
+    public const MMS_CARD_BIN_PATH = '/mms/openApi/cardBin';
+    public const MMS_REPLENISH_PATH = '/mms/openApi/replenishFile';
     public const MMS_UPLOAD_MAX_BYTES = 5242880;
 
     /**
@@ -81,7 +88,39 @@ class LakalaOpenApiClient
             'req_time' => date('YmdHis'),
             'version' => '3.0',
             'req_data' => $params,
-        ], ['BBS00000', 'BBS10000']);
+        ], ['BBS00000', 'BBS10000'], $this->configBool('verify_legacy_response_signature'));
+    }
+
+    /**
+     * 当前公开 LABS v1 交易接口请求。
+     *
+     * @param string $path 官方 `/labs/txn/*` 路径
+     * @param array<string, mixed> $params reqData 内容
+     * @param array<string, mixed> $termExtInfo 终端扩展信息，termIp/termLoc/termBaseStation 至少一个
+     * @return array<string, mixed> respData 内容
+     */
+    public function labs(string $path, array $params, array $termExtInfo): array
+    {
+        if (trim((string) ($termExtInfo['termIp'] ?? '')) === ''
+            && trim((string) ($termExtInfo['termLoc'] ?? '')) === ''
+            && trim((string) ($termExtInfo['termBaseStation'] ?? '')) === ''
+        ) {
+            throw new LakalaSdkException('拉卡拉 LABS 请求缺少终端 IP、位置或基站信息');
+        }
+
+        $successCodes = match ($path) {
+            self::LABS_MICROPAY_PATH => ['000000', 'BPS10029', 'BBS11105', 'BBS11112', 'BBS00100', 'BBS00101'],
+            self::LABS_REFUND_PATH => ['000000', 'BPS10034', 'BBS11112', 'BBS00100', 'BBS00101'],
+            default => ['000000'],
+        };
+
+        return $this->postJson($path, [
+            'ver' => '1.0.0',
+            'timestamp' => (string) (int) floor(microtime(true) * 1000),
+            'reqId' => $this->requestId(),
+            'reqData' => $params,
+            'termExtInfo' => $termExtInfo,
+        ], $successCodes, true);
     }
 
     /**
@@ -97,7 +136,7 @@ class LakalaOpenApiClient
             'req_time' => date('YmdHis'),
             'version' => '1.0',
             'req_data' => $params,
-        ], ['000000']);
+        ], ['000000'], $this->configBool('verify_legacy_response_signature'));
     }
 
     /**
@@ -120,7 +159,7 @@ class LakalaOpenApiClient
             'timestamp' => (string) (int) floor(microtime(true) * 1000),
             'reqId' => $reqId,
             'reqData' => $params,
-        ], ['000000', 'BBS00000', 'BBS10000']);
+        ], ['000000', 'BBS00000', 'BBS10000'], true);
     }
 
     /**
@@ -137,11 +176,30 @@ class LakalaOpenApiClient
         $timestamp = (string) ($payload['timestamp'] ?? '');
         $nonce = (string) ($payload['nonce_str'] ?? '');
 
-        if ($signature === '' || $timestamp === '' || $nonce === '') {
+        if ($signature === '' || !$this->validTimestamp($timestamp) || $nonce === '') {
             return false;
         }
 
         return $this->rsaPublicVerify($timestamp . "\n" . $nonce . "\n" . $body . "\n", $signature);
+    }
+
+    /**
+     * 校验公开网关响应头签名。
+     */
+    public function verifyResponse(ResponseInterface $response, string $body): bool
+    {
+        $appId = trim($response->getHeaderLine('Lklapi-Appid'));
+        $serialNo = trim($response->getHeaderLine('Lklapi-Serial'));
+        $timestamp = trim($response->getHeaderLine('Lklapi-Timestamp'));
+        $nonce = trim($response->getHeaderLine('Lklapi-Nonce'));
+        $signature = trim($response->getHeaderLine('Lklapi-Signature'));
+        if (!$this->validTimestamp($timestamp) || $nonce === '' || $signature === '') {
+            return false;
+        }
+
+        $message = $appId . "\n" . $serialNo . "\n" . $timestamp . "\n" . $nonce . "\n" . $body . "\n";
+
+        return $this->rsaPublicVerify($message, $signature);
     }
 
     /**
@@ -174,9 +232,10 @@ class LakalaOpenApiClient
      * @param string $path 接口路径
      * @param array<string, mixed> $body 公共报文
      * @param array<int, string> $successCodes 成功返回码
+     * @param bool $requireResponseSignature 是否强制校验拉卡拉响应头签名
      * @return array<string, mixed>
      */
-    private function postJson(string $path, array $body, array $successCodes): array
+    private function postJson(string $path, array $body, array $successCodes, bool $requireResponseSignature): array
     {
         $json = json_encode($body, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         if (!is_string($json)) {
@@ -200,6 +259,9 @@ class LakalaOpenApiClient
         }
 
         $this->lastResponseBody = (string) $response->getBody();
+        if ($requireResponseSignature && !$this->verifyResponse($response, $this->lastResponseBody)) {
+            throw new LakalaSdkException('拉卡拉响应验签失败');
+        }
         $decoded = json_decode($this->lastResponseBody, true);
         if (!is_array($decoded)) {
             throw new LakalaSdkException('拉卡拉响应不是合法 JSON');
@@ -210,7 +272,10 @@ class LakalaOpenApiClient
         if (in_array($code, $successCodes, true)) {
             // 兼容聚合支付、MMS 入网和个别网关返回的不同数据包裹字段。
             $data = $decoded['resp_data'] ?? $decoded['respData'] ?? $decoded['data'] ?? $decoded;
-            return is_array($data) ? $data : [];
+            $data = is_array($data) ? $data : [];
+            $data['_response_code'] = $code;
+
+            return $data;
         }
 
         $message = (string) ($decoded['msg'] ?? $decoded['retMsg'] ?? $decoded['resMsg'] ?? '拉卡拉请求失败');
@@ -225,7 +290,7 @@ class LakalaOpenApiClient
         $appId = $this->configText('app_id');
         $serialNo = $this->merchantSerialNo();
         $timestamp = (string) time();
-        $nonce = bin2hex(random_bytes(8));
+        $nonce = bin2hex(random_bytes(6));
         $message = $appId . "\n" . $serialNo . "\n" . $timestamp . "\n" . $nonce . "\n" . $body . "\n";
 
         return self::SCHEMA
@@ -315,6 +380,27 @@ class LakalaOpenApiClient
         $base = $this->configBool('sandbox') ? 'https://test.wsmsd.cn/sit' : 'https://s2.lakala.com';
 
         return $base . '/' . ltrim($path, '/');
+    }
+
+    /**
+     * 生成不超过 32 字符的请求流水号。
+     */
+    private function requestId(): string
+    {
+        return date('YmdHis') . bin2hex(random_bytes(9));
+    }
+
+    /**
+     * 通知和响应签名时间戳只接受五分钟窗口，避免长期重放。
+     */
+    private function validTimestamp(string $timestamp): bool
+    {
+        if (preg_match('/^\d{10,13}$/', $timestamp) !== 1) {
+            return false;
+        }
+        $seconds = strlen($timestamp) === 13 ? (int) floor(((int) $timestamp) / 1000) : (int) $timestamp;
+
+        return abs(time() - $seconds) <= 300;
     }
 
     /**

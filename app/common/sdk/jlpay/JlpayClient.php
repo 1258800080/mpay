@@ -39,7 +39,7 @@ class JlpayClient
             'timeout' => 20,
             'connect_timeout' => 10,
             'http_errors' => false,
-            'verify' => false,
+            'verify' => true,
         ]);
     }
 

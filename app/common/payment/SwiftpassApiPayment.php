@@ -13,11 +13,15 @@ use app\common\sdk\swiftpass\SwiftpassClient;
 use app\common\sdk\swiftpass\SwiftpassSdkException;
 use app\common\trait\DirectPaymentProductSelectorTrait;
 use app\exception\PaymentException;
+use app\exception\PaymentUncertainException;
+use app\exception\UnsupportedPaymentOperationException;
 use support\Request;
 use support\Response;
 
 /**
  * 威富通 RSA 支付 API 插件。
+ *
+ * 负责微信、支付宝、QQ、银联和京东支付产品的下单、退款及异步通知适配；当前协议未接入主动查单与关单能力。
  */
 class SwiftpassApiPayment extends BasePayment implements PaymentInterface, PayPluginInterface
 {
@@ -84,7 +88,8 @@ class SwiftpassApiPayment extends BasePayment implements PaymentInterface, PayPl
      * 发起支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准待支付结果
      */
     public function pay(array $order): array
     {
@@ -135,8 +140,9 @@ class SwiftpassApiPayment extends BasePayment implements PaymentInterface, PayPl
      * Native 二维码支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @param string $payType 支付方式
-     * @return array<string, mixed>
+     * @param string $payType 标准支付方式代码
+     *
+     * @return array<string, mixed> 标准二维码待支付结果
      */
     private function nativePay(array $order, string $payType): array
     {
@@ -167,25 +173,25 @@ class SwiftpassApiPayment extends BasePayment implements PaymentInterface, PayPl
     }
 
     /**
-     * 威富通旧插件未提供主动查单链路。
+     * 当前适配协议未提供可确认的主动查单接口。
      *
      * @param array<string, mixed> $order 标准插件查单参数
      * @return array<string, mixed>
      */
     public function query(array $order): array
     {
-        return ['success' => false, 'status' => PaymentPluginStatusConstant::PENDING, 'msg' => '威富通插件暂不支持主动查单'];
+        throw new UnsupportedPaymentOperationException('威富通插件暂不支持主动查单', 40200);
     }
 
     /**
-     * 威富通旧插件未提供关单链路。
+     * 当前适配协议未提供可确认的关单接口。
      *
      * @param array<string, mixed> $order 标准插件关单参数
      * @return array<string, mixed>
      */
     public function close(array $order): array
     {
-        return ['success' => false, 'msg' => '威富通插件暂不支持关单'];
+        throw new UnsupportedPaymentOperationException('威富通插件暂不支持关单', 40200);
     }
 
     /**
@@ -206,23 +212,27 @@ class SwiftpassApiPayment extends BasePayment implements PaymentInterface, PayPl
                 'op_user_id' => $this->configText('mch_id'),
             ]);
         } catch (SwiftpassSdkException $e) {
-            return ['success' => false, 'msg' => $e->getMessage()];
+            throw new PaymentUncertainException('威富通退款结果不确定：' . $e->getMessage(), 40200);
         }
 
         return [
-            'success' => true,
-            'msg' => '退款申请成功',
-            'chan_refund_no' => (string) ($data['refund_id'] ?? $order['refund_no']),
+            'status' => PaymentPluginStatusConstant::SUCCESS,
+            'refund_no' => (string) $order['refund_no'],
+            'pay_no' => (string) $order['pay_no'],
             'refund_amount' => (int) ($data['refund_fee'] ?? $order['refund_amount']),
-            'raw_data' => $data,
+            'chan_refund_no' => (string) ($data['refund_id'] ?? ''),
+            'message' => '退款申请成功',
         ];
     }
 
     /**
      * 解析支付回调。
      *
+     * SDK 负责解析并验证原始通知内容，只有通信状态和业务状态均为 0 才确认支付成功。
+     *
      * @param Request $request 回调请求
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准支付通知结果
      */
     public function notify(Request $request): array
     {
@@ -236,9 +246,11 @@ class SwiftpassApiPayment extends BasePayment implements PaymentInterface, PayPl
 
         return [
             'status' => $success ? PaymentPluginStatusConstant::SUCCESS : PaymentPluginStatusConstant::FAILED,
+            'pay_no' => trim((string) ($payload['out_trade_no'] ?? '')),
+            'paid_amount' => $success ? $this->integerCents($payload['total_fee'] ?? null, '威富通回调金额') : null,
             'message' => (string) ($payload['err_msg'] ?? $payload['message'] ?? ''),
-            'channel_order_no' => (string) ($payload['out_trade_no'] ?? ''),
-            'channel_trade_no' => (string) ($payload['transaction_id'] ?? ''),
+            'chan_order_no' => (string) ($payload['out_trade_no'] ?? ''),
+            'chan_trade_no' => (string) ($payload['transaction_id'] ?? ''),
             'channel_status' => (string) ($payload['result_code'] ?? $payload['status'] ?? ''),
         ];
     }
@@ -260,10 +272,27 @@ class SwiftpassApiPayment extends BasePayment implements PaymentInterface, PayPl
     }
 
     /**
-     * JSAPI 支付。
+     * 解析渠道以整数分表示的金额，拒绝小数及非数字内容。
+     *
+     * @param mixed $value 渠道金额原值
+     * @param string $field 用于异常提示的字段名称
+     */
+    private function integerCents(mixed $value, string $field): int
+    {
+        $text = trim((string) $value);
+        if (preg_match('/^\d+$/', $text) !== 1) {
+            throw new PaymentException($field . '格式无效', 40200);
+        }
+
+        return (int) $text;
+    }
+
+    /**
+     * 根据支付方式补充对应的用户身份并发起 JSAPI 下单。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准 JSAPI 或银联跳转待支付结果
      */
     private function jsapiPay(array $order): array
     {
@@ -310,7 +339,8 @@ class SwiftpassApiPayment extends BasePayment implements PaymentInterface, PayPl
      * 微信 H5 支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准跳转待支付结果
      */
     private function wxH5Pay(array $order): array
     {
@@ -330,10 +360,11 @@ class SwiftpassApiPayment extends BasePayment implements PaymentInterface, PayPl
     }
 
     /**
-     * 构造通用下单参数。
+     * 构造威富通各支付产品共享的下单参数。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 上游下单请求参数
      */
     private function basePayload(array $order): array
     {
@@ -347,16 +378,21 @@ class SwiftpassApiPayment extends BasePayment implements PaymentInterface, PayPl
     }
 
     /**
-     * 包装标准支付结果。
+     * 将上游支付凭据包装为标准待支付结果。
      *
+     * @param string $page 收银台承接页类型
+     * @param string $payType 标准支付方式代码
+     * @param string $product 威富通服务代码
+     * @param string $action 支付动作标识
      * @param array<string, mixed> $payParams 承接页参数
      * @param array<string, mixed> $data 上游响应
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准待支付结果
      */
     private function payResult(string $page, string $payType, string $product, string $action, array $payParams, array $data, array $order): array
     {
-        return [
+        return $this->pendingPaymentResult($order, [
             'pay_page' => $page,
             'pay_type' => $payType,
             'pay_product' => $product,
@@ -364,11 +400,11 @@ class SwiftpassApiPayment extends BasePayment implements PaymentInterface, PayPl
             'pay_params' => $payParams,
             'chan_order_no' => (string) ($data['out_trade_no'] ?? $order['pay_no']),
             'chan_trade_no' => (string) ($data['transaction_id'] ?? ''),
-        ];
+        ]);
     }
 
     /**
-     * 获取 SDK 客户端。
+     * 获取按配置签名方式和密钥初始化的 SDK 客户端。
      */
     private function client(): SwiftpassClient
     {
@@ -387,7 +423,9 @@ class SwiftpassApiPayment extends BasePayment implements PaymentInterface, PayPl
     }
 
     /**
-     * 获取字符串配置。
+     * 读取字符串配置，缺失时返回空字符串。
+     *
+     * @param string $key 配置键
      */
     private function configText(string $key): string
     {

@@ -12,6 +12,7 @@ use app\common\interface\PaymentInterface;
 use app\common\interface\PayPluginInterface;
 use app\common\util\FormatHelper;
 use app\exception\PaymentException;
+use app\exception\UnsupportedPaymentOperationException;
 use app\model\payment\PayOrder;
 use app\repository\payment\config\PaymentChannelRepository;
 use app\repository\payment\trade\PayOrderRepository;
@@ -23,8 +24,8 @@ use support\Response;
 /**
  * USDT TRC20 地址入账监听插件。
  *
- * 后端只负责换算应付 USDT、分配收款地址和匹配 watcher 投递的链上入账流水；
- * 链上查询由 receipt_watcher 的 TronGrid 适配器完成。
+ * 负责按固定汇率换算应付 USDT、分配地址与唯一金额，并匹配 watcher 投递的链上入账流水。
+ * 链上查询及确认数判断由 receipt_watcher 的 TronGrid 适配器完成，本插件不直接访问链上接口。
  */
 class UsdtTrc20ReceiptPayment extends BasePayment implements PaymentInterface, PayPluginInterface, ChannelNotifyPayloadInterface
 {
@@ -72,8 +73,11 @@ class UsdtTrc20ReceiptPayment extends BasePayment implements PaymentInterface, P
     /**
      * 发起 USDT TRC20 收款。
      *
+     * 地址与金额按账号级锁分配；展示金额必须与链上到账的 6 位原子金额完全对应。
+     *
      * @param array<string, mixed> $order 支付单快照
-     * @return array<string, mixed> 下单结果
+     *
+     * @return array<string, mixed> 标准页面待支付结果
      */
     public function pay(array $order): array
     {
@@ -99,45 +103,53 @@ class UsdtTrc20ReceiptPayment extends BasePayment implements PaymentInterface, P
             'tips' => '转账金额必须与页面显示完全一致，网络请选择 TRC20。',
         ];
 
-        return [
+        return $this->pendingPaymentResult($order, [
             'pay_page' => 'page',
             'pay_type' => (string) ($order['pay_type_code'] ?? 'usdt'),
             'pay_product' => 'trc20',
             'pay_action' => 'address',
             'pay_params' => $params,
-            'chan_order_no' => $payNo,
+            'chan_order_no' => '',
             'chan_trade_no' => '',
-        ];
+        ]);
     }
 
     /**
-     * 主动查单由 receipt_watcher 完成。
+     * 链上主动查询由 receipt_watcher 完成，因此插件查单只保持待支付状态。
      *
      * @param array<string, mixed> $order 支付单快照
-     * @return array<string, mixed> 查询结果
+     *
+     * @return array<string, mixed> 不确认终态的标准待支付结果
      */
     public function query(array $order): array
     {
         return [
-            'success' => true,
             'status' => PaymentPluginStatusConstant::PENDING,
-            'channel_order_no' => (string) ($order['channel_order_no'] ?? $order['pay_no'] ?? ''),
-            'channel_trade_no' => (string) ($order['channel_trade_no'] ?? ''),
+            'pay_no' => (string) ($order['pay_no'] ?? ''),
+            'paid_amount' => null,
+            'chan_order_no' => (string) ($order['chan_order_no'] ?? ''),
+            'chan_trade_no' => (string) ($order['chan_trade_no'] ?? ''),
             'message' => '等待 receipt_watcher 查询 USDT TRC20 入账流水',
         ];
     }
 
     /**
-     * USDT 地址收款不需要通知上游关单。
+     * 结束本地 USDT 地址收款等待状态。
+     *
+     * 链上没有可撤销的上游收款订单，因此该结果只表达本地终止等待。
      *
      * @param array<string, mixed> $order 支付单快照
-     * @return array<string, mixed> 关闭结果
+     *
+     * @return array<string, mixed> 标准本地关单结果
      */
     public function close(array $order): array
     {
         return [
-            'success' => true,
-            'msg' => 'USDT TRC20 收款无需上游关单',
+            'status' => PaymentPluginStatusConstant::CLOSED,
+            'pay_no' => (string) ($order['pay_no'] ?? ''),
+            'chan_order_no' => (string) ($order['chan_order_no'] ?? ''),
+            'chan_trade_no' => (string) ($order['chan_trade_no'] ?? ''),
+            'message' => 'USDT TRC20 收款无需上游关单',
         ];
     }
 
@@ -145,18 +157,20 @@ class UsdtTrc20ReceiptPayment extends BasePayment implements PaymentInterface, P
      * 链上收款不支持接口退款。
      *
      * @param array<string, mixed> $order 支付单快照
+     *
      * @return array<string, mixed> 退款结果
      */
     public function refund(array $order): array
     {
-        throw new PaymentException('USDT TRC20 收款不支持接口退款', 40200);
+        throw new UnsupportedPaymentOperationException('USDT TRC20 收款不支持接口退款', 40200);
     }
 
     /**
-     * 兼容 HTTP 手工重放入口。
+     * 将 HTTP 通知入口委托给与队列通知相同的载荷处理流程。
      *
      * @param Request $request 请求对象
-     * @return array<string, mixed> 回调结果
+     *
+     * @return array<string, mixed> 标准支付通知结果
      */
     public function notify(Request $request): array
     {
@@ -166,7 +180,10 @@ class UsdtTrc20ReceiptPayment extends BasePayment implements PaymentInterface, P
     /**
      * 根据链上流水定位支付单。
      *
+     * 已处理交易优先按 txid 幂等定位；新交易按合约、收款地址、原子金额和订单时间窗口匹配。
+     *
      * @param array<string, mixed> $payload watcher 投递载荷
+     *
      * @return array{pay_no:string} 定位结果
      */
     public function channelNotifyPayload(array $payload): array
@@ -178,31 +195,39 @@ class UsdtTrc20ReceiptPayment extends BasePayment implements PaymentInterface, P
      * 生成标准支付成功通知。
      *
      * @param array<string, mixed> $payload watcher 投递载荷
-     * @return array<string, mixed> 插件通知结果
+     *
+     * @return array<string, mixed> 标准支付成功通知结果
      */
     public function notifyPayload(array $payload): array
     {
         $record = $this->recordPayload($payload);
         $payNo = $this->locatePayNo($payload);
         $tradeNo = $this->channelTradeNo($record);
-        $this->persistNotifyMeta($payNo, $record, $tradeNo);
+        $paidAmount = $this->persistNotifyMeta($payNo, $record, $tradeNo);
 
         return [
             'status' => PaymentPluginStatusConstant::SUCCESS,
             'pay_no' => $payNo,
+            'paid_amount' => $paidAmount,
             'message' => 'receipt_watcher 已确认 USDT TRC20 入账流水',
-            'channel_order_no' => $tradeNo,
-            'channel_trade_no' => $tradeNo,
+            'chan_order_no' => $tradeNo,
+            'chan_trade_no' => $tradeNo,
             'channel_status' => 'trc20_confirmed',
             'paid_at' => $this->paidAtFromRecord($record),
         ];
     }
 
+    /**
+     * 返回渠道要求的成功应答。
+     */
     public function notifySuccess(): string|Response
     {
         return 'success';
     }
 
+    /**
+     * 返回渠道要求的失败应答。
+     */
     public function notifyFail(): string|Response
     {
         return 'fail';
@@ -242,24 +267,6 @@ class UsdtTrc20ReceiptPayment extends BasePayment implements PaymentInterface, P
                 ],
                 'validate' => [
                     ['required' => true, 'message' => '请填写 USDT 汇率'],
-                ],
-            ],
-            [
-                'type' => 'input',
-                'field' => 'usdt_contract_address',
-                'title' => 'USDT 合约地址',
-                'value' => self::DEFAULT_USDT_CONTRACT,
-                'props' => [
-                    'placeholder' => self::DEFAULT_USDT_CONTRACT,
-                ],
-            ],
-            [
-                'type' => 'input',
-                'field' => 'trongrid_base_url',
-                'title' => 'TronGrid 地址',
-                'value' => 'https://api.trongrid.io',
-                'props' => [
-                    'placeholder' => 'https://api.trongrid.io',
                 ],
             ],
             [
@@ -309,7 +316,10 @@ class UsdtTrc20ReceiptPayment extends BasePayment implements PaymentInterface, P
     /**
      * 分配 USDT 收款地址和金额。
      *
+     * 优先独占空闲地址；地址池均被占用时，以 0.001 USDT 为步长分配当前地址下未占用的金额。
+     *
      * @param string $payNo 支付单号
+     *
      * @return array<string, mixed> 收款参数
      */
     private function prepareUsdtReceipt(string $payNo): array
@@ -364,6 +374,7 @@ class UsdtTrc20ReceiptPayment extends BasePayment implements PaymentInterface, P
      *
      * @param string $payNo 当前支付单号
      * @param int $baseAtomic 基础 USDT 原子金额
+     *
      * @return array{address:string, amount_atomic:int}
      */
     private function selectAddressAndAmount(string $payNo, int $baseAtomic): array
@@ -457,11 +468,11 @@ class UsdtTrc20ReceiptPayment extends BasePayment implements PaymentInterface, P
      * @param string $payNo 支付单号
      * @param array<string, mixed> $record 流水记录
      * @param string $tradeNo 链上交易哈希
-     * @return void
+     * @return int 原始人民币订单金额，单位分
      */
-    private function persistNotifyMeta(string $payNo, array $record, string $tradeNo): void
+    private function persistNotifyMeta(string $payNo, array $record, string $tradeNo): int
     {
-        Db::transaction(function () use ($payNo, $record, $tradeNo): void {
+        return Db::transaction(function () use ($payNo, $record, $tradeNo): int {
             $payOrder = $this->lockedPayOrder($payNo);
             $extJson = (array) ($payOrder->ext_json ?? []);
             $receipt = (array) ($extJson[self::EXT_KEY] ?? []);
@@ -474,13 +485,18 @@ class UsdtTrc20ReceiptPayment extends BasePayment implements PaymentInterface, P
             $extJson[self::EXT_KEY] = $receipt;
             $payOrder->ext_json = $extJson;
             $payOrder->save();
+
+            return $this->originalAmount($payOrder);
         });
     }
 
     /**
      * 通过链上流水定位支付单号。
      *
+     * 合约字段存在时必须等于配置的 USDT 合约；随后按地址、原子金额和有效时间窗口筛选候选单。
+     *
      * @param array<string, mixed> $payload watcher 投递载荷
+     *
      * @return string 支付单号
      */
     private function locatePayNo(array $payload): string
@@ -612,7 +628,10 @@ class UsdtTrc20ReceiptPayment extends BasePayment implements PaymentInterface, P
     /**
      * 人民币分金额换算为 USDT 原子金额。
      *
+     * 全程使用定点整数并向上取整到 0.001 USDT，避免浮点误差造成少收。
+     *
      * @param int $cnyCents 人民币金额，单位分
+     *
      * @return int USDT 原子金额，6 位小数
      */
     private function cnyCentsToUsdtAtomic(int $cnyCents): int
@@ -647,6 +666,7 @@ class UsdtTrc20ReceiptPayment extends BasePayment implements PaymentInterface, P
      *
      * @param string $value 十进制文本
      * @param int $scale 小数位
+     *
      * @return int 定点整数
      */
     private function decimalToInteger(string $value, int $scale): int
@@ -736,9 +756,7 @@ class UsdtTrc20ReceiptPayment extends BasePayment implements PaymentInterface, P
      */
     private function tokenContract(): string
     {
-        $contract = $this->normalizeAddress((string) $this->getConfig('usdt_contract_address', self::DEFAULT_USDT_CONTRACT));
-
-        return $contract !== '' ? $contract : self::DEFAULT_USDT_CONTRACT;
+        return self::DEFAULT_USDT_CONTRACT;
     }
 
     /**
@@ -784,7 +802,10 @@ class UsdtTrc20ReceiptPayment extends BasePayment implements PaymentInterface, P
     /**
      * 账号级互斥锁。
      *
+     * 缓存锁使用随机令牌校验所有权，避免一个请求释放另一个请求刚取得的锁。
+     *
      * @param callable $callback 回调
+     *
      * @return mixed 回调结果
      */
     private function withAccountLock(callable $callback): mixed
@@ -844,8 +865,11 @@ class UsdtTrc20ReceiptPayment extends BasePayment implements PaymentInterface, P
     /**
      * 选择离链上支付时间最近的候选订单。
      *
+     * 距离相同会拒绝确认，避免在地址、金额同时复用时把流水归属到任意订单。
+     *
      * @param array<int, PayOrder> $orders 候选订单
      * @param int $paidAt 支付时间戳
+     *
      * @return string 支付单号
      */
     private function closestPayNo(array $orders, int $paidAt): string

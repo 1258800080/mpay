@@ -13,7 +13,10 @@ use app\common\constant\PaymentPluginStatusConstant;
 use app\common\interface\PaymentInterface;
 use app\common\interface\PayPluginInterface;
 use app\common\util\FormatHelper;
+use app\exception\PaymentDefinitiveException;
 use app\exception\PaymentException;
+use app\exception\PaymentUncertainException;
+use app\exception\UnsupportedPaymentOperationException;
 use app\service\payment\epay\EpaySignerManager;
 use support\Request;
 use support\Response;
@@ -130,10 +133,10 @@ class EpayV1Payment extends BasePayment implements PaymentInterface, PayPluginIn
         }
 
         if ((string) $order['extra']['_submit_type'] === EpayProtocolConstant::SUBMIT_TYPE_PAGE) {
-            return $this->submitPay($payload);
+            return $this->pendingPaymentResult($order, $this->submitPay($payload));
         }
 
-        return $this->mapiPay($payload, $order);
+        return $this->pendingPaymentResult($order, $this->mapiPay($payload, $order));
     }
 
     /**
@@ -169,7 +172,6 @@ class EpayV1Payment extends BasePayment implements PaymentInterface, PayPluginIn
                 'method' => 'get',
                 'payload' => $payload,
             ],
-            // 页面跳转阶段还拿不到上游真实单号，先用本地 out_trade_no/pay_no 占位。
             'chan_order_no' => (string) $payload['out_trade_no'],
             'chan_trade_no' => '',
         ];
@@ -179,7 +181,7 @@ class EpayV1Payment extends BasePayment implements PaymentInterface, PayPluginIn
      * 使用 V1 mapi.php 接口支付。
      *
      * mapi.php 会直接返回二维码、跳转链接或 URL Scheme，并返回平台订单号。
-     * 如果上游没有返回有效承接内容或 trade_no，按创建订单失败处理。
+     * 如果上游已受理但没有返回有效承接内容或 trade_no，结果无法确认，按不确定异常处理。
      *
      * @param array<string, mixed> $payload V1 支付参数
      * @param array<string, mixed> $order 标准插件下单参数
@@ -206,7 +208,7 @@ class EpayV1Payment extends BasePayment implements PaymentInterface, PayPluginIn
         ]);
 
         if ((int) ($response['code'] ?? 0) !== 1) {
-            throw new PaymentException((string) ($response['msg'] ?? '上游 V1 下单失败'), 40200, [
+            throw new PaymentDefinitiveException((string) ($response['msg'] ?? '上游 V1 下单失败'), 40200, [
                 'response' => $response,
             ]);
         }
@@ -221,14 +223,14 @@ class EpayV1Payment extends BasePayment implements PaymentInterface, PayPluginIn
         }
 
         if ($payPage === '') {
-            throw new PaymentException('上游 V1 未返回有效支付内容', 40200, [
+            throw new PaymentUncertainException('上游 V1 未返回有效支付内容', 40200, [
                 'response' => $response,
             ]);
         }
 
         $channelOrderNo = (string) ($response['trade_no'] ?? '');
         if ($channelOrderNo === '') {
-            throw new PaymentException('上游 V1 未返回平台订单号', 40200, [
+            throw new PaymentUncertainException('上游 V1 未返回平台订单号', 40200, [
                 'response' => $response,
             ]);
         }
@@ -302,22 +304,32 @@ class EpayV1Payment extends BasePayment implements PaymentInterface, PayPluginIn
         ]);
 
         if ((int) ($response['code'] ?? 0) !== 1) {
-            return [
-                'success' => false,
-                'msg' => (string) ($response['msg'] ?? '上游 V1 查单失败'),
-                'raw_data' => $response,
-            ];
+            throw new PaymentUncertainException((string) ($response['msg'] ?? '上游 V1 查单失败'), 40200);
         }
 
         $status = (int) ($response['status'] ?? 0) === 1
             ? PaymentPluginStatusConstant::SUCCESS
             : PaymentPluginStatusConstant::PENDING;
 
+        $responsePayNo = trim((string) ($response['out_trade_no'] ?? ''));
+        if ($responsePayNo === '' || !hash_equals($payNo, $responsePayNo)) {
+            throw new PaymentUncertainException('上游 V1 查单返回支付单号不匹配', 40200, ['pay_no' => $payNo]);
+        }
+
+        $paidAmount = null;
+        if ($status === PaymentPluginStatusConstant::SUCCESS) {
+            $paidAmount = $this->yuanToCents($response['money'] ?? null, '上游 V1 查单金额');
+            if ($paidAmount !== (int) ($order['amount'] ?? -1)) {
+                throw new PaymentUncertainException('上游 V1 查单返回金额不匹配', 40200, ['pay_no' => $payNo]);
+            }
+        }
+
         return [
-            'success' => true,
             'status' => $status,
-            'channel_order_no' => (string) ($response['trade_no'] ?? $channelOrderNo),
-            'channel_trade_no' => (string) ($response['api_trade_no'] ?? ''),
+            'pay_no' => $payNo,
+            'paid_amount' => $paidAmount,
+            'chan_order_no' => (string) ($response['trade_no'] ?? ''),
+            'chan_trade_no' => (string) ($response['api_trade_no'] ?? ''),
             'channel_status' => (string) ($response['status'] ?? ''),
             'message' => (string) ($response['msg'] ?? ''),
             'paid_at' => $status === PaymentPluginStatusConstant::SUCCESS ? ($response['endtime'] ?? null) : null,
@@ -332,7 +344,7 @@ class EpayV1Payment extends BasePayment implements PaymentInterface, PayPluginIn
      */
     public function close(array $order): array
     {
-        throw new PaymentException('上游 ePay V1 协议不支持关单', 40200, [
+        throw new UnsupportedPaymentOperationException('上游 ePay V1 协议不支持关单', 40200, [
             'plugin_code' => $this->getCode(),
             'pay_no' => (string) ($order['pay_no'] ?? ''),
         ]);
@@ -372,11 +384,17 @@ class EpayV1Payment extends BasePayment implements PaymentInterface, PayPluginIn
             'headers' => ['Accept' => 'application/json'],
         ]);
 
+        if ((int) ($response['code'] ?? 0) !== 1) {
+            throw new PaymentDefinitiveException((string) ($response['msg'] ?? '上游 V1 退款失败'), 40200);
+        }
+
         return [
-            'success' => (int) ($response['code'] ?? 0) === 1,
-            'msg' => (string) ($response['msg'] ?? ''),
-            'chan_refund_no' => (string) ($response['refund_no'] ?? $response['trade_no'] ?? ''),
-            'raw_data' => $response,
+            'status' => PaymentPluginStatusConstant::SUCCESS,
+            'refund_no' => $refundNo,
+            'pay_no' => $payNo,
+            'refund_amount' => (int) $order['refund_amount'],
+            'chan_refund_no' => '',
+            'message' => (string) ($response['msg'] ?? '退款成功'),
         ];
     }
 
@@ -413,9 +431,13 @@ class EpayV1Payment extends BasePayment implements PaymentInterface, PayPluginIn
 
         return [
             'status' => $status,
+            'pay_no' => trim((string) ($payload['out_trade_no'] ?? '')),
+            'paid_amount' => $status === PaymentPluginStatusConstant::SUCCESS
+                ? $this->yuanToCents($payload['money'] ?? null, '上游 V1 回调金额')
+                : null,
             'message' => $tradeStatus,
-            'channel_order_no' => $channelOrderNo,
-            'channel_trade_no' => $channelOrderNo,
+            'chan_order_no' => $channelOrderNo,
+            'chan_trade_no' => $channelOrderNo,
             'channel_status' => $tradeStatus,
         ];
     }
@@ -438,6 +460,8 @@ class EpayV1Payment extends BasePayment implements PaymentInterface, PayPluginIn
 
     /**
      * 获取签名管理器。
+     *
+     * @return EpaySignerManager
      */
     private function signerManager(): EpaySignerManager
     {
@@ -451,9 +475,29 @@ class EpayV1Payment extends BasePayment implements PaymentInterface, PayPluginIn
     }
 
     /**
+     * 将两位小数元金额转换为整数分。
+     *
+     * @param mixed $value 渠道金额
+     * @param string $field 金额字段说明
+     * @return int 金额，单位分
+     */
+    private function yuanToCents(mixed $value, string $field): int
+    {
+        $text = trim((string) $value);
+        if (preg_match('/^(0|[1-9]\d*)(?:\.(\d{1,2}))?$/', $text, $matches) !== 1) {
+            throw new PaymentUncertainException($field . '格式无效', 40200);
+        }
+
+        return ((int) $matches[1] * 100) + (int) str_pad((string) ($matches[2] ?? ''), 2, '0');
+    }
+
+    /**
      * 拼接上游网关地址。
      *
      * 后台配置只保存根地址，具体协议路径由插件内部统一补齐。
+     *
+     * @param string $path 协议路径
+     * @return string 完整网关地址
      */
     private function gatewayUrl(string $path): string
     {

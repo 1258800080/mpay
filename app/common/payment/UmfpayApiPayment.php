@@ -12,12 +12,18 @@ use app\common\interface\PayPluginInterface;
 use app\common\sdk\umfpay\UmfpayClient;
 use app\common\sdk\umfpay\UmfpaySdkException;
 use app\common\trait\DirectPaymentProductSelectorTrait;
+use app\exception\PaymentDefinitiveException;
 use app\exception\PaymentException;
+use app\exception\PaymentUncertainException;
+use app\exception\UnsupportedPaymentOperationException;
 use support\Request;
 use support\Response;
 
 /**
  * 联动优势支付 API 插件。
+ *
+ * 负责微信公众号、支付宝/微信/银联扫码产品的下单、退款及带签名应答的异步通知适配。
+ * 当前协议未接入主动查单与关单能力。
  */
 class UmfpayApiPayment extends BasePayment implements PaymentInterface, PayPluginInterface
 {
@@ -78,7 +84,8 @@ class UmfpayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      * 发起支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准待支付结果
      */
     public function pay(array $order): array
     {
@@ -110,7 +117,8 @@ class UmfpayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      * 微信公众号跳转支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准跳转待支付结果
      */
     private function jsapiPay(array $order): array
     {
@@ -127,8 +135,9 @@ class UmfpayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      * 二维码支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @param string $payType 支付方式
-     * @return array<string, mixed>
+     * @param string $payType 标准支付方式代码
+     *
+     * @return array<string, mixed> 标准二维码待支付结果
      */
     private function qrcodePay(array $order, string $payType): array
     {
@@ -162,25 +171,25 @@ class UmfpayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     }
 
     /**
-     * 联动优势旧插件未提供主动查单链路。
+     * 当前适配协议未提供可确认的主动查单接口。
      *
      * @param array<string, mixed> $order 标准插件查单参数
      * @return array<string, mixed>
      */
     public function query(array $order): array
     {
-        return ['success' => false, 'status' => PaymentPluginStatusConstant::PENDING, 'msg' => '联动优势插件暂不支持主动查单'];
+        throw new UnsupportedPaymentOperationException('联动优势插件暂不支持主动查单', 40200);
     }
 
     /**
-     * 联动优势旧插件未提供关单链路。
+     * 当前适配协议未提供可确认的关单接口。
      *
      * @param array<string, mixed> $order 标准插件关单参数
      * @return array<string, mixed>
      */
     public function close(array $order): array
     {
-        return ['success' => false, 'msg' => '联动优势插件暂不支持关单'];
+        throw new UnsupportedPaymentOperationException('联动优势插件暂不支持关单', 40200);
     }
 
     /**
@@ -201,27 +210,31 @@ class UmfpayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
                 'refund_amount' => (string) (int) $order['refund_amount'],
             ]);
         } catch (UmfpaySdkException $e) {
-            return ['success' => false, 'msg' => $e->getMessage()];
+            throw new PaymentUncertainException('联动优势退款结果不确定：' . $e->getMessage(), 40200);
         }
 
         if ((string) ($data['ret_code'] ?? '') !== '0000') {
-            return ['success' => false, 'msg' => (string) ($data['ret_msg'] ?? '退款失败'), 'raw_data' => $data];
+            throw new PaymentDefinitiveException((string) ($data['ret_msg'] ?? '联动优势退款失败'), 40200);
         }
 
         return [
-            'success' => true,
-            'msg' => '退款申请成功',
-            'chan_refund_no' => (string) ($data['order_id'] ?? $order['refund_no']),
+            'status' => PaymentPluginStatusConstant::SUCCESS,
+            'refund_no' => (string) $order['refund_no'],
+            'pay_no' => (string) $order['pay_no'],
             'refund_amount' => (int) ($data['refund_amt'] ?? $order['refund_amount']),
-            'raw_data' => $data,
+            'chan_refund_no' => (string) ($data['refund_no'] ?? ''),
+            'message' => '退款申请成功',
         ];
     }
 
     /**
      * 解析支付回调。
      *
+     * 联动优势以查询参数通知；原始参数会保留到当前处理实例，用于生成协议要求的签名 HTML 应答。
+     *
      * @param Request $request 回调请求
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准支付通知结果
      */
     public function notify(Request $request): array
     {
@@ -235,15 +248,17 @@ class UmfpayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
 
         return [
             'status' => $success ? PaymentPluginStatusConstant::SUCCESS : PaymentPluginStatusConstant::PENDING,
+            'pay_no' => trim((string) ($payload['order_id'] ?? '')),
+            'paid_amount' => $success ? $this->integerCents($payload['amount'] ?? null, '联动优势回调金额') : null,
             'message' => (string) ($payload['trade_state'] ?? ''),
-            'channel_order_no' => (string) ($payload['order_id'] ?? ''),
-            'channel_trade_no' => (string) ($payload['trade_no'] ?? ''),
+            'chan_order_no' => (string) ($payload['order_id'] ?? ''),
+            'chan_trade_no' => (string) ($payload['trade_no'] ?? ''),
             'channel_status' => (string) ($payload['trade_state'] ?? ''),
         ];
     }
 
     /**
-     * 返回联动优势成功应答。
+     * 使用最近一次已解析通知参数生成联动优势签名成功应答。
      */
     public function notifySuccess(): string|Response
     {
@@ -251,7 +266,7 @@ class UmfpayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     }
 
     /**
-     * 返回联动优势失败应答。
+     * 使用最近一次已解析通知参数生成联动优势签名失败应答。
      */
     public function notifyFail(): string|Response
     {
@@ -259,10 +274,27 @@ class UmfpayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     }
 
     /**
-     * 构造通用下单参数。
+     * 解析渠道以整数分表示的金额，拒绝小数及非数字内容。
+     *
+     * @param mixed $value 渠道金额原值
+     * @param string $field 用于异常提示的字段名称
+     */
+    private function integerCents(mixed $value, string $field): int
+    {
+        $text = trim((string) $value);
+        if (preg_match('/^\d+$/', $text) !== 1) {
+            throw new PaymentException($field . '格式无效', 40200);
+        }
+
+        return (int) $text;
+    }
+
+    /**
+     * 构造联动优势各支付产品共享的下单参数。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 上游下单请求参数
      */
     private function basePayload(array $order): array
     {
@@ -277,16 +309,21 @@ class UmfpayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     }
 
     /**
-     * 包装标准支付结果。
+     * 将上游支付凭据包装为标准待支付结果。
      *
+     * @param string $page 收银台承接页类型
+     * @param string $payType 标准支付方式代码
+     * @param string $product 联动优势产品代码
+     * @param string $action 支付动作标识
      * @param array<string, mixed> $payParams 承接页参数
      * @param array<string, mixed> $data 上游响应
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准待支付结果
      */
     private function payResult(string $page, string $payType, string $product, string $action, array $payParams, array $data, array $order): array
     {
-        return [
+        return $this->pendingPaymentResult($order, [
             'pay_page' => $page,
             'pay_type' => $payType,
             'pay_product' => $product,
@@ -294,11 +331,11 @@ class UmfpayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
             'pay_params' => $payParams,
             'chan_order_no' => (string) ($data['order_id'] ?? $order['pay_no']),
             'chan_trade_no' => (string) ($data['trade_no'] ?? ''),
-        ];
+        ]);
     }
 
     /**
-     * 获取 SDK 客户端。
+     * 获取复用商户私钥与平台公钥初始化的 SDK 客户端。
      */
     private function client(): UmfpayClient
     {
@@ -314,7 +351,9 @@ class UmfpayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     }
 
     /**
-     * 获取字符串配置。
+     * 读取字符串配置，缺失时返回空字符串。
+     *
+     * @param string $key 配置键
      */
     private function configText(string $key): string
     {

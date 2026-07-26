@@ -23,6 +23,21 @@ class AlipayCertificate
      */
     public static function appCertSn(string $certContent): string
     {
+        self::validateCertificate($certContent, '应用公钥证书');
+
+        return self::certSn($certContent);
+    }
+
+    /**
+     * 计算支付宝公钥证书序列号。
+     *
+     * @param string $certContent 支付宝公钥证书内容
+     * @return string 证书序列号
+     */
+    public static function alipayCertSn(string $certContent): string
+    {
+        self::validateCertificate($certContent, '支付宝公钥证书');
+
         return self::certSn($certContent);
     }
 
@@ -62,6 +77,7 @@ class AlipayCertificate
      */
     public static function publicKeyFromCert(string $certContent): string
     {
+        self::validateCertificate($certContent, '支付宝公钥证书');
         $resource = openssl_pkey_get_public($certContent);
         if ($resource === false) {
             throw new AlipaySdkException('支付宝公钥证书无效');
@@ -74,6 +90,74 @@ class AlipayCertificate
         }
 
         return $key;
+    }
+
+    /**
+     * 校验证书格式、有效期和 RSA 公钥强度。
+     *
+     * @param string $certContent 证书内容
+     * @param string $label 证书名称
+     * @return void
+     */
+    public static function validateCertificate(string $certContent, string $label): void
+    {
+        $parsed = self::parse($certContent);
+        $now = time();
+        if ((int) ($parsed['validFrom_time_t'] ?? 0) > $now) {
+            throw new AlipaySdkException($label . '尚未生效', 'configuration');
+        }
+        if ((int) ($parsed['validTo_time_t'] ?? 0) < $now) {
+            throw new AlipaySdkException($label . '已过期', 'configuration');
+        }
+
+        $resource = openssl_pkey_get_public($certContent);
+        $details = $resource === false ? false : openssl_pkey_get_details($resource);
+        if (!is_array($details) || ($details['type'] ?? null) !== OPENSSL_KEYTYPE_RSA) {
+            throw new AlipaySdkException($label . '必须包含 RSA 公钥', 'configuration');
+        }
+        if ((int) ($details['bits'] ?? 0) < 2048) {
+            throw new AlipaySdkException($label . 'RSA 公钥必须至少为 2048 位', 'configuration');
+        }
+    }
+
+    /**
+     * 校验应用私钥与应用公钥证书匹配。
+     *
+     * @param string $privateKey 应用私钥
+     * @param string $appCertContent 应用公钥证书内容
+     * @return void
+     */
+    public static function assertPrivateKeyMatchesCertificate(string $privateKey, string $appCertContent): void
+    {
+        self::validateCertificate($appCertContent, '应用公钥证书');
+        if (!AlipaySigner::keysMatch($privateKey, self::publicKeyFromAnyCertificate($appCertContent))) {
+            throw new AlipaySdkException('支付宝应用私钥与应用公钥证书不匹配', 'configuration');
+        }
+    }
+
+    /**
+     * 校验支付宝公钥证书由已配置支付宝根证书中的一个 RSA 根签发。
+     *
+     * @param string $alipayCertContent 支付宝公钥证书内容
+     * @param string $rootCertContent 支付宝根证书内容
+     * @return void
+     */
+    public static function assertTrustedByRoot(string $alipayCertContent, string $rootCertContent): void
+    {
+        self::validateCertificate($alipayCertContent, '支付宝公钥证书');
+        $roots = self::splitCertificates($rootCertContent);
+        if ($roots === []) {
+            throw new AlipaySdkException('支付宝根证书文件不包含有效证书', 'configuration');
+        }
+
+        foreach ($roots as $root) {
+            $rootKey = openssl_pkey_get_public($root);
+            if ($rootKey !== false && openssl_x509_verify($alipayCertContent, $rootKey) === 1) {
+                return;
+            }
+        }
+
+        throw new AlipaySdkException('支付宝公钥证书无法通过已配置根证书验证', 'configuration');
     }
 
     /**
@@ -101,6 +185,24 @@ class AlipayCertificate
         }
 
         return $parsed;
+    }
+
+    /**
+     * 从任意 X509 证书提取 PEM 公钥。
+     *
+     * @param string $certContent X509 证书内容
+     * @return string PEM 公钥
+     */
+    private static function publicKeyFromAnyCertificate(string $certContent): string
+    {
+        $resource = openssl_pkey_get_public($certContent);
+        $details = $resource === false ? false : openssl_pkey_get_details($resource);
+        $key = is_array($details) ? (string) ($details['key'] ?? '') : '';
+        if ($key === '') {
+            throw new AlipaySdkException('从应用公钥证书提取公钥失败', 'configuration');
+        }
+
+        return $key;
     }
 
     /**
@@ -171,7 +273,7 @@ class AlipayCertificate
     /**
      * 将十六进制大整数转成十进制字符串。
      *
-     * 这里不用 bcmath，避免部署环境没有安装扩展时证书模式不可用。
+     * 使用十进制字符串运算，避免证书大整数受 PHP 整数宽度限制。
      *
      * @param string $hex 十六进制字符串
      * @return string 十进制字符串

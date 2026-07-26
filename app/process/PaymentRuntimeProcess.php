@@ -12,7 +12,7 @@ use Workerman\Worker;
 /**
  * 支付运行时维护进程。
  *
- * 使用 Webman 自定义进程承载轻量定时任务，避免把通知重试和主动查单塞进请求链路。
+ * 使用 Webman 自定义进程承载轻量定时任务，避免把通知重试、转账恢复和主动查单塞进请求链路。
  */
 class PaymentRuntimeProcess
 {
@@ -89,6 +89,36 @@ class PaymentRuntimeProcess
                 fn (): array => $this->maintenanceService()->retryMerchantNotifies(
                     $this->intConfig('pay_notify_retry_batch_size', 100, 1)
                 )
+            );
+
+            $this->runIfDue(
+                'transfer_dispatch_recovery',
+                30,
+                fn (): array => $this->maintenanceService()->recoverPendingTransferDispatches(100, 60)
+            );
+
+            $this->runIfDue(
+                'transfer_query_recovery',
+                60,
+                fn (): array => $this->maintenanceService()->recoverPendingTransferQueries(100, 60)
+            );
+
+            $this->runIfDue(
+                'pay_success_side_effect_recovery',
+                30,
+                fn (): array => $this->maintenanceService()->recoverSuccessfulPayOrderSideEffects(100, 60)
+            );
+
+            $this->runIfDue(
+                'refund_active_query',
+                60,
+                fn (): array => $this->maintenanceService()->syncProcessingRefundsByQuery(100, 60)
+            );
+
+            $this->runIfDue(
+                'refund_account_reverse_recovery',
+                60,
+                fn (): array => $this->maintenanceService()->recoverRefundAccountReverses(100)
             );
 
             if ($this->boolConfig('pay_order_timeout_enabled', true)) {

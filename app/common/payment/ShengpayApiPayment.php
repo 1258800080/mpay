@@ -13,11 +13,15 @@ use app\common\sdk\shengpay\ShengpayClient;
 use app\common\sdk\shengpay\ShengpaySdkException;
 use app\common\trait\DirectPaymentProductSelectorTrait;
 use app\exception\PaymentException;
+use app\exception\PaymentUncertainException;
+use app\exception\UnsupportedPaymentOperationException;
 use support\Request;
 use support\Response;
 
 /**
  * 盛付通支付 API 插件。
+ *
+ * 负责微信、支付宝与银联直连产品的下单、退款和异步通知适配；当前协议未接入主动查单与关单能力。
  */
 class ShengpayApiPayment extends BasePayment implements PaymentInterface, PayPluginInterface
 {
@@ -81,7 +85,8 @@ class ShengpayApiPayment extends BasePayment implements PaymentInterface, PayPlu
      * 发起支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准待支付结果
      */
     public function pay(array $order): array
     {
@@ -149,7 +154,8 @@ class ShengpayApiPayment extends BasePayment implements PaymentInterface, PayPlu
      *
      * @param array<string, mixed> $order 标准插件下单参数
      * @param string $tradeType 盛付通支付产品
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准待支付结果
      */
     private function tradePay(array $order, string $tradeType): array
     {
@@ -173,25 +179,25 @@ class ShengpayApiPayment extends BasePayment implements PaymentInterface, PayPlu
     }
 
     /**
-     * 盛付通旧插件未提供主动查单链路。
+     * 当前适配协议未提供可确认的主动查单接口。
      *
      * @param array<string, mixed> $order 标准插件查单参数
      * @return array<string, mixed>
      */
     public function query(array $order): array
     {
-        return ['success' => false, 'status' => PaymentPluginStatusConstant::PENDING, 'msg' => '盛付通插件暂不支持主动查单'];
+        throw new UnsupportedPaymentOperationException('盛付通插件暂不支持主动查单', 40200);
     }
 
     /**
-     * 盛付通旧插件未提供关单链路。
+     * 当前适配协议未提供可确认的关单接口。
      *
      * @param array<string, mixed> $order 标准插件关单参数
      * @return array<string, mixed>
      */
     public function close(array $order): array
     {
-        return ['success' => false, 'msg' => '盛付通插件暂不支持关单'];
+        throw new UnsupportedPaymentOperationException('盛付通插件暂不支持关单', 40200);
     }
 
     /**
@@ -209,23 +215,27 @@ class ShengpayApiPayment extends BasePayment implements PaymentInterface, PayPlu
                 'refundFee' => (int) $order['refund_amount'],
             ]);
         } catch (ShengpaySdkException $e) {
-            return ['success' => false, 'msg' => $e->getMessage()];
+            throw new PaymentUncertainException('盛付通退款结果不确定：' . $e->getMessage(), 40200);
         }
 
         return [
-            'success' => true,
-            'msg' => '退款申请成功',
-            'chan_refund_no' => (string) ($data['refundId'] ?? $order['refund_no']),
+            'status' => PaymentPluginStatusConstant::SUCCESS,
+            'refund_no' => (string) $order['refund_no'],
+            'pay_no' => (string) $order['pay_no'],
             'refund_amount' => (int) ($data['refundFee'] ?? $order['refund_amount']),
-            'raw_data' => $data,
+            'chan_refund_no' => (string) ($data['refundId'] ?? ''),
+            'message' => '退款申请成功',
         ];
     }
 
     /**
      * 解析支付回调。
      *
+     * 回调使用原始 JSON 请求体解析，参数须通过盛付通平台公钥验签；只有 PAY_SUCCESS 才确认实付金额。
+     *
      * @param Request $request 回调请求
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准支付通知结果
      */
     public function notify(Request $request): array
     {
@@ -238,9 +248,11 @@ class ShengpayApiPayment extends BasePayment implements PaymentInterface, PayPlu
 
         return [
             'status' => $success ? PaymentPluginStatusConstant::SUCCESS : PaymentPluginStatusConstant::PENDING,
+            'pay_no' => trim((string) ($payload['outTradeNo'] ?? '')),
+            'paid_amount' => $success ? $this->integerCents($payload['totalFee'] ?? null, '盛付通回调金额') : null,
             'message' => (string) ($payload['status'] ?? ''),
-            'channel_order_no' => (string) ($payload['outTradeNo'] ?? ''),
-            'channel_trade_no' => (string) ($payload['transactionId'] ?? ''),
+            'chan_order_no' => (string) ($payload['outTradeNo'] ?? ''),
+            'chan_trade_no' => (string) ($payload['transactionId'] ?? ''),
             'channel_status' => (string) ($payload['status'] ?? ''),
         ];
     }
@@ -262,10 +274,27 @@ class ShengpayApiPayment extends BasePayment implements PaymentInterface, PayPlu
     }
 
     /**
-     * JSAPI 支付。
+     * 解析渠道以整数分表示的金额，拒绝小数及非数字内容。
+     *
+     * @param mixed $value 渠道金额原值
+     * @param string $field 用于异常提示的字段名称
+     */
+    private function integerCents(mixed $value, string $field): int
+    {
+        $text = trim((string) $value);
+        if (preg_match('/^\d+$/', $text) !== 1) {
+            throw new PaymentException($field . '格式无效', 40200);
+        }
+
+        return (int) $text;
+    }
+
+    /**
+     * 根据支付方式补充用户与应用标识并发起 JSAPI 下单。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准 JSAPI 待支付结果
      */
     private function jsapiPay(array $order): array
     {
@@ -295,10 +324,11 @@ class ShengpayApiPayment extends BasePayment implements PaymentInterface, PayPlu
     }
 
     /**
-     * 构造通用下单参数。
+     * 构造盛付通各支付产品共享的下单参数。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 上游下单请求参数
      */
     private function basePayload(array $order): array
     {
@@ -319,7 +349,7 @@ class ShengpayApiPayment extends BasePayment implements PaymentInterface, PayPlu
     }
 
     /**
-     * 下单接口路径。
+     * 根据收单接口类型选择线上或线下下单路径。
      */
     private function orderPath(): string
     {
@@ -327,16 +357,21 @@ class ShengpayApiPayment extends BasePayment implements PaymentInterface, PayPlu
     }
 
     /**
-     * 包装标准支付结果。
+     * 将上游支付凭据包装为标准待支付结果。
      *
+     * @param string $page 收银台承接页类型
+     * @param string $payType 标准支付方式代码
+     * @param string $product 已选盛付通产品代码
+     * @param string $action 支付动作标识
      * @param array<string, mixed> $payParams 承接页参数
      * @param array<string, mixed> $data 上游响应
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准待支付结果
      */
     private function payResult(string $page, string $payType, string $product, string $action, array $payParams, array $data, array $order): array
     {
-        return [
+        return $this->pendingPaymentResult($order, [
             'pay_page' => $page,
             'pay_type' => $payType,
             'pay_product' => $product,
@@ -344,11 +379,11 @@ class ShengpayApiPayment extends BasePayment implements PaymentInterface, PayPlu
             'pay_params' => $payParams,
             'chan_order_no' => (string) ($data['outTradeNo'] ?? $order['pay_no']),
             'chan_trade_no' => (string) ($data['transactionId'] ?? ''),
-        ];
+        ]);
     }
 
     /**
-     * 获取 SDK 客户端。
+     * 获取复用商户私钥与平台公钥初始化的 SDK 客户端。
      */
     private function client(): ShengpayClient
     {
@@ -364,7 +399,9 @@ class ShengpayApiPayment extends BasePayment implements PaymentInterface, PayPlu
     }
 
     /**
-     * 获取字符串配置。
+     * 读取字符串配置，缺失时返回空字符串。
+     *
+     * @param string $key 配置键
      */
     private function configText(string $key): string
     {

@@ -23,6 +23,8 @@ class CashierValidator extends Validator
         'mini_openid' => 'nullable|string|max:128',
         'buyer_id' => 'nullable|string|max:128',
         'buyer_open_id' => 'nullable|string|max:128',
+        'unionpay_user_id' => 'nullable|string|max:128',
+        'unionpay_auth_code' => 'nullable|string|max:256',
         'sub_appid' => 'nullable|string|max:64',
         'op_app_id' => 'nullable|string|max:64',
         'auth_code' => 'nullable|string|max:256',
@@ -31,6 +33,8 @@ class CashierValidator extends Validator
         'mini_code' => 'nullable|string|max:256',
         'code' => 'nullable|string|max:256',
         'state' => 'nullable|string|max:64',
+        'respCode' => 'nullable|string|max:32',
+        'userAuthCode' => 'nullable|string|max:256',
     ];
 
     protected array $attributes = [
@@ -45,6 +49,8 @@ class CashierValidator extends Validator
         'mini_openid' => '小程序OpenID',
         'buyer_id' => '支付宝用户ID',
         'buyer_open_id' => '支付宝用户OpenID',
+        'unionpay_user_id' => '云闪付用户ID',
+        'unionpay_auth_code' => '云闪付授权码',
         'sub_appid' => '子应用AppID',
         'op_app_id' => '支付宝小程序AppID',
         'auth_code' => '授权码',
@@ -53,6 +59,8 @@ class CashierValidator extends Validator
         'mini_code' => '小程序登录Code',
         'code' => '授权Code',
         'state' => '授权State',
+        'respCode' => '银联授权响应码',
+        'userAuthCode' => '银联用户授权码',
     ];
 
     protected array $scenes = [
@@ -70,6 +78,8 @@ class CashierValidator extends Validator
             'mini_openid',
             'buyer_id',
             'buyer_open_id',
+            'unionpay_user_id',
+            'unionpay_auth_code',
             'sub_appid',
             'op_app_id',
             'auth_code',
@@ -79,6 +89,8 @@ class CashierValidator extends Validator
             'code',
         ],
         'identity_wechat_callback' => ['code', 'state'],
+        'identity_alipay_callback' => ['auth_code', 'state'],
+        'identity_unionpay_callback' => ['respCode', 'userAuthCode', 'state'],
     ];
 
     /**
@@ -164,7 +176,34 @@ class CashierValidator extends Validator
     public function sceneIdentityWechatCallback(): static
     {
         return $this->appendRules([
-            'code' => 'required|string|max:256',
+            'code' => 'nullable|string|max:256',
+            'state' => 'required|string|max:64',
+        ]);
+    }
+
+    /**
+     * 支付宝生活号网页授权回调场景。
+     *
+     * @return static
+     */
+    public function sceneIdentityAlipayCallback(): static
+    {
+        return $this->appendRules([
+            'auth_code' => 'nullable|string|max:256',
+            'state' => 'required|string|max:64',
+        ]);
+    }
+
+    /**
+     * 云闪付 userAuth 回调场景。
+     *
+     * @return static
+     */
+    public function sceneIdentityUnionpayCallback(): static
+    {
+        return $this->appendRules([
+            'respCode' => 'nullable|string|max:32',
+            'userAuthCode' => 'nullable|string|max:256',
             'state' => 'required|string|max:64',
         ]);
     }

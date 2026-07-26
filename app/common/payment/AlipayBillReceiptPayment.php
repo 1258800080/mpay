@@ -13,6 +13,7 @@ use app\common\interface\PaymentInterface;
 use app\common\interface\PayPluginInterface;
 use app\common\util\FormatHelper;
 use app\exception\PaymentException;
+use app\exception\UnsupportedPaymentOperationException;
 use app\model\payment\PayOrder;
 use app\repository\payment\config\PaymentChannelRepository;
 use app\repository\payment\config\PaymentTypeRepository;
@@ -234,11 +235,11 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
             : $this->prepareAmountReceipt($payNo);
 
         if ($mode === 'alipay_transfer') {
-            return $this->payResult(
+            return $this->pendingPaymentResult($order, $this->payResult(
                 $this->alipayTransferParams($prepared),
                 $payNo,
                 (string) ($order['pay_type_code'] ?? '')
-            );
+            ));
         }
 
         $qrcode = trim((string) $this->getConfig('receipt_qrcode_content', ''));
@@ -271,7 +272,10 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
             $params['qrcode_image'] = $image;
         }
 
-        return $this->payResult($params, $payNo, (string) ($order['pay_type_code'] ?? ''));
+        return $this->pendingPaymentResult(
+            $order,
+            $this->payResult($params, $payNo, (string) ($order['pay_type_code'] ?? ''))
+        );
     }
 
     /**
@@ -286,10 +290,11 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
     public function query(array $order): array
     {
         return [
-            'success' => true,
             'status' => PaymentPluginStatusConstant::PENDING,
-            'channel_order_no' => (string) ($order['channel_order_no'] ?? $order['pay_no'] ?? ''),
-            'channel_trade_no' => (string) ($order['channel_trade_no'] ?? $order['pay_no'] ?? ''),
+            'pay_no' => (string) ($order['pay_no'] ?? ''),
+            'paid_amount' => null,
+            'chan_order_no' => (string) ($order['chan_order_no'] ?? ''),
+            'chan_trade_no' => (string) ($order['chan_trade_no'] ?? ''),
             'message' => '等待 receipt_watcher 查询支付宝账单流水',
         ];
     }
@@ -303,8 +308,11 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
     public function close(array $order): array
     {
         return [
-            'success' => true,
-            'msg' => '支付宝账单收款无需上游关单',
+            'status' => PaymentPluginStatusConstant::CLOSED,
+            'pay_no' => (string) ($order['pay_no'] ?? ''),
+            'chan_order_no' => (string) ($order['chan_order_no'] ?? ''),
+            'chan_trade_no' => (string) ($order['chan_trade_no'] ?? ''),
+            'message' => '支付宝账单收款无需上游关单',
         ];
     }
 
@@ -316,14 +324,14 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
      */
     public function refund(array $order): array
     {
-        throw new PaymentException('支付宝账单收款不支持接口退款', 40200);
+        throw new UnsupportedPaymentOperationException('支付宝账单收款不支持接口退款', 40200);
     }
 
     /**
-     * HTTP 手工通知入口。
+     * 处理 HTTP 归一化通知。
      *
-     * 该插件正式链路是 Redis 队列数组载荷。这里保留 HTTP notify() 是为了人工重放
-     * 或调试同一份归一化流水，内部直接复用 notifyPayload()，不再单独维护两套解析逻辑。
+     * 该插件的主要通知链路使用 Redis 队列数组载荷；HTTP notify() 兼容提交相同结构的
+     * 归一化流水，并复用 notifyPayload() 保持解析和验签语义一致。
      *
      * @param Request $request 请求对象
      * @return array<string, mixed>
@@ -336,7 +344,7 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
     /**
      * 根据归一化流水定位支付单。
      *
-     * ChannelNotifyPayloadInterface 的第一阶段：只确认这条流水对应哪个 pay_no。
+     * ChannelNotifyPayloadInterface 只定位流水对应的 pay_no，不推进支付状态。
      * 不在这里推进订单状态，也不写回调日志，后续由服务层再调用 notifyPayload()。
      *
      * @param array<string, mixed> $payload 通知载荷
@@ -366,24 +374,31 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
         $tradeNo = $this->channelTradeNo($record);
         $notifiedAmount = isset($record['price']) ? $this->moneyToCents((string) $record['price']) : null;
 
-        $this->restoreOriginalPayAmount($payNo, $record, $tradeNo, $notifiedAmount);
+        $paidAmount = $this->restoreOriginalPayAmount($payNo, $record, $tradeNo, $notifiedAmount);
 
         return [
             'status' => PaymentPluginStatusConstant::SUCCESS,
             'pay_no' => $payNo,
+            'paid_amount' => $paidAmount,
             'message' => 'receipt_watcher 已确认支付宝账单流水',
-            'channel_order_no' => $tradeNo,
-            'channel_trade_no' => $tradeNo,
+            'chan_order_no' => $tradeNo,
+            'chan_trade_no' => $tradeNo,
             'channel_status' => 'receipt_watcher_received',
             'paid_at' => $this->paidAtFromRecord($record),
         ];
     }
 
+    /**
+     * 返回渠道要求的成功应答。
+     */
     public function notifySuccess(): string|Response
     {
         return 'success';
     }
 
+    /**
+     * 返回渠道要求的失败应答。
+     */
     public function notifyFail(): string|Response
     {
         return 'fail';
@@ -393,7 +408,7 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
      * 组装收银台承接返回。
      *
      * pay_product/pay_action 用于前端和日志识别这是支付宝账单流水监听场景；
-     * chan_order_no 暂用系统支付单号，因为平台真实流水号要等 receipt_watcher 查询后才知道。
+     * 流水确认前没有真实渠道引用，真实支付宝流水号由 receipt_watcher 通知补齐。
      *
      * @param array<string, mixed> $params 承接参数
      * @param string $payNo 支付单号
@@ -410,7 +425,7 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
             'pay_product' => 'alipay_bill_receipt',
             'pay_action' => 'bill_watcher',
             'pay_params' => $params,
-            'chan_order_no' => $payNo,
+            'chan_order_no' => '',
             'chan_trade_no' => '',
         ];
     }
@@ -728,11 +743,11 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
      * @param array<string, mixed> $record 流水记录
      * @param string $tradeNo 第三方流水号
      * @param int|null $notifiedAmount 实际付款金额
-     * @return void
+     * @return int 原始业务金额，单位分
      */
-    private function restoreOriginalPayAmount(string $payNo, array $record, string $tradeNo, ?int $notifiedAmount): void
+    private function restoreOriginalPayAmount(string $payNo, array $record, string $tradeNo, ?int $notifiedAmount): int
     {
-        Db::transaction(function () use ($payNo, $record, $tradeNo, $notifiedAmount): void {
+        return Db::transaction(function () use ($payNo, $record, $tradeNo, $notifiedAmount): int {
             $payOrder = $this->lockedPayOrder($payNo);
             $extJson = (array) ($payOrder->ext_json ?? []);
             $receiptMeta = (array) ($extJson['personal_receipt'] ?? []);
@@ -751,6 +766,8 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
             $extJson['personal_receipt'] = $receiptMeta;
             $payOrder->ext_json = $extJson;
             $payOrder->save();
+
+            return $originalAmount > 0 ? $originalAmount : (int) $payOrder->pay_amount;
         });
     }
 
@@ -973,7 +990,7 @@ class AlipayBillReceiptPayment extends BasePayment implements PaymentInterface, 
     /**
      * 从队列消息中提取归一化流水记录。
      *
-     * receipt_watcher 队列通常传 `{record: {...}}`；HTTP 手工重放时也允许直接传流水字段。
+     * receipt_watcher 队列通常传 `{record: {...}}`；HTTP 入口也接受直接传递的流水字段。
      *
      * @param array<string, mixed> $payload 通知载荷
      * @return array<string, mixed> 流水记录

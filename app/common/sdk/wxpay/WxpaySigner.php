@@ -205,19 +205,34 @@ class WxpaySigner
      * 验证 V2 响应或通知签名。
      *
      * @param array<string, mixed> $params 响应或通知参数
-     * @param string $apiKey 商户 API 密钥
+     * @param string|array<int, string> $apiKey 商户 API 密钥或密钥轮换期候选列表
      * @return bool 是否验签通过
      */
-    public static function verifyV2(array $params, string $apiKey): bool
+    public static function verifyV2(array $params, string|array $apiKey): bool
     {
-        $sign = (string) ($params['sign'] ?? '');
+        $sign = strtoupper(trim((string) ($params['sign'] ?? '')));
         if ($sign === '') {
             return false;
         }
 
-        $signType = (string) ($params['sign_type'] ?? $params['signType'] ?? 'MD5');
+        $signType = strtoupper(trim((string) ($params['sign_type'] ?? $params['signType'] ?? '')));
+        if ($signType === '') {
+            // 通知文档规定缺省为 MD5；但 APIv2 成功响应通常不回传
+            // sign_type。官方 PHP SDK 以签名长度识别 32 位 MD5 与 64 位
+            // HMAC-SHA256，这里保持相同口径。
+            $signType = strlen($sign) === 64 ? 'HMAC-SHA256' : 'MD5';
+        }
+        $apiKeys = is_array($apiKey) ? $apiKey : [$apiKey];
+        foreach (array_values(array_unique($apiKeys)) as $candidate) {
+            if ($candidate === '') {
+                continue;
+            }
+            if (hash_equals($sign, self::signV2($params, $candidate, $signType))) {
+                return true;
+            }
+        }
 
-        return hash_equals($sign, self::signV2($params, $apiKey, $signType));
+        return false;
     }
 
     /**
@@ -233,13 +248,17 @@ class WxpaySigner
 
         $pairs = [];
         foreach ($params as $key => $value) {
-            if ($key === 'sign' || $value === null || $value === '') {
+            if ($key === 'sign' || $value === null) {
                 continue;
             }
-            if (is_array($value)) {
-                $value = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+            if (!is_scalar($value) && !$value instanceof \Stringable) {
+                throw new WxpaySdkException('微信支付 V2 签名字段必须是标量：' . $key);
             }
-            $pairs[] = $key . '=' . (string) $value;
+            $value = (string) $value;
+            if ($value === '') {
+                continue;
+            }
+            $pairs[] = $key . '=' . $value;
         }
 
         return implode('&', $pairs) . '&key=' . $apiKey;

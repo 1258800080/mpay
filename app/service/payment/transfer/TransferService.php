@@ -4,9 +4,11 @@ namespace app\service\payment\transfer;
 
 use app\common\base\BaseService;
 use app\common\constant\CommonConstant;
+use app\common\constant\PaymentRecoveryTaskConstant;
 use app\common\constant\TransferConstant;
 use app\common\interface\TransferPluginInterface;
 use app\exception\ConflictException;
+use app\exception\PaymentDefinitiveException;
 use app\exception\ResourceNotFoundException;
 use app\exception\ValidationException;
 use app\model\merchant\Merchant;
@@ -18,6 +20,7 @@ use app\repository\payment\trade\TransferOrderRepository;
 use app\service\account\funds\MerchantAccountService;
 use app\service\payment\runtime\PaymentPluginManager;
 use app\service\payment\runtime\PaymentQueueService;
+use app\service\payment\runtime\PaymentRecoveryTaskService;
 use support\Log;
 use Throwable;
 
@@ -40,6 +43,11 @@ class TransferService extends BaseService
     private const QUERY_DELAY_SECONDS = [60, 120, 300, 600, 900];
 
     /**
+     * 转账派发认领租约秒数。
+     */
+    private const DISPATCH_LEASE_SECONDS = 90;
+
+    /**
      * 构造方法。
      *
      * @param MerchantAccountRepository $merchantAccountRepository 商户账户仓库
@@ -48,6 +56,7 @@ class TransferService extends BaseService
      * @param PaymentPluginManager $paymentPluginManager 支付插件管理器
      * @param MerchantAccountService $merchantAccountService 商户账户服务
      * @param PaymentQueueService $paymentQueueService 支付队列服务
+     * @param PaymentRecoveryTaskService $recoveryTaskService 支付恢复任务服务
      * @return void
      */
     public function __construct(
@@ -56,7 +65,8 @@ class TransferService extends BaseService
         protected PaymentChannelRepository $paymentChannelRepository,
         protected PaymentPluginManager $paymentPluginManager,
         protected MerchantAccountService $merchantAccountService,
-        protected PaymentQueueService $paymentQueueService
+        protected PaymentQueueService $paymentQueueService,
+        protected PaymentRecoveryTaskService $recoveryTaskService
     ) {
     }
 
@@ -107,6 +117,7 @@ class TransferService extends BaseService
         $bizNo = $this->generateNo('TRF');
         $traceNo = $this->generateNo('TRC');
         $totalDebit = $amount + $costAmount;
+        $extJson = (array) ($input['ext_json'] ?? []);
         $created = false;
 
         /** @var TransferOrder $transferOrder */
@@ -124,6 +135,7 @@ class TransferService extends BaseService
             $traceNo,
             $channel,
             $input,
+            $extJson,
             &$created
         ): TransferOrder {
             if ($outBizNo !== '') {
@@ -179,8 +191,16 @@ class TransferService extends BaseService
                 'status' => TransferConstant::TRANSFER_STATUS_PROCESSING,
                 'request_at' => $this->now(),
                 'processing_at' => $this->now(),
-                'ext_json' => (array) ($input['ext_json'] ?? []),
+                'ext_json' => $extJson,
             ]);
+            $this->recoveryTaskService->scheduleInCurrentTransaction(
+                PaymentRecoveryTaskConstant::TYPE_TRANSFER_DISPATCH,
+                $bizNo,
+                0,
+                0,
+                10,
+                true
+            );
             $created = true;
 
             return $createdOrder;
@@ -190,9 +210,9 @@ class TransferService extends BaseService
             return $this->formatTransferOrder($this->syncTransferOrderIfNeeded($transferOrder));
         }
 
-        $this->paymentQueueService->sendTransferDispatch((string) $transferOrder->biz_no);
+        $this->enqueueTransferDispatchSafely($transferOrder);
 
-        return $this->formatTransferOrder($transferOrder);
+        return $this->formatTransferOrder($transferOrder->refresh());
     }
 
     /**
@@ -233,16 +253,36 @@ class TransferService extends BaseService
     {
         $order = $this->resolveTransferOrderByBizNo($bizNo);
         if (TransferConstant::isTerminalStatus((int) $order->status)) {
+            $this->recoveryTaskService->complete(PaymentRecoveryTaskConstant::TYPE_TRANSFER_DISPATCH, $bizNo);
             return $order;
         }
 
-        [$channel, $plugin] = $this->resolveTransferChannelAndPlugin((int) $order->merchant_id, (string) $order->type, (int) $order->channel_id);
-        unset($channel);
+        $task = $this->recoveryTaskService->claim(
+            PaymentRecoveryTaskConstant::TYPE_TRANSFER_DISPATCH,
+            $bizNo,
+            self::DISPATCH_LEASE_SECONDS
+        );
+        if (!$task) {
+            return $this->resolveTransferOrderByBizNo($bizNo);
+        }
 
-        $latest = $this->dispatchTransfer($order, $plugin);
-        $this->enqueueNextTransferQueryIfNeeded($latest, 0);
+        try {
+            [$channel, $plugin] = $this->resolveTransferChannelAndPlugin(
+                (int) $order->merchant_id,
+                (string) $order->type,
+                (int) $order->channel_id
+            );
+            unset($channel);
 
-        return $latest;
+            $latest = $this->dispatchTransfer($order, $plugin);
+            $this->scheduleInitialTransferQueryIfNeeded($latest);
+            $this->recoveryTaskService->succeed($task);
+
+            return $latest;
+        } catch (Throwable $e) {
+            $this->recoveryTaskService->retry($task, 60, $e->getMessage());
+            throw $e;
+        }
     }
 
     /**
@@ -256,13 +296,124 @@ class TransferService extends BaseService
     {
         $order = $this->resolveTransferOrderByBizNo($bizNo);
         if (TransferConstant::isTerminalStatus((int) $order->status)) {
+            $this->recoveryTaskService->complete(PaymentRecoveryTaskConstant::TYPE_TRANSFER_QUERY, $bizNo);
             return $order;
         }
 
-        $latest = $this->syncTransferOrderIfNeeded($order);
-        $this->enqueueNextTransferQueryIfNeeded($latest, $attempt);
+        $task = $this->recoveryTaskService->claim(
+            PaymentRecoveryTaskConstant::TYPE_TRANSFER_QUERY,
+            $bizNo
+        );
+        if (!$task) {
+            return $order;
+        }
 
-        return $latest;
+        try {
+            $latest = $this->syncTransferOrderIfNeeded($order);
+            if (TransferConstant::isTerminalStatus((int) $latest->status)) {
+                $this->recoveryTaskService->succeed($task);
+                return $latest;
+            }
+
+            $currentAttempt = (int) $task->retry_count + 1;
+            $delay = $this->resolveTransferQueryDelay((int) $task->retry_count);
+            $this->recoveryTaskService->retry($task, $delay, (string) $latest->channel_error_msg);
+            if ($currentAttempt < self::QUERY_MAX_ATTEMPTS) {
+                $this->enqueueTransferQuerySafely($bizNo, $currentAttempt + 1, $delay);
+            } else {
+                Log::warning(sprintf(
+                    '[TransferService] 转账自动查单达到上限 biz_no=%s attempt=%d',
+                    $bizNo,
+                    $currentAttempt
+                ));
+            }
+
+            return $latest;
+        } catch (Throwable $e) {
+            $delay = $this->resolveTransferQueryDelay((int) $task->retry_count);
+            $this->recoveryTaskService->retry($task, $delay, $e->getMessage());
+            throw $e;
+        }
+    }
+
+    /**
+     * 扫描并重新投递未可靠派发的处理中转账单。
+     *
+     * 转账单本身保存完整可重建载荷和派发状态，作为轻量本地 outbox。即使数据库提交后
+     * Redis 暂时不可用，运行时进程也能重新投递；重复消息由本地租约和稳定上游业务号共同保护。
+     *
+     * @param int $limit 单次扫描数量
+     * @param int $minAgeSeconds 至少等待秒数
+     * @return array<string, int> 恢复摘要
+     */
+    public function recoverPendingTransferDispatches(int $limit = 100, int $minAgeSeconds = 60): array
+    {
+        $summary = [
+            'scanned' => 0,
+            'dispatched' => 0,
+            'skipped' => 0,
+            'failed' => 0,
+        ];
+        foreach ($this->recoveryTaskService->listDueRefs(
+            PaymentRecoveryTaskConstant::TYPE_TRANSFER_DISPATCH,
+            max(1, $limit)
+        ) as $bizNo) {
+            $summary['scanned']++;
+            try {
+                $beforeStatus = (int) $this->resolveTransferOrderByBizNo($bizNo)->status;
+                $latest = $this->dispatchQueuedTransfer($bizNo);
+                if (!TransferConstant::isTerminalStatus($beforeStatus)
+                    && ((int) $latest->status !== $beforeStatus || (string) $latest->channel_error_code !== '')) {
+                    $summary['dispatched']++;
+                } else {
+                    $summary['skipped']++;
+                }
+            } catch (Throwable $e) {
+                Log::warning(sprintf(
+                    '[TransferService] 转账派发恢复失败 biz_no=%s error=%s',
+                    $bizNo,
+                    $e->getMessage()
+                ));
+                $summary['failed']++;
+            }
+        }
+
+        return $summary;
+    }
+
+    /**
+     * 恢复未可靠投递或消费的转账主动查单任务。
+     *
+     * @param int $limit 单次扫描数量
+     * @param int $minAgeSeconds 至少等待秒数
+     * @return array<string, int> 恢复摘要
+     */
+    public function recoverPendingTransferQueries(int $limit = 100, int $minAgeSeconds = 60): array
+    {
+        $summary = [
+            'scanned' => 0,
+            'queued' => 0,
+            'failed' => 0,
+        ];
+        foreach ($this->recoveryTaskService->listDueRefs(
+            PaymentRecoveryTaskConstant::TYPE_TRANSFER_QUERY,
+            max(1, $limit)
+        ) as $bizNo) {
+            $summary['scanned']++;
+            try {
+                $this->queryQueuedTransfer($bizNo);
+                $summary['queued']++;
+            } catch (Throwable $e) {
+                Log::warning(sprintf(
+                    '[TransferService] 转账查单恢复失败 biz_no=%s error=%s',
+                    $bizNo,
+                    $e->getMessage()
+                ));
+                $summary['failed']++;
+            }
+        }
+
+        return $summary;
     }
 
     /**
@@ -339,14 +490,22 @@ class TransferService extends BaseService
         try {
             $result = $plugin->transfer($this->buildPluginTransferPayload($order));
             return $this->applyPluginTransferResult($order, $result);
-        } catch (Throwable $e) {
+        } catch (PaymentDefinitiveException $e) {
             Log::warning(sprintf(
-                '[TransferService] 转账请求失败 biz_no=%s error=%s',
+                '[TransferService] 转账被上游明确拒绝 biz_no=%s error=%s',
                 (string) $order->biz_no,
                 $e->getMessage()
             ));
 
-            return $this->markTransferFailed($order, $e->getMessage() ?: '转账请求异常');
+            return $this->markTransferFailed($order, $e->getMessage() ?: '转账被上游明确拒绝');
+        } catch (Throwable $e) {
+            Log::warning(sprintf(
+                '[TransferService] 转账请求结果未知 biz_no=%s error=%s',
+                (string) $order->biz_no,
+                $e->getMessage()
+            ));
+
+            return $this->markTransferUncertain($order, $e->getMessage() ?: '转账请求结果未知');
         }
     }
 
@@ -379,27 +538,53 @@ class TransferService extends BaseService
     }
 
     /**
-     * 如转账仍在处理中，投递下一次延迟查单。
-     *
-     * @param TransferOrder $order 转账单
-     * @param int $attempt 当前查单次数
-     * @return void
+     * 在首次派发后创建可靠查单任务，Redis 队列只用于加速唤醒。
      */
-    private function enqueueNextTransferQueryIfNeeded(TransferOrder $order, int $attempt): void
+    private function scheduleInitialTransferQueryIfNeeded(TransferOrder $order): void
     {
         if (TransferConstant::isTerminalStatus((int) $order->status)) {
+            $this->recoveryTaskService->complete(
+                PaymentRecoveryTaskConstant::TYPE_TRANSFER_QUERY,
+                (string) $order->biz_no
+            );
             return;
         }
 
-        if ($attempt >= self::QUERY_MAX_ATTEMPTS) {
-            $this->markTransferQueryMaxReached($order, $attempt);
-            return;
+        $delay = $this->resolveTransferQueryDelay(0);
+        $this->recoveryTaskService->schedule(
+            PaymentRecoveryTaskConstant::TYPE_TRANSFER_QUERY,
+            (string) $order->biz_no,
+            $delay,
+            self::QUERY_MAX_ATTEMPTS,
+            0,
+            true
+        );
+        $this->enqueueTransferQuerySafely((string) $order->biz_no, 1, $delay);
+    }
+
+    /**
+     * 最佳努力投递转账查单消息；投递失败时数据库任务仍会到期执行。
+     */
+    private function enqueueTransferQuerySafely(string $bizNo, int $attempt, int $delay): bool
+    {
+        try {
+            $success = $this->paymentQueueService->sendTransferQuery($bizNo, $attempt, max(0, $delay));
+            if ($success) {
+                return true;
+            }
+            $error = 'Redis 队列返回投递失败';
+        } catch (Throwable $e) {
+            $error = $e->getMessage() ?: 'Redis 队列投递异常';
         }
 
-        $nextAttempt = $attempt + 1;
-        $delay = $this->resolveTransferQueryDelay($attempt);
-        $this->paymentQueueService->sendTransferQuery((string) $order->biz_no, $nextAttempt, $delay);
-        $this->recordTransferQuerySchedule($order, $nextAttempt, $delay, false);
+        Log::warning(sprintf(
+            '[TransferService] 转账查单消息投递失败 biz_no=%s attempt=%d error=%s',
+            $bizNo,
+            $attempt,
+            $error
+        ));
+
+        return false;
     }
 
     /**
@@ -433,6 +618,7 @@ class TransferService extends BaseService
                     'plugin_result' => $this->buildPluginResultSnapshot($result),
                 ]);
                 $latest->save();
+                $this->completeTransferRecoveryTasksInCurrentTransaction((string) $latest->biz_no);
 
                 return $latest->refresh();
             });
@@ -495,67 +681,86 @@ class TransferService extends BaseService
                 'plugin_result' => $this->buildPluginResultSnapshot($result),
             ]);
             $latest->save();
+            $this->completeTransferRecoveryTasksInCurrentTransaction((string) $latest->biz_no);
 
             return $latest->refresh();
         });
     }
 
     /**
-     * 记录转账查单已达到自动查询上限。
+     * 记录转账请求结果未知，保留处理中状态和已扣资金等待主动查单。
+     *
+     * 网络超时、响应解析失败和验签失败都不能证明上游未受理，因此这里绝不释放
+     * 转账本金与手续费。只有明确失败结果或 PaymentDefinitiveException 才能进入失败终态。
      *
      * @param TransferOrder $order 转账单
-     * @param int $attempt 当前查单次数
-     * @return void
+     * @param string $message 不确定原因
+     * @return TransferOrder 最新转账单
      */
-    private function markTransferQueryMaxReached(TransferOrder $order, int $attempt): void
+    private function markTransferUncertain(TransferOrder $order, string $message): TransferOrder
     {
-        $this->recordTransferQuerySchedule($order, $attempt, 0, true);
-        Log::warning(sprintf(
-            '[TransferService] 转账自动查单达到上限 biz_no=%s attempt=%s',
-            (string) $order->biz_no,
-            $attempt
-        ));
+        return $this->transactionRetry(function () use ($order, $message): TransferOrder {
+            $latest = $this->transferOrderRepository->findForUpdateByBizNo((string) $order->biz_no);
+            if (!$latest || TransferConstant::isTerminalStatus((int) $latest->status)) {
+                return $latest ?: $order;
+            }
+
+            $summary = mb_strcut($message, 0, 255, 'UTF-8');
+            $latest->status = TransferConstant::TRANSFER_STATUS_PROCESSING;
+            $latest->channel_error_code = 'TRANSFER_RESULT_UNCERTAIN';
+            $latest->channel_error_msg = $summary;
+            $latest->save();
+
+            return $latest->refresh();
+        });
     }
 
     /**
-     * 记录自动查单调度快照。
+     * 在转账终态事务内同时收口派发和查单任务。
+     */
+    private function completeTransferRecoveryTasksInCurrentTransaction(string $bizNo): void
+    {
+        foreach ([
+            PaymentRecoveryTaskConstant::TYPE_TRANSFER_DISPATCH,
+            PaymentRecoveryTaskConstant::TYPE_TRANSFER_QUERY,
+        ] as $taskType) {
+            $this->recoveryTaskService->completeInCurrentTransaction($taskType, $bizNo);
+        }
+    }
+
+    /**
+     * 安全投递转账派发消息。
+     *
+     * 数据库已经提交后，Redis 投递失败不能再向调用方抛出为“下单失败”；失败快照
+     * 会由运行时维护进程继续扫描恢复。
      *
      * @param TransferOrder $order 转账单
-     * @param int $attempt 下一次或当前查单次数
      * @param int $delay 延迟秒数
-     * @param bool $maxReached 是否达到上限
-     * @return void
+     * @return bool 是否投递成功
      */
-    private function recordTransferQuerySchedule(TransferOrder $order, int $attempt, int $delay, bool $maxReached): void
+    private function enqueueTransferDispatchSafely(TransferOrder $order, int $delay = 0): bool
     {
+        $success = false;
+        $error = '';
+
         try {
-            $this->transactionRetry(function () use ($order, $attempt, $delay, $maxReached): void {
-                $latest = $this->transferOrderRepository->findForUpdateByBizNo((string) $order->biz_no);
-                if (!$latest || TransferConstant::isTerminalStatus((int) $latest->status)) {
-                    return;
-                }
-
-                $runtime = (array) (((array) ($latest->ext_json ?? []))['runtime'] ?? []);
-                $runtime['transfer_query'] = [
-                    'attempt' => $attempt,
-                    'max_attempts' => self::QUERY_MAX_ATTEMPTS,
-                    'last_scheduled_at' => $this->now(),
-                    'next_delay_seconds' => $delay,
-                    'max_reached' => $maxReached,
-                ];
-
-                $extJson = (array) ($latest->ext_json ?? []);
-                $extJson['runtime'] = $runtime;
-                $latest->ext_json = $extJson;
-                $latest->save();
-            });
+            $success = $this->paymentQueueService->sendTransferDispatch((string) $order->biz_no, max(0, $delay));
+            if (!$success) {
+                $error = 'Redis 队列返回投递失败';
+            }
         } catch (Throwable $e) {
+            $error = $e->getMessage() ?: 'Redis 队列投递异常';
+        }
+
+        if (!$success) {
             Log::warning(sprintf(
-                '[TransferService] 记录转账查单调度失败 biz_no=%s error=%s',
+                '[TransferService] 转账派发消息投递失败 biz_no=%s error=%s',
                 (string) $order->biz_no,
-                $e->getMessage()
+                $error
             ));
         }
+
+        return $success;
     }
 
     /**
@@ -655,10 +860,6 @@ class TransferService extends BaseService
         }
 
         if (in_array($statusText, ['failed', 'fail', 'closed', 'error'], true)) {
-            return TransferConstant::TRANSFER_STATUS_FAILED;
-        }
-
-        if (array_key_exists('success', $result) && (bool) $result['success'] === false) {
             return TransferConstant::TRANSFER_STATUS_FAILED;
         }
 

@@ -65,7 +65,7 @@ class AuthController extends BaseController
         $token = preg_replace('/^Bearer\s+/i', '', $token) ?: $token;
 
         if ($token === '') {
-            return $this->fail('未获取到登录令牌', 401);
+            return $this->success(true);
         }
 
         $this->adminAuthService->revokeToken($token);
@@ -83,7 +83,7 @@ class AuthController extends BaseController
     {
         $adminId = $this->currentAdminId($request);
         if ($adminId <= 0) {
-            return $this->fail('未获取到当前管理员信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         return $this->success($this->adminUserService->profile(
@@ -102,7 +102,7 @@ class AuthController extends BaseController
     {
         $adminId = $this->currentAdminId($request);
         if ($adminId <= 0) {
-            return $this->fail('未获取到当前管理员信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         $data = $this->validated($request->all(), AuthValidator::class, 'changePassword');

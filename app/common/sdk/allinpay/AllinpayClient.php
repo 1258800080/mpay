@@ -8,31 +8,28 @@ use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
 
 /**
- * 通联支付轻量客户端。
+ * 通联收银宝轻量客户端。
  *
- * 迁移自彩虹 `PayService`：公共参数、RSA 签名、表单请求和回调验签。
+ * 协议事实源：通联收银宝公用接口规范。请求与成功响应都使用
+ * RSA(SHA1WithRSA)，对 sign 之外的全部非空字段按字段名 ASCII 升序拼接。
  */
 class AllinpayClient
 {
-    private const SIGN_TYPE = 'RSA';
-    private const VERSION = '11';
+    public const SIGN_TYPE = 'RSA';
+    public const VERSION = '11';
+    public const CASHIER_VERSION = '12';
 
     /**
-     * SDK 配置。
-     *
      * @var array<string, mixed>
      */
     private array $config;
 
-    /**
-     * HTTP 客户端。
-     */
     private Client $httpClient;
 
     /**
      * 构造方法。
      *
-     * @param array<string, mixed> $config SDK 配置
+     * @param array<string, mixed> $config
      */
     public function __construct(array $config)
     {
@@ -46,15 +43,14 @@ class AllinpayClient
     }
 
     /**
-     * 发起表单接口请求。
+     * 发起 application/x-www-form-urlencoded 请求并严格验证成功响应。
      *
-     * @param string $url 接口地址
      * @param array<string, mixed> $params 业务参数
      * @return array<string, mixed>
      */
-    public function submit(string $url, array $params): array
+    public function submit(string $url, array $params, string $version = self::VERSION): array
     {
-        $payload = $this->signedPayload($params, self::VERSION);
+        $payload = $this->buildSignedPayload($params, $version);
 
         try {
             $response = $this->httpClient->post($url, [
@@ -68,78 +64,121 @@ class AllinpayClient
             throw new AllinpaySdkException('通联网关请求失败：' . $e->getMessage(), 0, $e);
         }
 
+        if ($response->getStatusCode() < 200 || $response->getStatusCode() >= 300) {
+            throw new AllinpaySdkException('通联网关 HTTP 状态异常：' . $response->getStatusCode());
+        }
+
         $data = json_decode((string) $response->getBody(), true);
         if (!is_array($data)) {
             throw new AllinpaySdkException('通联响应不是合法 JSON');
         }
-        if ((string) ($data['retcode'] ?? '') !== 'SUCCESS') {
-            throw new AllinpaySdkException((string) ($data['retmsg'] ?? '通联请求失败'));
+        $retcode = $data['retcode'] ?? null;
+        if (!is_scalar($retcode) || (string) $retcode !== 'SUCCESS') {
+            $message = $data['retmsg'] ?? '通联请求失败';
+            throw new AllinpaySdkException(is_scalar($message) ? (string) $message : '通联请求失败');
         }
+        if (!$this->verify($data)) {
+            throw new AllinpaySdkException('通联响应验签失败');
+        }
+
+        $this->assertResponseIdentity($data);
 
         return $data;
     }
 
     /**
-     * 构造通联收银台签名参数。
+     * 构造 H5 收银台 version=12 的 POST 参数。
      *
      * @param array<string, mixed> $params 业务参数
      * @return array<string, mixed>
      */
     public function cashierPayload(array $params): array
     {
-        return $this->signedPayload($params, '12');
+        return $this->buildSignedPayload($params, self::CASHIER_VERSION);
     }
 
     /**
-     * 验证通联回调签名。
-     *
-     * @param array<string, mixed> $payload 回调参数
-     */
-    public function verify(array $payload): bool
-    {
-        $sign = (string) ($payload['sign'] ?? '');
-        if ($sign === '') {
-            return false;
-        }
-
-        return $this->verifyContent($this->signContent($payload), $sign);
-    }
-
-    /**
-     * 构造带签名的请求参数。
+     * 构造公共字段齐全的签名请求。
      *
      * @param array<string, mixed> $params 业务参数
      * @return array<string, mixed>
      */
-    private function signedPayload(array $params, string $version): array
+    public function buildSignedPayload(array $params, string $version = self::VERSION): array
     {
-        $payload = array_merge([
+        $payload = array_merge($params, [
             'appid' => $this->configText('app_id'),
             'cusid' => $this->configText('merchant_no'),
             'version' => $version,
             'randomstr' => bin2hex(random_bytes(8)),
             'signtype' => self::SIGN_TYPE,
-        ], $params);
-        $payload['sign'] = $this->sign($this->signContent($payload));
+        ]);
+        $payload['sign'] = $this->sign($this->signingContent($payload));
 
         return $payload;
     }
 
     /**
-     * 构造待签名字符串。
+     * 验证通联接口响应或回调签名。
      *
-     * @param array<string, mixed> $payload 参数
+     * @param array<string, mixed> $payload 完整响应或通知参数
      */
-    private function signContent(array $payload): string
+    public function verify(array $payload): bool
     {
-        ksort($payload);
+        $signValue = $payload['sign'] ?? null;
+        if (!is_scalar($signValue)) {
+            return false;
+        }
+        $sign = trim((string) $signValue);
+        if ($sign === '') {
+            return false;
+        }
+
+        $signTypeValue = $payload['signtype'] ?? self::SIGN_TYPE;
+        if (!is_scalar($signTypeValue)) {
+            return false;
+        }
+        $signType = strtoupper(trim((string) $signTypeValue));
+        if ($signType !== self::SIGN_TYPE) {
+            return false;
+        }
+
+        $signature = base64_decode($sign, true);
+        if ($signature === false) {
+            return false;
+        }
+
+        $publicKey = openssl_pkey_get_public($this->pemKey($this->configText('platform_public_key'), 'public'));
+        if ($publicKey === false) {
+            throw new AllinpaySdkException('通联平台公钥不正确');
+        }
+
+        return openssl_verify(
+            $this->signingContent($payload),
+            $signature,
+            $publicKey,
+            OPENSSL_ALGO_SHA1
+        ) === 1;
+    }
+
+    /**
+     * 生成通联 RSA 待签名原文，供固定向量测试与问题定位使用。
+     *
+     * @param array<string, mixed> $payload 请求、响应或回调参数
+     */
+    public function signingContent(array $payload): string
+    {
+        unset($payload['sign']);
+        ksort($payload, SORT_STRING);
 
         $pieces = [];
         foreach ($payload as $key => $value) {
-            if ($key === 'sign' || $value === '' || $value === null) {
+            if ($value === '' || $value === null) {
                 continue;
             }
-            $pieces[] = $key . '=' . (string) $value;
+            if (!is_scalar($value) && !$value instanceof \Stringable) {
+                throw new AllinpaySdkException('通联签名字段必须是标量：' . (string) $key);
+            }
+            $pieces[] = (string) $key . '=' . (string) $value;
         }
 
         return implode('&', $pieces);
@@ -164,20 +203,24 @@ class AllinpayClient
     }
 
     /**
-     * 平台公钥验签。
+     * 校验渠道响应身份。
+     *
+     * @param array<string, mixed> $data
      */
-    private function verifyContent(string $content, string $sign): bool
+    private function assertResponseIdentity(array $data): void
     {
-        $publicKey = openssl_pkey_get_public($this->pemKey($this->configText('platform_public_key'), 'public'));
-        if ($publicKey === false) {
-            throw new AllinpaySdkException('通联平台公钥不正确');
+        $cusid = $data['cusid'] ?? null;
+        if (!is_scalar($cusid) || trim((string) $cusid) !== $this->configText('merchant_no')) {
+            throw new AllinpaySdkException('通联响应商户号不匹配');
         }
-
-        return openssl_verify($content, base64_decode($sign), $publicKey, OPENSSL_ALGO_SHA1) === 1;
+        $appid = $data['appid'] ?? null;
+        if (!is_scalar($appid) || trim((string) $appid) !== $this->configText('app_id')) {
+            throw new AllinpaySdkException('通联响应应用ID不匹配');
+        }
     }
 
     /**
-     * 规范化 PEM 密钥。
+     * 规范化未携带 PEM 头的密钥配置。
      */
     private function pemKey(string $key, string $type): string
     {
@@ -192,9 +235,6 @@ class AllinpayClient
             . "\n-----END {$header}-----";
     }
 
-    /**
-     * 获取字符串配置。
-     */
     private function configText(string $key): string
     {
         return trim((string) ($this->config[$key] ?? ''));

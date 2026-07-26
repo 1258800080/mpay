@@ -13,10 +13,14 @@ use app\common\interface\PaymentInterface;
 use app\common\interface\PayPluginInterface;
 use app\common\util\FormatHelper;
 use app\exception\PaymentException;
+use app\exception\PaymentUncertainException;
 use app\service\payment\epay\EpaySignerManager;
 use support\Request;
 use support\Response;
 
+/**
+ * ePay V2 命令测试支付桩。
+ */
 class EpayV2CommandMockPayment extends BasePayment implements PaymentInterface, PayPluginInterface
 {
     protected array $paymentInfo = [
@@ -35,7 +39,7 @@ class EpayV2CommandMockPayment extends BasePayment implements PaymentInterface, 
         $payNo = (string) $order['pay_no'];
         $payUrl = rtrim((string) $this->getConfig('mock_jump_base_url', 'https://mock.epay.test/v2/pay'), '/') . '/' . rawurlencode($payNo);
 
-        return [
+        return $this->pendingPaymentResult($order, [
             'pay_page' => 'jump',
             'pay_type' => (string) $order['pay_type_code'],
             'pay_product' => (string) ($order['extra']['payment']['method'] ?? 'web'),
@@ -50,44 +54,43 @@ class EpayV2CommandMockPayment extends BasePayment implements PaymentInterface, 
             ],
             'chan_order_no' => $payNo,
             'chan_trade_no' => $payNo,
-        ];
+        ]);
     }
 
     public function query(array $order): array
     {
         return [
-            'success' => true,
             'status' => PaymentPluginStatusConstant::SUCCESS,
-            'channel_order_no' => (string) ($order['chan_order_no'] ?? $order['pay_no'] ?? ''),
-            'channel_trade_no' => (string) ($order['chan_trade_no'] ?? $order['chan_order_no'] ?? $order['pay_no'] ?? ''),
+            'pay_no' => (string) $order['pay_no'],
+            'paid_amount' => (int) $order['amount'],
+            'chan_order_no' => (string) ($order['chan_order_no'] ?? $order['pay_no'] ?? ''),
+            'chan_trade_no' => (string) ($order['chan_trade_no'] ?? $order['chan_order_no'] ?? $order['pay_no'] ?? ''),
             'channel_status' => '1',
             'message' => 'mock success',
             'paid_at' => FormatHelper::dateTime(time()),
-            'raw_data' => ['code' => 0, 'msg' => 'mock success'],
         ];
     }
 
     public function close(array $order): array
     {
         return [
-            'success' => true,
-            'msg' => 'mock closed',
-            'raw_data' => ['code' => 0, 'msg' => 'mock closed'],
+            'status' => PaymentPluginStatusConstant::CLOSED,
+            'pay_no' => (string) $order['pay_no'],
+            'chan_order_no' => (string) ($order['chan_order_no'] ?? ''),
+            'chan_trade_no' => (string) ($order['chan_trade_no'] ?? ''),
+            'message' => 'mock closed',
         ];
     }
 
     public function refund(array $order): array
     {
         return [
-            'success' => true,
-            'msg' => '退款成功',
+            'status' => PaymentPluginStatusConstant::SUCCESS,
+            'refund_no' => (string) $order['refund_no'],
+            'pay_no' => (string) $order['pay_no'],
+            'refund_amount' => (int) $order['refund_amount'],
             'chan_refund_no' => (string) ($order['refund_no'] ?? ''),
-            'raw_data' => [
-                'code' => 0,
-                'msg' => '退款成功',
-                'refund_no' => (string) ($order['refund_no'] ?? ''),
-                'trade_no' => (string) ($order['pay_no'] ?? ''),
-            ],
+            'message' => '退款成功',
         ];
     }
 
@@ -107,9 +110,13 @@ class EpayV2CommandMockPayment extends BasePayment implements PaymentInterface, 
             'status' => $tradeStatus === NotifyConstant::EPAY_TRADE_STATUS_SUCCESS
                 ? PaymentPluginStatusConstant::SUCCESS
                 : PaymentPluginStatusConstant::PENDING,
+            'pay_no' => trim((string) ($payload['out_trade_no'] ?? '')),
+            'paid_amount' => $tradeStatus === NotifyConstant::EPAY_TRADE_STATUS_SUCCESS
+                ? $this->yuanToCents($payload['money'] ?? null)
+                : null,
             'message' => $tradeStatus,
-            'channel_order_no' => (string) ($payload['trade_no'] ?? ''),
-            'channel_trade_no' => (string) ($payload['trade_no'] ?? ''),
+            'chan_order_no' => (string) ($payload['trade_no'] ?? ''),
+            'chan_trade_no' => (string) ($payload['trade_no'] ?? ''),
             'channel_status' => $tradeStatus,
             'paid_at' => FormatHelper::dateTime(time()),
         ];
@@ -123,5 +130,18 @@ class EpayV2CommandMockPayment extends BasePayment implements PaymentInterface, 
     public function notifyFail(): string|Response
     {
         return 'fail';
+    }
+
+    /**
+     * 将两位小数元金额转换为整数分。
+     */
+    private function yuanToCents(mixed $value): int
+    {
+        $text = trim((string) $value);
+        if (preg_match('/^(0|[1-9]\d*)(?:\.(\d{1,2}))?$/', $text, $matches) !== 1) {
+            throw new PaymentUncertainException('上游 V2 回调金额格式无效', 40200);
+        }
+
+        return ((int) $matches[1] * 100) + (int) str_pad((string) ($matches[2] ?? ''), 2, '0');
     }
 }

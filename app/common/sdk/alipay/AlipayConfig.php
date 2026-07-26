@@ -31,6 +31,9 @@ class AlipayConfig
      */
     private array $config;
 
+    /** @var array<string, string> */
+    private array $certificateCache = [];
+
     /**
      * 构造方法。
      *
@@ -43,7 +46,6 @@ class AlipayConfig
      * - alipay_cert_path：证书模式下的支付宝公钥证书路径。
      * - alipay_root_cert_path：证书模式下的支付宝根证书路径。
      * - sandbox：是否使用沙箱网关。
-     * - gateway：自定义网关；传入后优先级高于 sandbox。
      * - app_auth_token：服务商代调用时的授权 token。
      *
      * @param array<string, mixed> $config 配置数组
@@ -92,11 +94,6 @@ class AlipayConfig
      */
     public function gateway(): string
     {
-        $gateway = $this->string('gateway', '');
-        if ($gateway !== '') {
-            return $gateway;
-        }
-
         return $this->bool('sandbox') ? self::GATEWAY_SANDBOX : self::GATEWAY_PRODUCTION;
     }
 
@@ -157,7 +154,7 @@ class AlipayConfig
      */
     public function format(): string
     {
-        return strtoupper($this->string('format', 'JSON'));
+        return 'JSON';
     }
 
     /**
@@ -167,7 +164,7 @@ class AlipayConfig
      */
     public function charset(): string
     {
-        return $this->string('charset', 'UTF-8');
+        return 'UTF-8';
     }
 
     /**
@@ -179,7 +176,7 @@ class AlipayConfig
      */
     public function signType(): string
     {
-        return strtoupper($this->string('sign_type', 'RSA2'));
+        return 'RSA2';
     }
 
     /**
@@ -189,7 +186,7 @@ class AlipayConfig
      */
     public function version(): string
     {
-        return $this->string('version', '1.0');
+        return '1.0';
     }
 
     /**
@@ -220,28 +217,6 @@ class AlipayConfig
     public function connectTimeout(): int
     {
         return max(1, $this->int('connect_timeout', 5));
-    }
-
-    /**
-     * 是否验签支付宝网关同步响应。
-     *
-     * @return bool 是否验签
-     */
-    public function verifyResponse(): bool
-    {
-        return $this->bool('verify_response', true);
-    }
-
-    /**
-     * 支付宝响应缺少 sign 时是否直接失败。
-     *
-     * 默认不强制，避免个别错误响应没有签名时影响错误信息读取。
-     *
-     * @return bool 是否强制响应签名
-     */
-    public function strictResponseSign(): bool
-    {
-        return $this->bool('strict_response_sign', false);
     }
 
     /**
@@ -287,18 +262,33 @@ class AlipayConfig
         if (!in_array($this->mode(), [self::MODE_KEY, self::MODE_CERT], true)) {
             throw new AlipaySdkException('支付宝加签模式必须是 key 或 cert');
         }
-        if ($this->signType() !== 'RSA2') {
-            throw new AlipaySdkException('当前支付宝 SDK 仅支持 RSA2 签名');
-        }
+        AlipaySigner::validatePrivateKey($this->privateKey());
+
+        $certPaths = array_filter([
+            $this->string('app_cert_path'),
+            $this->string('alipay_cert_path'),
+            $this->string('alipay_root_cert_path'),
+        ], static fn (string $value): bool => $value !== '');
         if ($this->isCertMode()) {
+            if ($this->alipayPublicKey() !== '') {
+                throw new AlipaySdkException('支付宝证书模式不能同时配置 alipay_public_key', 'configuration');
+            }
             if ($this->appCertContent() === '' || $this->alipayCertContent() === '' || $this->alipayRootCertContent() === '') {
                 throw new AlipaySdkException('支付宝证书模式必须配置应用公钥证书、支付宝公钥证书和支付宝根证书');
             }
+            AlipayCertificate::assertPrivateKeyMatchesCertificate($this->privateKey(), $this->appCertContent());
+            AlipayCertificate::assertTrustedByRoot($this->alipayCertContent(), $this->alipayRootCertContent());
+            AlipayCertificate::appCertSn($this->appCertContent());
+            AlipayCertificate::alipayRootCertSn($this->alipayRootCertContent());
             return;
+        }
+        if ($certPaths !== []) {
+            throw new AlipaySdkException('支付宝密钥模式不能同时配置证书文件', 'configuration');
         }
         if ($this->alipayPublicKey() === '') {
             throw new AlipaySdkException('支付宝密钥模式必须配置 alipay_public_key');
         }
+        AlipaySigner::validatePublicKey($this->alipayPublicKey());
     }
 
     /**
@@ -333,12 +323,16 @@ class AlipayConfig
      */
     private function certificateContent(string $key): string
     {
-        $path = $this->string($key);
-        if ($path !== '') {
-            return $this->readConfiguredFile($path);
+        if (array_key_exists($key, $this->certificateCache)) {
+            return $this->certificateCache[$key];
         }
 
-        return '';
+        $path = $this->string($key);
+        if ($path !== '') {
+            return $this->certificateCache[$key] = $this->readConfiguredFile($path);
+        }
+
+        return $this->certificateCache[$key] = '';
     }
 
     /**
@@ -351,7 +345,7 @@ class AlipayConfig
     {
         $resolvedPath = $this->resolveReadablePath($path);
         if ($resolvedPath === '') {
-            throw new AlipaySdkException(sprintf('支付宝文件不可读：%s', $path));
+            throw new AlipaySdkException('支付宝证书文件不存在或不可读', 'configuration');
         }
 
         return $this->readFile($resolvedPath);
@@ -367,7 +361,7 @@ class AlipayConfig
     {
         $content = file_get_contents($path);
         if ($content === false) {
-            throw new AlipaySdkException(sprintf('读取支付宝文件失败：%s', $path));
+            throw new AlipaySdkException('读取支付宝证书文件失败', 'configuration');
         }
 
         return trim($content);

@@ -125,16 +125,19 @@ class NotifyService extends BaseService
 
         $callbackType = (int) ($input['callback_type'] ?? NotifyConstant::CALLBACK_TYPE_ASYNC);
         $requestData = $input['request_data'] ?? [];
+        // 去重摘要必须基于原始载荷；落库内容随后脱敏，避免 req XML、签名、
+        // 付款码或用户身份以一个不透明字符串绕过字段级日志保护。
+        $requestHash = $this->payloadHash($requestData);
 
         return $this->payCallbackLogRepository->create([
             'pay_no' => $payNo,
             'channel_id' => (int) ($input['channel_id'] ?? 0),
             'callback_type' => $callbackType,
-            'request_data' => $requestData,
-            'request_hash' => $this->payloadHash($requestData),
+            'request_data' => $this->maskSensitiveData($requestData),
+            'request_hash' => $requestHash,
             'verify_status' => (int) ($input['verify_status'] ?? NotifyConstant::VERIFY_STATUS_UNKNOWN),
             'process_status' => (int) ($input['process_status'] ?? NotifyConstant::PROCESS_STATUS_PENDING),
-            'process_result' => $input['process_result'] ?? [],
+            'process_result' => $this->maskSensitiveData($input['process_result'] ?? []),
             'created_at' => $input['created_at'] ?? $this->now(),
         ]);
     }

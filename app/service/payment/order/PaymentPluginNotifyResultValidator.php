@@ -1,27 +1,23 @@
 <?php
 
+declare(strict_types=1);
+
 namespace app\service\payment\order;
 
 use support\validation\Validator;
 
 /**
- * 插件回调返回值验证器。
- *
- * 只声明插件 notify() 返回结构的字段规则，具体状态推进由回调服务完成。
+ * 插件支付通知结果验证器。
  */
 class PaymentPluginNotifyResultValidator extends Validator
 {
-    /**
-     * 校验规则
-     *
-     * @var array<string, string>
-     */
     protected array $rules = [
         'status' => 'required|string|in:success,failed,pending',
-        'pay_no' => 'nullable|string|max:64',
+        'pay_no' => 'required|string|max:64',
+        'paid_amount' => 'required_if:status,success|nullable|integer|min:0',
         'message' => 'nullable|string',
-        'channel_order_no' => 'required|string|max:64',
-        'channel_trade_no' => 'required|string|max:64',
+        'chan_order_no' => 'nullable|string|max:64',
+        'chan_trade_no' => 'nullable|string|max:64',
         'channel_status' => 'nullable|string|max:128',
         'channel_error_code' => 'nullable|string|max:64',
         'channel_error_msg' => 'nullable|string',
@@ -29,48 +25,28 @@ class PaymentPluginNotifyResultValidator extends Validator
         'failed_at' => 'nullable',
     ];
 
-    /**
-     * 字段别名
-     *
-     * @var array<string, string>
-     */
     protected array $attributes = [
         'status' => '支付状态',
         'pay_no' => '支付单号',
-        'message' => '回调说明',
-        'channel_order_no' => '渠道订单号',
-        'channel_trade_no' => '渠道交易号',
+        'paid_amount' => '实付金额',
+        'message' => '通知说明',
+        'chan_order_no' => '渠道订单号',
+        'chan_trade_no' => '渠道交易号',
         'channel_status' => '渠道状态',
         'channel_error_code' => '渠道错误码',
-        'channel_error_msg' => '渠道错误消息',
+        'channel_error_msg' => '渠道错误信息',
         'paid_at' => '支付成功时间',
         'failed_at' => '支付失败时间',
     ];
 
-    /**
-     * 自定义错误消息
-     *
-     * @var array<string, string>
-     */
-    protected array $messages = [
-        'status.required' => '插件回调返回 status 不能为空',
-        'status.in' => '插件回调返回的状态不合法',
-        'channel_order_no.required' => '插件回调返回 channel_order_no 不能为空',
-        'channel_trade_no.required' => '插件回调返回 channel_trade_no 不能为空',
-    ];
-
-    /**
-     * 校验场景
-     *
-     * @var array<string, array<int, string>>
-     */
     protected array $scenes = [
         'notify_result' => [
             'status',
             'pay_no',
+            'paid_amount',
             'message',
-            'channel_order_no',
-            'channel_trade_no',
+            'chan_order_no',
+            'chan_trade_no',
             'channel_status',
             'channel_error_code',
             'channel_error_msg',

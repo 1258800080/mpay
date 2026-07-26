@@ -21,7 +21,7 @@ class FormatHelper
      */
     public static function amount(int $amount): string
     {
-        return number_format($amount / 100, 2, '.', '');
+        return bcdiv((string) $amount, '100', 2);
     }
 
     /**
@@ -186,6 +186,10 @@ class FormatHelper
         $masked = [];
         foreach ($value as $key => $item) {
             $keyText = strtolower((string) $key);
+            if (in_array($keyText, ['req', 'response'], true)) {
+                $masked[$key] = self::maskStructuredPayload($item);
+                continue;
+            }
             if (self::isSensitiveKey($keyText)) {
                 $masked[$key] = is_scalar($item) ? self::maskCredentialValue((string) $item) : '****';
                 continue;
@@ -195,6 +199,87 @@ class FormatHelper
         }
 
         return $masked;
+    }
+
+    /**
+     * 解析常见渠道报文后按字段脱敏；无法解析的密文只保留摘要。
+     *
+     * @param mixed $payload 原始渠道报文
+     * @return mixed 脱敏后的结构或摘要
+     */
+    private static function maskStructuredPayload(mixed $payload): mixed
+    {
+        if (is_array($payload)) {
+            return self::maskSensitiveData($payload);
+        }
+        if (!is_scalar($payload)) {
+            return ['opaque' => true, 'length' => 0];
+        }
+
+        $original = trim((string) $payload);
+        if ($original === '') {
+            return '';
+        }
+
+        $decoded = $original;
+        for ($index = 0; $index < 2; $index++) {
+            $next = rawurldecode($decoded);
+            if ($next === $decoded) {
+                break;
+            }
+            $decoded = $next;
+        }
+
+        $json = json_decode($decoded, true);
+        if (is_array($json)) {
+            return ['format' => 'json', 'data' => self::maskSensitiveData($json)];
+        }
+
+        $xml = self::decodeXmlPayload($decoded);
+        if ($xml !== null) {
+            return ['format' => 'xml', 'data' => self::maskSensitiveData($xml)];
+        }
+
+        if (str_contains($decoded, '=') && str_contains($decoded, '&')) {
+            parse_str($decoded, $form);
+            if (is_array($form) && $form !== []) {
+                return ['format' => 'form', 'data' => self::maskSensitiveData($form)];
+            }
+        }
+
+        return [
+            'opaque' => true,
+            'length' => strlen($original),
+            'sha256' => hash('sha256', $original),
+        ];
+    }
+
+    /**
+     * 尝试把 XML 文本解析为可递归脱敏的数组。
+     *
+     * @param string $payload XML 文本
+     * @return array<string, mixed>|null
+     */
+    private static function decodeXmlPayload(string $payload): ?array
+    {
+        if (!str_starts_with(ltrim($payload), '<')) {
+            return null;
+        }
+
+        $previous = libxml_use_internal_errors(true);
+        try {
+            $xml = simplexml_load_string($payload, \SimpleXMLElement::class, LIBXML_NONET | LIBXML_NOCDATA);
+            if ($xml === false) {
+                return null;
+            }
+            $json = json_encode($xml, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+            $data = is_string($json) ? json_decode($json, true) : null;
+
+            return is_array($data) && $data !== [] && !array_is_list($data) ? $data : null;
+        } finally {
+            libxml_clear_errors();
+            libxml_use_internal_errors($previous);
+        }
     }
 
     /**
@@ -271,6 +356,30 @@ class FormatHelper
     {
         if ($key === '') {
             return false;
+        }
+
+        if (in_array($key, [
+            'sign',
+            'signature',
+            'authorization',
+            'auth_code',
+            'alipay_auth_code',
+            'wx_login_code',
+            'mini_code',
+            'session_key',
+            'unionpay_auth_code',
+            'userauthcode',
+            'openid',
+            'wx_openid',
+            'sub_openid',
+            'mini_openid',
+            'unionid',
+            'buyer_id',
+            'buyer_open_id',
+            'user_id',
+            'unionpay_user_id',
+        ], true)) {
+            return true;
         }
 
         foreach ([

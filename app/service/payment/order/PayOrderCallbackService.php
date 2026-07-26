@@ -74,13 +74,10 @@ class PayOrderCallbackService extends BaseService
                 ->withScene('notify_result')
                 ->withException(PaymentException::class)
                 ->validate();
-            $notifyPayNo = trim((string) ($notifyResult['pay_no'] ?? ''));
-            if ($notifyPayNo !== '' && $notifyPayNo !== (string) $payOrder->pay_no) {
-                throw new PaymentException('插件回调定位的支付单与当前支付单不一致', 40200, [
-                    'callback_pay_no' => (string) $payOrder->pay_no,
-                    'notify_pay_no' => $notifyPayNo,
-                ]);
-            }
+            $this->assertNotifyPayNoMatches($payOrder, $notifyResult);
+            $payOrder = $this->freshPayOrder($payOrder);
+            $this->assertNotifyAmountMatches($payOrder, $notifyResult);
+            $this->assertNotifyChannelReferencesMatch($payOrder, $notifyResult);
             $callbackPayload = $this->buildCallbackPayload($payOrder, $request->all(), $notifyResult);
             $this->applyNotifyResult($payOrder, $notifyResult, $callbackPayload);
 
@@ -134,9 +131,14 @@ class PayOrderCallbackService extends BaseService
                 ]);
             }
 
+            $payOrder = $this->payOrderRepository->findByPayNo($payNo);
+            if (!$payOrder) {
+                throw new ResourceNotFoundException('支付单不存在', ['pay_no' => $payNo]);
+            }
+            $this->assertChannelMatches($payOrder, $channelId);
+
             return $this->handlePluginCallback($payNo, $request);
         } catch (Throwable $e) {
-            // return $plugin->notifyFail();
             throw $e;
         }
     }
@@ -179,6 +181,7 @@ class PayOrderCallbackService extends BaseService
         if (!$payOrder) {
             throw new ResourceNotFoundException('支付单不存在', ['pay_no' => $payNo]);
         }
+        $this->assertChannelMatches($payOrder, $channelId);
 
         $callbackPayload = null;
         try {
@@ -186,13 +189,11 @@ class PayOrderCallbackService extends BaseService
                 ->withScene('notify_result')
                 ->withException(PaymentException::class)
                 ->validate();
-            $notifyPayNo = trim((string) ($notifyResult['pay_no'] ?? ''));
-            if ($notifyPayNo !== '' && $notifyPayNo !== (string) $payOrder->pay_no) {
-                throw new PaymentException('插件回调定位的支付单与当前支付单不一致', 40200, [
-                    'callback_pay_no' => (string) $payOrder->pay_no,
-                    'notify_pay_no' => $notifyPayNo,
-                ]);
-            }
+            $this->assertNotifyPayNoMatches($payOrder, $notifyResult);
+            $payOrder = $this->freshPayOrder($payOrder);
+            $this->assertChannelMatches($payOrder, $channelId);
+            $this->assertNotifyAmountMatches($payOrder, $notifyResult);
+            $this->assertNotifyChannelReferencesMatch($payOrder, $notifyResult);
 
             $callbackPayload = $this->buildCallbackPayload($payOrder, $payload, $notifyResult);
             $this->applyNotifyResult($payOrder, $notifyResult, $callbackPayload);
@@ -234,8 +235,8 @@ class PayOrderCallbackService extends BaseService
                 default => NotifyConstant::PROCESS_STATUS_PENDING,
             },
             'process_result' => $notifyResult,
-            'channel_order_no' => (string) $notifyResult['channel_order_no'],
-            'channel_trade_no' => (string) $notifyResult['channel_trade_no'],
+            'channel_order_no' => (string) ($notifyResult['chan_order_no'] ?? ''),
+            'channel_trade_no' => (string) ($notifyResult['chan_trade_no'] ?? ''),
         ];
 
         foreach (['paid_at', 'failed_at', 'channel_error_code', 'channel_error_msg'] as $key) {
@@ -245,6 +246,103 @@ class PayOrderCallbackService extends BaseService
         }
 
         return $payload;
+    }
+
+    /**
+     * 插件返回渠道实付金额时，必须与当前 URL 定位的支付单整数分金额完全一致。
+     *
+     * @param array<string, mixed> $notifyResult 插件通知结果
+     */
+    private function assertNotifyAmountMatches(PayOrder $payOrder, array $notifyResult): void
+    {
+        if ((string) $notifyResult['status'] !== PaymentPluginStatusConstant::SUCCESS) {
+            return;
+        }
+
+        $paidAmount = (int) $notifyResult['paid_amount'];
+        if ($paidAmount !== (int) $payOrder->pay_amount) {
+            throw new PaymentException('插件回调金额与当前支付单不一致', 40200, [
+                'pay_no' => (string) $payOrder->pay_no,
+                'order_amount' => (int) $payOrder->pay_amount,
+                'notify_amount' => $paidAmount,
+            ]);
+        }
+    }
+
+    /**
+     * 已保存的渠道单号是本次支付尝试的关联依据；重放通知不得替换为另一笔渠道交易。
+     *
+     * @param array<string, mixed> $notifyResult 插件通知结果
+     */
+    private function assertNotifyChannelReferencesMatch(PayOrder $payOrder, array $notifyResult): void
+    {
+        $pairs = [
+            'chan_order_no' => ['model' => 'channel_order_no', 'label' => '渠道订单号'],
+            'chan_trade_no' => ['model' => 'channel_trade_no', 'label' => '渠道交易号'],
+        ];
+        foreach ($pairs as $field => $definition) {
+            $expected = trim((string) ($payOrder->{$definition['model']} ?? ''));
+            $actual = trim((string) ($notifyResult[$field] ?? ''));
+            if ($expected !== '' && $actual !== '' && !hash_equals($expected, $actual)) {
+                throw new PaymentException('插件回调' . $definition['label'] . '与当前支付单不一致', 40200, [
+                    'pay_no' => (string) $payOrder->pay_no,
+                    'field' => $field,
+                ]);
+            }
+        }
+
+        if ((string) $notifyResult['status'] === PaymentPluginStatusConstant::SUCCESS
+            && trim((string) ($notifyResult['chan_order_no'] ?? '')) === ''
+            && trim((string) ($notifyResult['chan_trade_no'] ?? '')) === '') {
+            throw new PaymentException('支付成功通知缺少渠道流水号', 40200, [
+                'pay_no' => (string) $payOrder->pay_no,
+            ]);
+        }
+    }
+
+    /**
+     * 防止 A 单合法回调被投递到 B 单回调 URL。
+     *
+     * @param array<string, mixed> $notifyResult 插件通知结果
+     */
+    private function assertNotifyPayNoMatches(PayOrder $payOrder, array $notifyResult): void
+    {
+        $notifyPayNo = trim((string) ($notifyResult['pay_no'] ?? ''));
+        if (!hash_equals((string) $payOrder->pay_no, $notifyPayNo)) {
+            throw new PaymentException('插件回调定位的支付单与当前支付单不一致', 40200, [
+                'callback_pay_no' => (string) $payOrder->pay_no,
+                'notify_pay_no' => $notifyPayNo,
+            ]);
+        }
+    }
+
+    /**
+     * 重新读取插件通知标准化后的支付单快照。
+     *
+     * 监听类插件会在通知解析阶段恢复临时识别金额，后续金额和渠道一致性校验
+     * 必须基于标准化后的最新支付单，而不是回调入口最初读取的旧快照。
+     */
+    private function freshPayOrder(PayOrder $payOrder): PayOrder
+    {
+        $latest = $this->payOrderRepository->findByPayNo((string) $payOrder->pay_no);
+        if (!$latest) {
+            throw new ResourceNotFoundException('支付单不存在', ['pay_no' => (string) $payOrder->pay_no]);
+        }
+
+        return $latest;
+    }
+
+    /**
+     * 通道路由只能处理归属于该通道的支付单。
+     */
+    private function assertChannelMatches(PayOrder $payOrder, int $channelId): void
+    {
+        if ((int) $payOrder->channel_id !== $channelId) {
+            throw new PaymentException('通道通知与支付单所属通道不一致', 40200, [
+                'pay_no' => (string) $payOrder->pay_no,
+                'channel_id' => $channelId,
+            ]);
+        }
     }
 
     /**

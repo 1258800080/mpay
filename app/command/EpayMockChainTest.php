@@ -128,9 +128,9 @@ class EpayMockChainTest extends Command
         ];
         $submitPayload['sign'] = $this->signMd5Payload($submitPayload, (string) $credential->api_key);
         $submitResponse = $this->resolve(EpayV1ProtocolService::class)->submit($submitPayload, $this->buildRequest($submitPayload, '/submit.php'));
+        $this->logJson($output, 'V1 submit 响应', $this->describeHttpResponse($submitResponse));
         $submitSnapshot = $this->loadOrderSnapshot((int) $merchant->id, $submitOutTradeNo);
         $this->assertTrue(isset($submitSnapshot['pay_order']), 'V1 submit 未创建支付单');
-        $this->logJson($output, 'V1 submit 响应', $this->describeHttpResponse($submitResponse));
         $this->logJson($output, 'V1 submit 订单快照', $this->formatOrderSnapshot($submitSnapshot));
 
         $mapiOutTradeNo = $this->buildOrderNo('V1MAP');
@@ -422,7 +422,7 @@ class EpayMockChainTest extends Command
             ],
         ]);
         $channel = $this->ensureChannel(
-            (int) $merchant->id,
+            0,
             (int) $paymentType->id,
             'epay_v1_command_mock',
             (int) $pluginConf->id,
@@ -497,7 +497,7 @@ class EpayMockChainTest extends Command
             ],
         ]);
         $channel = $this->ensureChannel(
-            (int) $merchant->id,
+            0,
             (int) $paymentType->id,
             'epay_v2_command_mock',
             (int) $pluginConf->id,
@@ -938,7 +938,7 @@ class EpayMockChainTest extends Command
             'pid' => (int) $merchant->id,
             'trade_no' => (string) $payOrder->channel_order_no,
             'api_trade_no' => (string) ($payOrder->channel_trade_no ?: $payOrder->channel_order_no),
-            'out_trade_no' => (string) $bizOrder->merchant_order_no,
+            'out_trade_no' => (string) $payOrder->pay_no,
             'type' => 'alipay',
             'name' => (string) $bizOrder->subject,
             'money' => FormatHelper::amount((int) $payOrder->pay_amount),
@@ -967,7 +967,7 @@ class EpayMockChainTest extends Command
             'pid' => (int) $merchant->id,
             'trade_no' => (string) $payOrder->channel_order_no,
             'api_trade_no' => (string) ($payOrder->channel_trade_no ?: $payOrder->channel_order_no),
-            'out_trade_no' => (string) $bizOrder->merchant_order_no,
+            'out_trade_no' => (string) $payOrder->pay_no,
             'type' => 'alipay',
             'name' => (string) $bizOrder->subject,
             'money' => FormatHelper::amount((int) $payOrder->pay_amount),

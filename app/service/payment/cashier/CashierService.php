@@ -5,6 +5,7 @@ namespace app\service\payment\cashier;
 use app\common\base\BaseService;
 use app\common\constant\CommonConstant;
 use app\common\constant\PaymentIdentityConstant;
+use app\common\constant\RouteConstant;
 use app\common\constant\TradeConstant;
 use app\common\util\FormatHelper;
 use app\exception\BusinessStateException;
@@ -24,16 +25,33 @@ use app\service\payment\order\PayOrderService;
 use app\service\payment\runtime\MerchantNotifyDispatcherService;
 use app\service\payment\runtime\PaymentRouteService;
 use app\service\system\config\SystemPublicConfigService;
+use support\Log;
 use support\Request;
 use support\Response;
+use Throwable;
 
 /**
  * 收银台服务。
  *
- * 负责收银台上下文、可选支付方式和最终支付确认。
+ * 负责构建收银台上下文、确认支付方式、承接身份授权并输出公开支付数据。
+ * 支付单状态推进由订单生命周期服务负责，本服务不直接修改支付终态。
  */
 class CashierService extends BaseService
 {
+    /**
+     * 构造方法。
+     *
+     * @param MerchantService $merchantService 商户服务
+     * @param PaymentTypeService $paymentTypeService 支付方式服务
+     * @param PaymentRouteService $paymentRouteService 支付路由服务
+     * @param PaymentChannelRepository $paymentChannelRepository 支付通道仓库
+     * @param BizOrderRepository $bizOrderRepository 业务单仓库
+     * @param PayOrderRepository $payOrderRepository 支付单仓库
+     * @param PayOrderService $payOrderService 支付单服务
+     * @param PaymentIdentityService $paymentIdentityService 支付身份服务
+     * @param MerchantNotifyDispatcherService $merchantNotifyDispatcherService 商户通知派发服务
+     * @param SystemPublicConfigService $systemPublicConfigService 系统公开配置服务
+     */
     public function __construct(
         protected MerchantService $merchantService,
         protected PaymentTypeService $paymentTypeService,
@@ -104,7 +122,7 @@ class CashierService extends BaseService
     /**
      * 确认支付方式并创建支付单。
      *
-     * @param array $input 请求参数
+     * @param array<string, mixed> $input 请求参数
      * @param Request $request 请求对象
      * @return array<string, mixed>
      */
@@ -165,18 +183,20 @@ class CashierService extends BaseService
      * 使用已获取的用户身份继续收银台支付。
      *
      * @param array<string, mixed> $input 请求参数
-     * @param Request $request 请求对象
      * @return array<string, mixed> 支付发起结果
      */
-    public function resumeIdentity(array $input, Request $request): array
+    public function resumeIdentity(array $input): array
     {
         $this->assertCashierEnabled();
 
         $token = trim((string) ($input['token'] ?? $input[PaymentIdentityConstant::FIELD_RESUME_TOKEN] ?? ''));
-        $context = $this->paymentIdentityService->context($token);
-        $identity = $this->paymentIdentityService->identityFromInput($input, $context);
 
-        return $this->continueIdentityPayment($token, $context, $identity);
+        return $this->withIdentityClaim($token, function () use ($token, $input): array {
+            $context = $this->paymentIdentityService->context($token);
+            $identity = $this->paymentIdentityService->identityFromInput($input, $context);
+
+            return $this->continueIdentityPayment($token, $context, $identity);
+        });
     }
 
     /**
@@ -196,19 +216,80 @@ class CashierService extends BaseService
      * 微信网页授权回调后继续收银台支付。
      *
      * @param array<string, mixed> $input 回调参数
-     * @param Request $request 请求对象
      * @return Response 跳转响应
      */
-    public function wechatIdentityCallback(array $input, Request $request): Response
+    public function wechatIdentityCallback(array $input): Response
     {
         $this->assertCashierEnabled();
 
         $token = trim((string) ($input['state'] ?? ''));
         $code = trim((string) ($input['code'] ?? ''));
-        $identity = $this->paymentIdentityService->wechatIdentity($token, $code);
-        $result = $this->continueIdentityPayment($token, $identity['context'], $identity['identity']);
 
-        return redirect((string) ($result['payment_page_url'] ?? $this->buildSiteUrl('/cashier')));
+        try {
+            return $this->withIdentityClaim($token, function () use ($token, $code): Response {
+                $identity = $this->paymentIdentityService->wechatIdentity($token, $code);
+                $result = $this->continueIdentityPayment($token, $identity['context'], $identity['identity']);
+
+                return $this->noStoreResponse(
+                    redirect((string) ($result['payment_page_url'] ?? $this->buildSiteUrl('/cashier')))
+                );
+            });
+        } catch (Throwable $e) {
+            return $this->identityCallbackFailure($token, 'wechat', $e);
+        }
+    }
+
+    /**
+     * 支付宝生活号网页授权回调后继续收银台支付。
+     *
+     * @param array<string, mixed> $input 回调参数
+     * @return Response 跳转响应
+     */
+    public function alipayIdentityCallback(array $input): Response
+    {
+        $this->assertCashierEnabled();
+
+        $token = trim((string) ($input['state'] ?? ''));
+        $authCode = trim((string) ($input['auth_code'] ?? ''));
+
+        try {
+            return $this->withIdentityClaim($token, function () use ($token, $authCode): Response {
+                $identity = $this->paymentIdentityService->alipayIdentity($token, $authCode);
+                $result = $this->continueIdentityPayment($token, $identity['context'], $identity['identity']);
+
+                return $this->noStoreResponse(
+                    redirect((string) ($result['payment_page_url'] ?? $this->buildSiteUrl('/cashier')))
+                );
+            });
+        } catch (Throwable $e) {
+            return $this->identityCallbackFailure($token, 'alipay', $e);
+        }
+    }
+
+    /**
+     * 云闪付 userAuth 回调后继续收银台支付。
+     *
+     * @param array<string, mixed> $input 回调参数
+     * @return Response 跳转响应
+     */
+    public function unionpayIdentityCallback(array $input): Response
+    {
+        $this->assertCashierEnabled();
+
+        $token = trim((string) ($input['state'] ?? ''));
+
+        try {
+            return $this->withIdentityClaim($token, function () use ($token, $input): Response {
+                $identity = $this->paymentIdentityService->unionpayIdentity($token, $input);
+                $result = $this->continueIdentityPayment($token, $identity['context'], $identity['identity']);
+
+                return $this->noStoreResponse(
+                    redirect((string) ($result['payment_page_url'] ?? $this->buildSiteUrl('/cashier')))
+                );
+            });
+        } catch (Throwable $e) {
+            return $this->identityCallbackFailure($token, 'unionpay', $e);
+        }
     }
 
     /**
@@ -225,7 +306,17 @@ class CashierService extends BaseService
         $channelId = (int) ($context['channel_id'] ?? 0);
         /** @var PaymentChannel|null $channel */
         $channel = $this->paymentChannelRepository->find($channelId);
-        if (!$channel || (int) $channel->status !== CommonConstant::STATUS_ENABLED) {
+        $merchantId = (int) ($input['merchant_id'] ?? 0);
+        $isPlatformChannel = $channel
+            && (int) $channel->merchant_id === 0
+            && (int) $channel->channel_mode === RouteConstant::CHANNEL_MODE_COLLECT;
+        $isMerchantChannel = $channel
+            && (int) $channel->merchant_id === $merchantId
+            && (int) $channel->channel_mode === RouteConstant::CHANNEL_MODE_SELF;
+        if (!$channel
+            || (int) $channel->status !== CommonConstant::STATUS_ENABLED
+            || (int) $channel->pay_type_id !== (int) ($input['pay_type_id'] ?? 0)
+            || (!$isPlatformChannel && !$isMerchantChannel)) {
             throw new ValidationException('身份流程对应的支付通道不可用', ['channel_id' => $channelId]);
         }
 
@@ -244,11 +335,64 @@ class CashierService extends BaseService
         }
 
         $attempt = $this->payOrderService->preparePayAttemptByChannel($input, $channel);
-        if (($attempt['status'] ?? '') !== PaymentIdentityConstant::STATUS_REQUIRED) {
-            $this->paymentIdentityService->forget($token);
-        }
+        $this->paymentIdentityService->forget($token);
 
         return $this->formatConfirmAttempt($attempt, $attempt['biz_order'] ?? $bizOrder);
+    }
+
+    /**
+     * 在 token 独占锁内执行身份换取和支付续跑。
+     *
+     * @template T
+     * @param string $token 身份流程令牌
+     * @param callable():T $callback
+     * @return T
+     */
+    private function withIdentityClaim(string $token, callable $callback): mixed
+    {
+        $claim = $this->paymentIdentityService->claim($token);
+        try {
+            return $callback();
+        } finally {
+            $this->paymentIdentityService->releaseClaim($claim);
+        }
+    }
+
+    /**
+     * 为身份授权跳转设置禁止缓存的安全响应头。
+     *
+     * @param Response $response 原始跳转响应
+     * @return Response 禁止缓存的跳转响应
+     */
+    private function noStoreResponse(Response $response): Response
+    {
+        return $response->withHeaders([
+            'Cache-Control' => 'no-store, no-cache, must-revalidate, private',
+            'Pragma' => 'no-cache',
+            'Referrer-Policy' => 'no-referrer',
+        ]);
+    }
+
+    /**
+     * 记录不含敏感值的授权失败摘要并返回承接页。
+     *
+     * @param string $token 身份流程令牌
+     * @param string $provider 授权平台
+     * @param Throwable $e 授权异常
+     * @return Response 授权失败承接页响应
+     */
+    private function identityCallbackFailure(string $token, string $provider, Throwable $e): Response
+    {
+        Log::warning(sprintf(
+            '[CashierIdentity] provider=%s token=%s error=%s',
+            $provider,
+            $token === '' ? 'missing' : substr(hash('sha256', $token), 0, 12),
+            $e::class
+        ));
+
+        $path = '/cashier/identity/' . rawurlencode($token) . '?error=authorization_failed';
+
+        return $this->noStoreResponse(redirect($this->buildSiteUrl($path)));
     }
 
     /**
@@ -263,22 +407,27 @@ class CashierService extends BaseService
         if (($attempt['status'] ?? '') === PaymentIdentityConstant::STATUS_REQUIRED) {
             return [
                 'biz_no' => (string) ($bizOrder->biz_no ?? ''),
-                ...$attempt,
+                'status' => PaymentIdentityConstant::STATUS_REQUIRED,
+                PaymentIdentityConstant::FIELD_REQUIRED => true,
+                'message' => (string) ($attempt['message'] ?? '请先完成用户身份授权'),
+                PaymentIdentityConstant::FIELD_RESUME_TOKEN => (string) ($attempt[PaymentIdentityConstant::FIELD_RESUME_TOKEN] ?? ''),
+                PaymentIdentityConstant::FIELD_IDENTITY_URL => (string) ($attempt[PaymentIdentityConstant::FIELD_IDENTITY_URL] ?? ''),
+                'expires_in' => max(0, (int) ($attempt['expires_in'] ?? 0)),
             ];
         }
 
         /** @var PayOrder $payOrder */
         $payOrder = $attempt['pay_order'];
-        $payParams = (array) ($attempt['pay_params'] ?? []);
         $paymentResult = (array) ($attempt['payment_result'] ?? []);
+        $presentation = (array) ($paymentResult['presentation'] ?? []);
+        $payParams = $this->publicPaymentParams((array) ($presentation['pay_params'] ?? []));
         $paymentPagePath = $this->buildPaymentPagePath((string) $payOrder->pay_no);
 
         return [
             'biz_no' => (string) $bizOrder->biz_no,
             'trade_no' => (string) $payOrder->pay_no,
-            'pay_type' => strtolower(trim((string) ($paymentResult['pay_page'] ?? 'qrcode'))),
+            'pay_type' => strtolower(trim((string) ($presentation['pay_page'] ?? ''))),
             'pay_info' => $payParams,
-            'payment_result' => $paymentResult,
             'payment_page_path' => $paymentPagePath,
             'payment_page_url' => $this->buildSiteUrl($paymentPagePath),
         ];
@@ -350,7 +499,7 @@ class CashierService extends BaseService
     }
 
     /**
-     * 确认收银台已开启。
+     * 校验收银台是否已开启。
      *
      * @return void
      */
@@ -362,7 +511,7 @@ class CashierService extends BaseService
     }
 
     /**
-     * 读取布尔配置。
+     * 解析系统布尔配置。
      *
      * @param string $key 配置键
      * @param bool $default 默认值
@@ -547,7 +696,10 @@ class CashierService extends BaseService
     }
 
     /**
-     * 提取收银台支付承接快照。
+     * 构建公开的收银台支付承接数据。
+     *
+     * 正常状态沿用支付单保存的 presentation；终态或快照缺失时根据本地订单事实生成只读承接数据。
+     * 输出前递归移除 raw，避免服务端诊断信息进入公开页面。
      *
      * @param PayOrder $payOrder 支付单
      * @return array<string, mixed>
@@ -556,7 +708,18 @@ class CashierService extends BaseService
     {
         $extJson = (array) ($payOrder->ext_json ?? []);
         $presentation = (array) ($extJson['presentation'] ?? []);
-        $payParams = (array) ($presentation['pay_params'] ?? []);
+        $status = (int) $payOrder->status;
+        if (in_array($status, [
+            TradeConstant::ORDER_STATUS_FAILED,
+            TradeConstant::ORDER_STATUS_CLOSED,
+            TradeConstant::ORDER_STATUS_TIMEOUT,
+        ], true)) {
+            $presentation = $this->buildOrderStatePresentation($payOrder);
+        } elseif (trim((string) ($presentation['pay_page'] ?? '')) === '') {
+            $presentation = $this->buildOrderStatePresentation($payOrder);
+        }
+
+        $payParams = $this->publicPaymentParams((array) ($presentation['pay_params'] ?? []));
         $payParams['server_time_timestamp'] = time();
 
         return [
@@ -566,6 +729,107 @@ class CashierService extends BaseService
             'pay_action' => (string) ($presentation['pay_action'] ?? ''),
             'pay_params' => $payParams,
         ];
+    }
+
+    /**
+     * 移除仅供服务端诊断的原始渠道数据。
+     *
+     * @param array<string, mixed> $params 支付承接参数
+     * @return array<string, mixed> 可公开给收银台的参数
+     */
+    private function publicPaymentParams(array $params): array
+    {
+        unset($params['raw']);
+        foreach ($params as $key => $value) {
+            if (is_array($value)) {
+                $params[$key] = $this->publicPaymentParams($value);
+            }
+        }
+
+        return $params;
+    }
+
+    /**
+     * 根据本地订单事实生成只读承接数据。
+     *
+     * @param PayOrder $payOrder 支付单
+     * @return array<string, mixed>
+     */
+    private function buildOrderStatePresentation(PayOrder $payOrder): array
+    {
+        $status = (int) $payOrder->status;
+        if (in_array($status, [
+            TradeConstant::ORDER_STATUS_CREATED,
+            TradeConstant::ORDER_STATUS_PAYING,
+        ], true)) {
+            return [
+                'pay_page' => 'page',
+                'pay_params' => [
+                    '_page' => 'paymentPending',
+                    'description' => '支付结果正在确认中，请勿重复支付。',
+                ],
+            ];
+        }
+
+        if ($status === TradeConstant::ORDER_STATUS_FAILED) {
+            return [
+                'pay_page' => 'error',
+                'pay_params' => [
+                    'error_msg' => $this->publicPaymentErrorMessage((string) ($payOrder->channel_error_msg ?? '')),
+                    'code' => $this->publicPaymentErrorCode((string) ($payOrder->channel_error_code ?? '')),
+                ],
+            ];
+        }
+
+        if ($status === TradeConstant::ORDER_STATUS_CLOSED) {
+            return [
+                'pay_page' => 'error',
+                'pay_params' => ['error_msg' => '支付订单已关闭，请返回收银台重新发起支付。'],
+            ];
+        }
+
+        if ($status === TradeConstant::ORDER_STATUS_TIMEOUT) {
+            return [
+                'pay_page' => 'error',
+                'pay_params' => ['error_msg' => '支付订单已超时，请返回收银台重新发起支付。'],
+            ];
+        }
+
+        return [];
+    }
+
+    /**
+     * 生成可在公开收银台展示的支付错误信息。
+     */
+    private function publicPaymentErrorMessage(string $message): string
+    {
+        $message = $this->normalizePublicPaymentText($message, 240);
+
+        return $message !== '' ? $message : '支付发起失败，请检查通道配置或稍后重试。';
+    }
+
+    /**
+     * 生成可在公开收银台展示的渠道错误码。
+     */
+    private function publicPaymentErrorCode(string $code): string
+    {
+        return $this->normalizePublicPaymentText($code, 64);
+    }
+
+    /**
+     * 清理渠道文本，避免 HTML、控制字符和超长内容进入公开页面。
+     */
+    private function normalizePublicPaymentText(string $value, int $maxBytes): string
+    {
+        $value = strip_tags($value);
+        $value = trim(preg_replace('/\s+/', ' ', $value) ?? '');
+        if ($value === '') {
+            return '';
+        }
+
+        return function_exists('mb_strcut')
+            ? mb_strcut($value, 0, $maxBytes, 'UTF-8')
+            : substr($value, 0, $maxBytes);
     }
 
 }

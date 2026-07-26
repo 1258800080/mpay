@@ -57,6 +57,10 @@ class SettlementAutomationService extends BaseService
             return null;
         }
 
+        if ((int) $payOrder->settlement_status !== TradeConstant::SETTLEMENT_STATUS_PENDING) {
+            return null;
+        }
+
         $payNo = (string) $payOrder->pay_no;
         $payAmount = (int) $payOrder->pay_amount;
         $serviceFee = (int) $payOrder->service_fee_amount;

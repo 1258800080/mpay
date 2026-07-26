@@ -14,11 +14,16 @@ use app\common\sdk\hnapay\HnapaySdkException;
 use app\common\trait\DirectPaymentProductSelectorTrait;
 use app\common\util\FormatHelper;
 use app\exception\PaymentException;
+use app\exception\PaymentUncertainException;
+use app\exception\UnsupportedPaymentOperationException;
 use support\Request;
 use support\Response;
 
 /**
  * 新生支付 API 插件。
+ *
+ * 提供支付宝、微信和银联的扫码/JSAPI、支付宝 H5、支付通知与退款能力，并兼容
+ * 扫码整数分通知和聚合支付元金额通知两种金额口径。当前没有可确认的统一查单与关单接口。
  */
 class HnapayApiPayment extends BasePayment implements PaymentInterface, PayPluginInterface
 {
@@ -74,7 +79,7 @@ class HnapayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      * 发起支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付结果
      */
     public function pay(array $order): array
     {
@@ -121,7 +126,7 @@ class HnapayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      * 扫码支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付结果
      */
     private function scanPay(array $order): array
     {
@@ -148,7 +153,7 @@ class HnapayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      * 支付宝 H5 表单支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付结果
      */
     private function h5Pay(array $order): array
     {
@@ -166,32 +171,32 @@ class HnapayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     }
 
     /**
-     * 新生旧插件未提供统一主动查单链路。
+     * 当前适配协议未提供可确认的统一主动查单接口。
      *
      * @param array<string, mixed> $order 标准插件查单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付状态结果
      */
     public function query(array $order): array
     {
-        return ['success' => false, 'status' => PaymentPluginStatusConstant::PENDING, 'msg' => '新生支付插件暂不支持主动查单'];
+        throw new UnsupportedPaymentOperationException('新生支付插件暂不支持主动查单', 40200);
     }
 
     /**
-     * 新生旧插件未提供关单链路。
+     * 当前适配协议未提供可确认的关单接口。
      *
      * @param array<string, mixed> $order 标准插件关单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准关单结果
      */
     public function close(array $order): array
     {
-        return ['success' => false, 'msg' => '新生支付插件暂不支持关单'];
+        throw new UnsupportedPaymentOperationException('新生支付插件暂不支持关单', 40200);
     }
 
     /**
      * 申请退款。
      *
      * @param array<string, mixed> $order 标准插件退款参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准退款结果
      */
     public function refund(array $order): array
     {
@@ -199,26 +204,29 @@ class HnapayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
             $data = $this->client()->refund((string) $order['pay_no'], [
                 'orgHnapayOrderId' => (string) ($order['chan_trade_no'] ?? ''),
                 'refundAmt' => FormatHelper::amount((int) $order['refund_amount']),
-                'notifyServerUrl' => (string) ($order['callback_url'] ?? ''),
+                'notifyServerUrl' => (string) ($order['refund_callback_url'] ?? ''),
             ]);
         } catch (HnapaySdkException $e) {
-            return ['success' => false, 'msg' => $e->getMessage()];
+            throw new PaymentUncertainException('新生支付退款结果不确定：' . $e->getMessage(), 40200);
         }
 
         return [
-            'success' => true,
-            'msg' => '退款申请成功',
-            'chan_refund_no' => (string) ($data['hnapayOrderId'] ?? $order['refund_no']),
+            'status' => PaymentPluginStatusConstant::SUCCESS,
+            'refund_no' => (string) $order['refund_no'],
+            'pay_no' => (string) $order['pay_no'],
             'refund_amount' => (int) $order['refund_amount'],
-            'raw_data' => $data,
+            'chan_refund_no' => (string) ($data['hnapayOrderId'] ?? ''),
+            'message' => '退款申请成功',
         ];
     }
 
     /**
-     * 解析支付回调。
+     * 解析并验签支付回调。
+     *
+     * 扫码与聚合支付使用不同验签方法和金额单位，必须先按订单字段判断协议类型。
      *
      * @param Request $request 回调请求
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付通知结果
      */
     public function notify(Request $request): array
     {
@@ -230,12 +238,20 @@ class HnapayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
         }
 
         $success = (string) ($payload[$isScan ? 'respCode' : 'resultCode'] ?? '') === '0000';
+        $paidAmount = null;
+        if ($success) {
+            $paidAmount = $isScan
+                ? $this->integerCents($payload['tranAmt'] ?? null, '新生支付扫码回调金额')
+                : $this->yuanToCents($payload['tranAmt'] ?? null, '新生支付回调金额');
+        }
 
         return [
             'status' => $success ? PaymentPluginStatusConstant::SUCCESS : PaymentPluginStatusConstant::FAILED,
+            'pay_no' => trim((string) ($payload[$isScan ? 'merOrderNum' : 'merOrderId'] ?? '')),
+            'paid_amount' => $paidAmount,
             'message' => (string) ($payload[$isScan ? 'respCode' : 'resultCode'] ?? ''),
-            'channel_order_no' => (string) ($payload[$isScan ? 'merOrderNum' : 'merOrderId'] ?? ''),
-            'channel_trade_no' => (string) ($payload['hnapayOrderId'] ?? ''),
+            'chan_order_no' => (string) ($payload[$isScan ? 'merOrderNum' : 'merOrderId'] ?? ''),
+            'chan_trade_no' => (string) ($payload['hnapayOrderId'] ?? ''),
             'channel_status' => (string) ($payload[$isScan ? 'respCode' : 'resultCode'] ?? ''),
         ];
     }
@@ -257,10 +273,44 @@ class HnapayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     }
 
     /**
+     * 读取渠道整数分金额。
+     *
+     * @param mixed $value 渠道金额
+     * @param string $field 金额字段说明
+     * @return int 金额，单位分
+     */
+    private function integerCents(mixed $value, string $field): int
+    {
+        $text = trim((string) $value);
+        if (preg_match('/^\d+$/', $text) !== 1) {
+            throw new PaymentException($field . '格式无效', 40200);
+        }
+
+        return (int) $text;
+    }
+
+    /**
+     * 将渠道元金额转换为整数分。
+     *
+     * @param mixed $value 渠道金额
+     * @param string $field 金额字段说明
+     * @return int 金额，单位分
+     */
+    private function yuanToCents(mixed $value, string $field): int
+    {
+        $text = trim((string) $value);
+        if (preg_match('/^(0|[1-9]\d*)(?:\.(\d{1,2}))?$/', $text, $matches) !== 1) {
+            throw new PaymentException($field . '格式无效', 40200);
+        }
+
+        return ((int) $matches[1] * 100) + (int) str_pad((string) ($matches[2] ?? ''), 2, '0');
+    }
+
+    /**
      * JSAPI 支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付结果
      */
     private function jsapiPay(array $order): array
     {
@@ -299,7 +349,10 @@ class HnapayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     }
 
     /**
-     * 新生支付方式编码。
+     * 将平台支付方式映射为新生机构编码。
+     *
+     * @param string $payType 平台支付方式编码
+     * @return string 新生机构编码
      */
     private function orgCode(string $payType): string
     {
@@ -313,14 +366,18 @@ class HnapayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     /**
      * 包装标准支付结果。
      *
+     * @param string $page 平台承接页类型
+     * @param string $payType 平台支付方式编码
+     * @param string $product 新生产品编码
+     * @param string $action 渠道接口动作
      * @param array<string, mixed> $payParams 承接页参数
      * @param array<string, mixed> $data 上游响应
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付结果
      */
     private function payResult(string $page, string $payType, string $product, string $action, array $payParams, array $data, array $order): array
     {
-        return [
+        return $this->pendingPaymentResult($order, [
             'pay_page' => $page,
             'pay_type' => $payType,
             'pay_product' => $product,
@@ -328,11 +385,13 @@ class HnapayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
             'pay_params' => $payParams,
             'chan_order_no' => (string) ($data['merOrderNum'] ?? $data['merOrderId'] ?? $order['pay_no']),
             'chan_trade_no' => (string) ($data['hnapayOrderId'] ?? ''),
-        ];
+        ]);
     }
 
     /**
-     * 获取 SDK 客户端。
+     * 获取当前通道的 SDK 客户端。
+     *
+     * @return HnapayClient
      */
     private function client(): HnapayClient
     {
@@ -349,6 +408,9 @@ class HnapayApiPayment extends BasePayment implements PaymentInterface, PayPlugi
 
     /**
      * 获取字符串配置。
+     *
+     * @param string $key 配置键
+     * @return string 配置值
      */
     private function configText(string $key): string
     {

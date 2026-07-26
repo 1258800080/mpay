@@ -29,10 +29,27 @@ class JeepayClient
      *
      * @param array<string, string> $config SDK 配置
      */
-    public function __construct(array $config)
+    public function __construct(array $config, ?Client $httpClient = null)
     {
-        $this->config = $config;
-        $this->httpClient = new Client([
+        $apiUrl = rtrim(trim((string) ($config['api_url'] ?? '')), '/');
+        $apiKey = trim((string) ($config['api_key'] ?? ''));
+        $parts = parse_url($apiUrl);
+        if (!is_array($parts)
+            || strtolower((string) ($parts['scheme'] ?? '')) !== 'https'
+            || trim((string) ($parts['host'] ?? '')) === ''
+            || isset($parts['user'])
+            || isset($parts['pass'])
+            || isset($parts['query'])
+            || isset($parts['fragment'])
+        ) {
+            throw new JeepaySdkException('Jeepay接口地址必须是无凭证、无查询参数的 HTTPS 地址');
+        }
+        if ($apiKey === '') {
+            throw new JeepaySdkException('Jeepay接口密钥不能为空');
+        }
+
+        $this->config = ['api_url' => $apiUrl, 'api_key' => $apiKey];
+        $this->httpClient = $httpClient ?? new Client([
             'timeout' => 15,
             'connect_timeout' => 10,
             'http_errors' => false,
@@ -53,22 +70,53 @@ class JeepayClient
 
         try {
             $response = $this->httpClient->post(rtrim($this->config['api_url'], '/') . '/' . ltrim($path, '/'), [
-                'headers' => ['Content-Type' => 'application/json'],
+                'headers' => [
+                    'Accept' => 'application/json',
+                    'Content-Type' => 'application/json',
+                ],
                 'json' => $payload,
             ]);
         } catch (GuzzleException $e) {
-            throw new JeepaySdkException('Jeepay网关请求失败：' . $e->getMessage(), 0, $e);
+            throw new JeepaySdkException('Jeepay网关请求失败：' . $e->getMessage(), true, '', $e);
         }
 
+        if ($response->getStatusCode() < 200 || $response->getStatusCode() >= 300) {
+            throw new JeepaySdkException('Jeepay网关返回非成功 HTTP 状态', true);
+        }
         $data = json_decode((string) $response->getBody(), true);
         if (!is_array($data)) {
-            throw new JeepaySdkException('Jeepay响应不是合法 JSON');
+            throw new JeepaySdkException('Jeepay响应不是合法 JSON', true);
         }
         if ((string) ($data['code'] ?? '') !== '0') {
-            throw new JeepaySdkException((string) ($data['msg'] ?? $data['errMsg'] ?? 'Jeepay请求失败'));
+            throw new JeepaySdkException(
+                trim((string) ($data['msg'] ?? '')) ?: 'Jeepay请求失败',
+                false,
+                trim((string) ($data['code'] ?? ''))
+            );
         }
 
-        return (array) ($data['data'] ?? $data);
+        $businessData = $data['data'] ?? null;
+        if (!is_array($businessData)) {
+            throw new JeepaySdkException('Jeepay成功响应缺少 data 对象', true);
+        }
+        $responseSign = trim((string) ($data['sign'] ?? ''));
+        $signaturePayload = $businessData;
+        $signaturePayload['sign'] = $responseSign;
+        if ($responseSign === '' || !$this->verify($signaturePayload)) {
+            throw new JeepaySdkException('Jeepay成功响应验签失败', true);
+        }
+
+        $errorCode = trim((string) ($businessData['errCode'] ?? ''));
+        $errorMessage = trim((string) ($businessData['errMsg'] ?? ''));
+        if ($errorCode !== '' || $errorMessage !== '') {
+            throw new JeepaySdkException(
+                $errorMessage !== '' ? $errorMessage : 'Jeepay渠道业务处理失败',
+                false,
+                $errorCode
+            );
+        }
+
+        return $businessData;
     }
 
     /**
@@ -78,12 +126,16 @@ class JeepayClient
      */
     public function verify(array $payload): bool
     {
-        $sign = (string) ($payload['sign'] ?? '');
+        $sign = strtoupper(trim((string) ($payload['sign'] ?? '')));
         if ($sign === '') {
             return false;
         }
 
-        return hash_equals($this->sign($payload), strtoupper($sign));
+        try {
+            return hash_equals($this->sign($payload), $sign);
+        } catch (JeepaySdkException) {
+            return false;
+        }
     }
 
     /**
@@ -91,15 +143,18 @@ class JeepayClient
      *
      * @param array<string, mixed> $payload 参数
      */
-    private function sign(array $payload): string
+    public function sign(array $payload): string
     {
-        ksort($payload);
+        ksort($payload, SORT_STRING);
         $pieces = [];
         foreach ($payload as $key => $value) {
             if ($key === 'sign' || $value === '' || $value === null) {
                 continue;
             }
-            $pieces[] = $key . '=' . (is_array($value) ? json_encode($value, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) : (string) $value);
+            if (!is_scalar($value)) {
+                throw new JeepaySdkException('Jeepay签名字段必须是标量：' . $key);
+            }
+            $pieces[] = $key . '=' . (string) $value;
         }
 
         return strtoupper(md5(implode('&', $pieces) . '&key=' . $this->config['api_key']));

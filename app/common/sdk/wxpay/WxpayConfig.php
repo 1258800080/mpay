@@ -22,9 +22,11 @@ use app\common\constant\FileConstant;
  * - private_key：V3 商户 API 私钥内容。
  * - private_key_path：V3 商户 API 私钥文件路径；private_key 为空时读取。
  * - api_v3_key：V3 APIv3 密钥，用于回调解密。
- * - wechatpay_public_key：微信支付平台公钥内容，用于验签。
- * - platform_cert_path：微信支付平台证书路径；未配置平台公钥时读取证书验签。
+ * - wechatpay_public_key/wechatpay_public_key_path：微信支付公钥内容或文件路径，用于验签。
+ * - wechatpay_public_key_id：微信支付公钥 ID，必须与 Wechatpay-Serial 一致。
+ * - platform_cert_path：微信支付平台证书路径；未配置微信支付公钥时读取证书验签。
  * - api_key：V2 商户 API 密钥。
+ * - previous_api_key：V2 密钥轮换期上一把 API 密钥，仅用于入站验签。
  * - v2_sign_type：V2 签名类型，MD5 或 HMAC-SHA256，默认 HMAC-SHA256。
  * - cert_path/key_path：V2 退款等双向证书接口使用的 apiclient_cert.pem 与 apiclient_key.pem。
  */
@@ -56,6 +58,13 @@ class WxpayConfig
      * @var string|null
      */
     private ?string $platformPublicKeyOrCert = null;
+
+    /**
+     * V3 微信支付验签材料标识缓存，公钥模式为公钥 ID，证书模式为证书序列号。
+     *
+     * @var string|null
+     */
+    private ?string $platformKeyIdentifier = null;
 
     /**
      * 构造方法。
@@ -210,17 +219,61 @@ class WxpayConfig
     /**
      * 获取微信支付平台公钥或平台证书内容。
      *
-     * wechatpay_public_key 优先；为空时读取 platform_cert_path 指向的证书文件。
+     * wechatpay_public_key 或 wechatpay_public_key_path 优先；均为空时读取
+     * platform_cert_path 指向的证书文件。
      *
      * @return string 平台公钥或平台证书内容
      */
     public function platformPublicKeyOrCert(): string
     {
         if ($this->platformPublicKeyOrCert === null) {
-            $this->platformPublicKeyOrCert = $this->configuredContent('wechatpay_public_key', 'platform_cert_path');
+            $this->platformPublicKeyOrCert = $this->configuredContent('wechatpay_public_key', 'wechatpay_public_key_path');
+            if ($this->platformPublicKeyOrCert === '') {
+                $this->platformPublicKeyOrCert = $this->configuredContent(null, 'platform_cert_path');
+            }
         }
 
         return $this->platformPublicKeyOrCert;
+    }
+
+    /**
+     * 获取微信支付验签材料标识。
+     *
+     * 公钥模式返回商户平台下载公钥时对应的 PUB_KEY_ID；平台证书模式从证书中
+     * 解析序列号。该值必须与响应或通知头中的 Wechatpay-Serial 匹配。
+     *
+     * @return string 公钥 ID 或平台证书序列号
+     */
+    public function platformKeyIdentifier(): string
+    {
+        if ($this->platformKeyIdentifier !== null) {
+            return $this->platformKeyIdentifier;
+        }
+
+        if ($this->usesWechatpayPublicKey()) {
+            return $this->platformKeyIdentifier = $this->string('wechatpay_public_key_id');
+        }
+
+        $certificate = $this->platformPublicKeyOrCert();
+        if ($certificate === '' || !str_contains($certificate, '-----BEGIN CERTIFICATE-----')) {
+            return $this->platformKeyIdentifier = '';
+        }
+
+        $parsed = openssl_x509_parse($certificate);
+        $serial = is_array($parsed) ? (string) ($parsed['serialNumberHex'] ?? '') : '';
+
+        return $this->platformKeyIdentifier = strtoupper(trim($serial));
+    }
+
+    /**
+     * 是否使用微信支付公钥而不是平台证书。
+     *
+     * @return bool 是否公钥模式
+     */
+    public function usesWechatpayPublicKey(): bool
+    {
+        return $this->string('wechatpay_public_key') !== ''
+            || $this->string('wechatpay_public_key_path') !== '';
     }
 
     /**
@@ -231,6 +284,18 @@ class WxpayConfig
     public function apiKey(): string
     {
         return $this->string('api_key');
+    }
+
+    /**
+     * 获取 V2 密钥轮换期上一把 API 密钥。
+     *
+     * 该密钥只允许用于验证微信入站通知，不用于新的出站请求签名。
+     *
+     * @return string 上一把 APIv2 密钥
+     */
+    public function previousApiKey(): string
+    {
+        return $this->string('previous_api_key');
     }
 
     /**
@@ -298,25 +363,23 @@ class WxpayConfig
     /**
      * 是否校验 HTTPS 证书。
      *
-     * 当前本地开发环境经常缺少 CA 根证书，默认关闭；生产环境可显式配置 verify=true。
-     *
      * @return bool 是否校验证书
      */
     public function verifyPeer(): bool
     {
-        return $this->bool('verify', false);
+        return $this->bool('verify', true);
     }
 
     /**
      * 是否校验 V3 响应签名。
      *
-     * 只有配置了 wechatpay_public_key 或 platform_cert_path 时才会实际验签。
+     * V3 响应默认必须验签。
      *
      * @return bool 是否验签响应
      */
     public function verifyResponse(): bool
     {
-        return $this->bool('verify_response', false);
+        return $this->bool('verify_response', true);
     }
 
     /**
@@ -385,10 +448,25 @@ class WxpayConfig
             if ($this->privateKey() === '') {
                 throw new WxpaySdkException('微信支付 V3 必须配置 private_key 或 private_key_path');
             }
+            if (strlen($this->apiV3Key()) !== 32) {
+                throw new WxpaySdkException('微信支付 APIv3 密钥必须是 32 字节');
+            }
+            if ($this->platformPublicKeyOrCert() === '') {
+                throw new WxpaySdkException('微信支付 V3 必须配置微信支付公钥或平台证书');
+            }
+            if ($this->usesWechatpayPublicKey() && $this->platformKeyIdentifier() === '') {
+                throw new WxpaySdkException('使用微信支付公钥时必须配置 wechatpay_public_key_id');
+            }
+            if (!$this->usesWechatpayPublicKey() && $this->platformKeyIdentifier() === '') {
+                throw new WxpaySdkException('无法从微信支付平台证书读取证书序列号');
+            }
         }
         if ($this->isV2()) {
-            if ($this->apiKey() === '') {
-                throw new WxpaySdkException('微信支付 V2 必须配置 api_key');
+            if (strlen($this->apiKey()) !== 32) {
+                throw new WxpaySdkException('微信支付 APIv2 密钥必须是 32 字节');
+            }
+            if ($this->previousApiKey() !== '' && strlen($this->previousApiKey()) !== 32) {
+                throw new WxpaySdkException('微信支付上一把 APIv2 密钥必须是 32 字节');
             }
             if (!in_array($this->v2SignType(), ['MD5', 'HMAC-SHA256'], true)) {
                 throw new WxpaySdkException('微信支付 V2 v2_sign_type 必须是 MD5 或 HMAC-SHA256');
@@ -423,13 +501,13 @@ class WxpayConfig
     /**
      * 读取“内容或路径”配置。
      *
-     * @param string $contentKey 内容字段
+     * @param string|null $contentKey 内容字段；为 null 时只读取路径
      * @param string $pathKey 路径字段
      * @return string 内容
      */
-    private function configuredContent(string $contentKey, string $pathKey): string
+    private function configuredContent(?string $contentKey, string $pathKey): string
     {
-        $content = $this->string($contentKey);
+        $content = $contentKey === null ? '' : $this->string($contentKey);
         if ($content !== '') {
             return $content;
         }

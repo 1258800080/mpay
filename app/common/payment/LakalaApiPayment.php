@@ -9,12 +9,16 @@ use app\common\constant\PaymentPluginTypeConstant;
 use app\common\constant\FileConstant;
 use app\common\constant\PaymentPluginStatusConstant;
 use app\common\interface\OnboardingPluginInterface;
+use app\common\interface\PaymentIdentityRequirementInterface;
 use app\common\interface\PaymentInterface;
 use app\common\interface\PayPluginInterface;
 use app\common\sdk\lakala\LakalaOpenApiClient;
 use app\common\sdk\lakala\LakalaSdkException;
 use app\common\trait\DirectPaymentProductSelectorTrait;
+use app\exception\PaymentDefinitiveException;
 use app\exception\PaymentException;
+use app\exception\PaymentUncertainException;
+use app\exception\UnsupportedPaymentOperationException;
 use GuzzleHttp\Client as HttpClient;
 use support\Request;
 use support\Response;
@@ -22,24 +26,28 @@ use support\Response;
 /**
  * 拉卡拉 OpenAPI 支付插件。
  *
- * 迁移自彩虹易支付 `lakala` 插件，并按 MPAY V2 插件契约重写：
- * 插件只负责调用拉卡拉接口和返回标准结构，订单状态、回调日志和商户通知由平台服务层处理。
+ * 提供聚合支付、付款码、查单、关单、退款和商户进件能力。
+ * 支付侧同时适配公开 LABS 与受控的 rainbow_v3 profile；进件侧负责资料校验、附件上传、
+ * 状态通知与复议，并将支付/进件响应分别归一化为平台标准结果。
  */
-class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPluginInterface, OnboardingPluginInterface
+class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPluginInterface, PaymentIdentityRequirementInterface, OnboardingPluginInterface
 {
     use DirectPaymentProductSelectorTrait;
 
     private const PRODUCT_ALIPAY_SCAN = 'alipay_scan';
     private const PRODUCT_ALIPAY_JSAPI = 'alipay_jsapi';
-    private const PRODUCT_WXPAY_SCAN = 'wxpay_scan';
     private const PRODUCT_WXPAY_JSAPI = 'wxpay_jsapi';
+    private const PRODUCT_WXPAY_MINI = 'wxpay_mini';
     private const PRODUCT_BANK_SCAN = 'bank_scan';
+    private const PRODUCT_BANK_JSAPI = 'bank_jsapi';
     private const PRODUCT_CASHIER = 'cashier';
     private const PRODUCT_MICROPAY = 'micropay';
+    private const PROFILE_OFFICIAL_LABS_V1 = 'official_labs_v1';
+    private const PROFILE_RAINBOW_V3 = 'rainbow_v3';
     private const UPSTREAM_TRANS_JSAPI = '51';
     private const UPSTREAM_TRANS_MINI = '71';
 
-    private ?LakalaOpenApiClient $client = null;
+    protected ?LakalaOpenApiClient $client = null;
 
     /**
      * 插件元信息。
@@ -51,7 +59,7 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
         'name' => '拉卡拉OpenAPI支付',
         'plugin_type' => PaymentPluginTypeConstant::TYPE_DIRECT,
         'author' => 'MPAY',
-        'version' => '1.0.0',
+        'version' => '1.1.0',
         'pay_types' => ['alipay', 'wxpay', 'bank'],
         'transfer_types' => [],
         'config_schema' => [],
@@ -290,21 +298,145 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
                 ],
             ],
             [
+                'type' => 'input',
+                'field' => 'terminal_ip',
+                'title' => '终端/服务端 IP',
+                'value' => '',
+                'props' => ['placeholder' => '查单、关单和退款时作为 LABS termIp'],
+                'validate' => [['required' => true, 'message' => '终端/服务端 IP 不能为空']],
+            ],
+            [
+                'type' => 'input',
+                'field' => 'terminal_location',
+                'title' => '终端经纬度（可选）',
+                'value' => '',
+                'props' => ['placeholder' => '+37.123456,-121.123456'],
+            ],
+            [
+                'type' => 'select',
+                'field' => 'payment_api_profile',
+                'title' => '支付接口协议',
+                'value' => self::PROFILE_OFFICIAL_LABS_V1,
+                'options' => [
+                    ['label' => '官方 LABS v1（推荐）', 'value' => self::PROFILE_OFFICIAL_LABS_V1],
+                    ['label' => '彩虹私有 v3（需拉卡拉确认权限）', 'value' => self::PROFILE_RAINBOW_V3],
+                ],
+                'validate' => [['required' => true, 'message' => '支付接口协议不能为空']],
+            ],
+            [
                 'type' => 'checkbox',
                 'field' => 'enabled_products',
                 'title' => '已开通产品',
-                'value' => [self::PRODUCT_ALIPAY_SCAN, self::PRODUCT_WXPAY_SCAN, self::PRODUCT_BANK_SCAN],
+                'value' => [self::PRODUCT_ALIPAY_SCAN, self::PRODUCT_BANK_SCAN],
                 'options' => [
                     ['label' => '支付宝扫码', 'value' => self::PRODUCT_ALIPAY_SCAN],
                     ['label' => '支付宝JSAPI', 'value' => self::PRODUCT_ALIPAY_JSAPI],
-                    ['label' => '微信扫码', 'value' => self::PRODUCT_WXPAY_SCAN],
-                    ['label' => '微信JSAPI/小程序', 'value' => self::PRODUCT_WXPAY_JSAPI],
+                    ['label' => '微信公众号JSAPI', 'value' => self::PRODUCT_WXPAY_JSAPI],
+                    ['label' => '微信小程序', 'value' => self::PRODUCT_WXPAY_MINI],
                     ['label' => '云闪付扫码', 'value' => self::PRODUCT_BANK_SCAN],
-                    ['label' => '聚合收银台', 'value' => self::PRODUCT_CASHIER],
+                    ['label' => '云闪付JSAPI', 'value' => self::PRODUCT_BANK_JSAPI],
+                    ['label' => '彩虹私有聚合收银台', 'value' => self::PRODUCT_CASHIER],
                     ['label' => '付款码支付', 'value' => self::PRODUCT_MICROPAY],
                 ],
                 'validate' => [
                     ['required' => true, 'message' => '已开通产品不能为空'],
+                ],
+            ],
+            [
+                'type' => 'input',
+                'field' => 'sub_merchant_no',
+                'title' => '交易子商户号（可选）',
+                'value' => '',
+            ],
+            [
+                'type' => 'input',
+                'field' => 'trade_terminal_no',
+                'title' => '交易终端号（可选）',
+                'value' => '',
+            ],
+            [
+                'type' => 'input',
+                'field' => 'external_order_source',
+                'title' => 'LABS 订单来源（可选）',
+                'value' => '',
+                'props' => ['placeholder' => '由拉卡拉分配；该值决定公开 LABS 结果通知路由'],
+            ],
+            [
+                'type' => 'input',
+                'field' => 'wx_mp_app_id',
+                'title' => '微信公众号 AppID',
+                'value' => '',
+            ],
+            [
+                'type' => 'input',
+                'field' => 'wx_mp_app_secret',
+                'title' => '微信公众号 AppSecret',
+                'value' => '',
+                'props' => ['type' => 'password'],
+            ],
+            [
+                'type' => 'input',
+                'field' => 'wx_mini_app_id',
+                'title' => '微信小程序 AppID',
+                'value' => '',
+            ],
+            [
+                'type' => 'input',
+                'field' => 'wx_mini_app_secret',
+                'title' => '微信小程序 AppSecret',
+                'value' => '',
+                'props' => ['type' => 'password'],
+            ],
+            [
+                'type' => 'input',
+                'field' => 'wx_mini_launch_path',
+                'title' => '微信小程序支付页路径',
+                'value' => '',
+            ],
+            [
+                'type' => 'select',
+                'field' => 'wx_default_jsapi_product',
+                'title' => '微信 JSAPI 默认场景',
+                'value' => 'mp',
+                'options' => [
+                    ['label' => '公众号', 'value' => 'mp'],
+                    ['label' => '小程序', 'value' => 'mini'],
+                ],
+            ],
+            [
+                'type' => 'input',
+                'field' => 'alipay_app_id',
+                'title' => '支付宝授权 AppID',
+                'value' => '',
+            ],
+            [
+                'type' => 'textarea',
+                'field' => 'alipay_private_key',
+                'title' => '支付宝应用私钥（身份授权）',
+                'value' => '',
+                'props' => ['rows' => 3],
+            ],
+            [
+                'type' => 'textarea',
+                'field' => 'alipay_public_key',
+                'title' => '支付宝公钥（身份授权）',
+                'value' => '',
+                'props' => ['rows' => 3],
+            ],
+            [
+                'type' => 'input',
+                'field' => 'alipay_mini_launch_path',
+                'title' => '支付宝小程序支付页路径',
+                'value' => '',
+            ],
+            [
+                'type' => 'switch',
+                'field' => 'verify_legacy_response_signature',
+                'title' => '私有 v3 响应验签',
+                'value' => false,
+                'props' => [
+                    'checkedText' => '强制',
+                    'uncheckedText' => '兼容旧接口',
                 ],
             ],
             [
@@ -367,9 +499,133 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      */
     public function pay(array $order): array
     {
-        $payType = (string) $order['pay_type_code'];
+        $payment = (array) ($order['extra']['payment'] ?? []);
+        if ((string) ($order['pay_type_code'] ?? '') === 'bank'
+            && strtolower(trim((string) ($payment['method'] ?? ''))) === 'jsapi'
+        ) {
+            return $this->preorder($order, self::PRODUCT_BANK_JSAPI, 'UQRCODEPAY', '51');
+        }
 
-        return $this->executeDirectPaymentProduct($order, [
+        return $this->executeDirectPaymentProduct($order, $this->paymentHandlers($order), '拉卡拉');
+    }
+
+    /**
+     * 每次注入通道配置时重置 SDK，防止跨通道复用证书和密钥。
+     *
+     * @param array<string, mixed> $channelConfig 通道配置
+     * @return void
+     */
+    public function init(array $channelConfig): void
+    {
+        parent::init($channelConfig);
+        $this->client = null;
+
+        $supported = [
+            self::PRODUCT_ALIPAY_SCAN,
+            self::PRODUCT_ALIPAY_JSAPI,
+            self::PRODUCT_WXPAY_JSAPI,
+            self::PRODUCT_WXPAY_MINI,
+            self::PRODUCT_BANK_SCAN,
+            self::PRODUCT_BANK_JSAPI,
+            self::PRODUCT_CASHIER,
+            self::PRODUCT_MICROPAY,
+        ];
+        $productsConfigured = array_key_exists('enabled_products', $channelConfig);
+        if ($productsConfigured && ($this->enabledProducts() === [] || array_diff($this->enabledProducts(), $supported) !== [])) {
+            throw new PaymentException('拉卡拉已开通产品配置无效', 40200);
+        }
+        if (!in_array($this->paymentProfile(), [self::PROFILE_OFFICIAL_LABS_V1, self::PROFILE_RAINBOW_V3], true)) {
+            throw new PaymentException('拉卡拉支付接口协议配置无效', 40200);
+        }
+        if ($productsConfigured && $this->productEnabled(self::PRODUCT_CASHIER) && !$this->isLegacyProfile()) {
+            throw new PaymentException('彩虹私有聚合收银台只能在 rainbow_v3 协议下启用', 40200);
+        }
+    }
+
+    /**
+     * 声明支付宝、微信公众号和微信小程序支付的身份需求。
+     *
+     * 身份判断复用 pay() 的 handler 过滤和候选排序，保证身份续跑仍命中原通道的原产品。
+     *
+     * @param array<string, mixed> $order 标准插件下单参数
+     * @return array<string, mixed>|null 身份要求；当前产品无需补充身份时返回 null
+     */
+    public function identityRequirement(array $order): ?array
+    {
+        $handlers = $this->directPaymentUsableHandlers($order, $this->paymentHandlers($order));
+        $candidates = $this->directPaymentProductCandidates($order, array_keys($handlers));
+        if (($candidates[0] ?? '') !== 'jsapi') {
+            return null;
+        }
+
+        $payType = (string) ($order['pay_type_code'] ?? '');
+        $payment = (array) ($order['extra']['payment'] ?? []);
+        if ($payType === 'alipay') {
+            if ($this->firstText($payment['buyer_id'] ?? '', $payment['buyer_open_id'] ?? '') !== '') {
+                return null;
+            }
+
+            return [
+                'provider' => 'alipay',
+                'product' => 'mini',
+                'channel_product' => self::PRODUCT_ALIPAY_JSAPI,
+                'auth_type' => 'alipay_mini',
+                'identity_field' => 'buyer_id',
+                'identity_aliases' => ['buyer_open_id'],
+                'app_id' => $this->configText('alipay_app_id'),
+                'mini_path' => $this->configText('alipay_mini_launch_path'),
+                'scope' => 'auth_base',
+                '_alipay_config' => [
+                    'mode' => 'key',
+                    'app_id' => $this->configText('alipay_app_id'),
+                    'private_key' => $this->configText('alipay_private_key'),
+                    'alipay_public_key' => $this->configText('alipay_public_key'),
+                    'sandbox' => $this->configBool('sandbox'),
+                ],
+                'message' => '拉卡拉支付宝 JSAPI 支付需要先获取 buyer_id 或 buyer_open_id',
+            ];
+        }
+
+        if ($payType !== 'wxpay') {
+            return null;
+        }
+
+        $mini = $this->selectedWxProduct($order) === self::PRODUCT_WXPAY_MINI;
+        $openid = $mini
+            ? $this->firstText($payment['mini_openid'] ?? '')
+            : $this->firstText($payment['openid'] ?? '', $payment['sub_openid'] ?? '');
+        if ($openid !== '') {
+            return null;
+        }
+
+        return [
+            'provider' => 'wxpay',
+            'product' => $mini ? 'mini' : 'mp',
+            'channel_product' => $mini ? self::PRODUCT_WXPAY_MINI : self::PRODUCT_WXPAY_JSAPI,
+            'auth_type' => $mini ? 'mini_program' : 'wechat_oauth',
+            'identity_field' => $mini ? 'mini_openid' : 'openid',
+            'app_id' => $mini ? $this->configText('wx_mini_app_id') : $this->configText('wx_mp_app_id'),
+            '_app_secret' => $mini ? $this->configText('wx_mini_app_secret') : $this->configText('wx_mp_app_secret'),
+            'scope' => 'snsapi_base',
+            'mini_path' => $mini ? $this->configText('wx_mini_launch_path') : '',
+            'env_version' => $mini ? 'release' : '',
+            'message' => $mini
+                ? '拉卡拉微信小程序支付需要先获取 mini_openid'
+                : '拉卡拉微信公众号支付需要先获取 openid',
+        ];
+    }
+
+    /**
+     * 支付 handler 是产品选择、身份判断和实际下单的唯一能力声明。
+     *
+     * @param array<string, mixed> $order 标准插件下单参数
+     * @return array<string, array<string, mixed>> 支付场景与产品处理器映射
+     */
+    private function paymentHandlers(array $order): array
+    {
+        $payType = (string) ($order['pay_type_code'] ?? '');
+        $wxProduct = $this->selectedWxProduct($order);
+        $handlers = [
             'auth_code' => [
                 'products' => [
                     'alipay' => self::PRODUCT_MICROPAY,
@@ -380,65 +636,61 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
                 'handler' => fn (): array => $this->micropay($order, $payType),
             ],
             'jsapi' => [
-                'products' => ['alipay' => self::PRODUCT_ALIPAY_JSAPI, 'wxpay' => self::PRODUCT_WXPAY_JSAPI],
+                'products' => [
+                    'alipay' => self::PRODUCT_ALIPAY_JSAPI,
+                    'wxpay' => $wxProduct,
+                    'bank' => self::PRODUCT_BANK_JSAPI,
+                ],
                 'handler' => function () use ($order, $payType): array {
                     return match ($payType) {
                         'alipay' => $this->preorder($order, self::PRODUCT_ALIPAY_JSAPI, 'ALIPAY', '51'),
-                        'wxpay' => $this->preorder($order, self::PRODUCT_WXPAY_JSAPI, 'WECHAT', $this->wxpayJsapiTransType($order)),
+                        'wxpay' => $this->preorder($order, $this->selectedWxProduct($order), 'WECHAT', $this->wxpayJsapiTransType($order)),
+                        'bank' => $this->preorder($order, self::PRODUCT_BANK_JSAPI, 'UQRCODEPAY', '51'),
                     };
                 },
             ],
-            'h5' => [
-                'products' => [
-                    'alipay' => self::PRODUCT_CASHIER,
-                    'wxpay' => self::PRODUCT_CASHIER,
-                    'bank' => self::PRODUCT_CASHIER,
-                ],
-
-                'handler' => fn (): array => $this->cashierPay($order, $payType),
-            ],
-            'jump' => [
-                'products' => [
-                    'alipay' => self::PRODUCT_CASHIER,
-                    'wxpay' => self::PRODUCT_CASHIER,
-                    'bank' => self::PRODUCT_CASHIER,
-                ],
-
-                'handler' => fn (): array => $this->cashierPay($order, $payType),
-            ],
-            'web' => [
-                'products' => [
-                    'alipay' => self::PRODUCT_CASHIER,
-                    'wxpay' => self::PRODUCT_CASHIER,
-                    'bank' => self::PRODUCT_CASHIER,
-                ],
-
-                'handler' => fn (): array => $this->cashierPay($order, $payType),
+            'urlscheme' => [
+                'products' => ['bank' => self::PRODUCT_BANK_JSAPI],
+                'handler' => fn (): array => $this->preorder($order, self::PRODUCT_BANK_JSAPI, 'UQRCODEPAY', '51'),
             ],
             'qrcode' => [
                 'products' => [
                     'bank' => self::PRODUCT_BANK_SCAN,
-                    'wxpay' => self::PRODUCT_WXPAY_SCAN,
                     'alipay' => self::PRODUCT_ALIPAY_SCAN,
                 ],
 
                 'handler' => fn (): array => $this->preorderByType($order, $payType),
             ],
-        ], '拉卡拉');
+        ];
+
+        if ($this->isLegacyProfile()) {
+            $cashier = [
+                'products' => [
+                    'alipay' => self::PRODUCT_CASHIER,
+                    'wxpay' => self::PRODUCT_CASHIER,
+                    'bank' => self::PRODUCT_CASHIER,
+                ],
+                'handler' => fn (): array => $this->cashierPay($order, $payType),
+            ];
+            $handlers['h5'] = $cashier;
+            $handlers['jump'] = $cashier;
+            $handlers['web'] = $cashier;
+        }
+
+        return $handlers;
     }
 
     /**
      * 按支付方式选择拉卡拉扫码预下单产品。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @param string $payType 支付方式
-     * @return array<string, mixed>
+     * @param string $payType 平台支付方式编码
+     * @return array<string, mixed> 标准支付结果
      */
     private function preorderByType(array $order, string $payType): array
     {
         return match ($payType) {
             'bank' => $this->preorder($order, self::PRODUCT_BANK_SCAN, 'UQRCODEPAY', '41'),
-            'wxpay' => $this->preorder($order, self::PRODUCT_WXPAY_SCAN, 'WECHAT', '41'),
             default => $this->preorder($order, self::PRODUCT_ALIPAY_SCAN, 'ALIPAY', '41'),
         };
     }
@@ -447,6 +699,7 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      * 微信 JSAPI 和小程序对应同一个后台开通项，上游交易类型按身份字段切换。
      *
      * @param array<string, mixed> $order 标准插件下单参数
+     * @return string 拉卡拉交易类型
      */
     private function wxpayJsapiTransType(array $order): string
     {
@@ -458,6 +711,22 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     }
 
     /**
+     * 根据明确身份字段或通道默认配置选择微信公众号或小程序产品。
+     *
+     * @param array<string, mixed> $order 标准插件下单参数
+     * @return string 微信产品编码
+     */
+    private function selectedWxProduct(array $order): string
+    {
+        $payment = (array) ($order['extra']['payment'] ?? []);
+        $mini = $this->firstText($payment['mini_openid'] ?? '', $payment['mini_code'] ?? '') !== ''
+            || in_array($payment['is_mini'] ?? false, [true, 1, '1', 'true', 'on'], true)
+            || strtolower($this->configText('wx_default_jsapi_product')) === 'mini';
+
+        return $mini ? self::PRODUCT_WXPAY_MINI : self::PRODUCT_WXPAY_JSAPI;
+    }
+
+    /**
      * 查询支付订单。
      *
      * @param array<string, mixed> $order 标准插件查单参数
@@ -465,30 +734,69 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      */
     public function query(array $order): array
     {
+        $isCashier = $this->orderPayProduct($order) === self::PRODUCT_CASHIER;
         try {
-            $data = $this->client()->execute('/api/v3/labs/query/tradequery', [
-                'merchant_no' => $this->configText('merchant_no'),
-                'term_no' => $this->configText('terminal_no'),
-                'out_trade_no' => (string) $order['pay_no'],
-            ]);
+            if ($this->isLegacyProfile() && $isCashier) {
+                $data = $this->client()->cashier('/api/v3/ccss/counter/order/query', [
+                    'merchant_no' => $this->configText('merchant_no'),
+                    'out_order_no' => (string) $order['pay_no'],
+                ]);
+            } elseif ($this->isLegacyProfile()) {
+                $data = $this->client()->execute('/api/v3/labs/query/tradequery', [
+                    'merchant_no' => $this->configText('merchant_no'),
+                    'term_no' => $this->configText('terminal_no'),
+                    'out_trade_no' => (string) $order['pay_no'],
+                ]);
+            } else {
+                $data = $this->client()->labs(LakalaOpenApiClient::LABS_QUERY_PATH, [
+                    'mercId' => $this->configText('merchant_no'),
+                    'termNo' => $this->configText('terminal_no'),
+                    'ornOrderId' => (string) $order['pay_no'],
+                ], $this->termExtInfo($order));
+            }
         } catch (LakalaSdkException $e) {
-            return [
-                'success' => false,
-                'msg' => $e->getMessage(),
-            ];
+            throw new PaymentException('拉卡拉查单失败：' . $e->getMessage(), 40200);
         }
 
-        $status = $this->tradeStatus((string) ($data['trade_state'] ?? ''));
+        $channelStatus = (string) ($data['tradeState'] ?? $data['trade_state'] ?? $data['order_status'] ?? 'UNKNOWN');
+        $status = $this->tradeStatus($channelStatus);
+        $payNo = trim((string) ($order['pay_no'] ?? ''));
+        $channelOrderNo = $this->firstText(
+            $data['orderId'] ?? '',
+            $data['out_trade_no'] ?? '',
+            $data['out_order_no'] ?? ''
+        );
+        if ($channelOrderNo === '' || !hash_equals($payNo, $channelOrderNo)) {
+            throw new PaymentException('拉卡拉查单返回订单号不匹配', 40200, ['pay_no' => $payNo]);
+        }
+        $channelTradeNo = $this->firstText(
+            $data['lklOrderNo'] ?? '',
+            $data['trade_no'] ?? '',
+            $data['pay_order_no'] ?? '',
+            $order['chan_trade_no'] ?? ''
+        );
+        $paidAmount = null;
+        if ($status === PaymentPluginStatusConstant::SUCCESS) {
+            $paidAmount = $this->parseCentAmount(
+                $data['amount'] ?? $data['total_amount'] ?? $data['totalAmount'] ?? null
+            );
+            if ($paidAmount !== (int) ($order['amount'] ?? -1)) {
+                throw new PaymentException('拉卡拉查单返回金额不匹配', 40200, ['pay_no' => $payNo]);
+            }
+            if ($channelTradeNo === '') {
+                throw new PaymentException('拉卡拉成功查单响应缺少渠道交易号', 40200, ['pay_no' => $payNo]);
+            }
+        }
 
         return [
-            'success' => true,
             'status' => $status,
-            'channel_order_no' => (string) ($data['out_trade_no'] ?? $order['pay_no']),
-            'channel_trade_no' => (string) ($data['trade_no'] ?? $order['chan_trade_no'] ?? $order['pay_no']),
-            'channel_status' => (string) ($data['trade_state'] ?? ''),
-            'message' => (string) ($data['trade_state_desc'] ?? $data['trade_state'] ?? ''),
-            'paid_at' => $status === PaymentPluginStatusConstant::SUCCESS ? ($data['pay_time'] ?? null) : null,
-            'raw_data' => $data,
+            'pay_no' => $payNo,
+            'paid_amount' => $paidAmount,
+            'chan_order_no' => $channelOrderNo,
+            'chan_trade_no' => $channelTradeNo,
+            'channel_status' => $channelStatus,
+            'message' => (string) ($data['tradeStateDesc'] ?? $data['trade_state_desc'] ?? $channelStatus),
+            'paid_at' => $status === PaymentPluginStatusConstant::SUCCESS ? ($data['payTime'] ?? $data['pay_time'] ?? null) : null,
         ];
     }
 
@@ -500,27 +808,71 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      */
     public function close(array $order): array
     {
-        try {
-            $data = $this->client()->execute('/api/v3/labs/relation/revoked', [
-                'merchant_no' => $this->configText('merchant_no'),
-                'term_no' => $this->configText('terminal_no'),
-                'out_trade_no' => 'CLOSE' . date('YmdHis') . random_int(1000, 9999),
-                'origin_out_trade_no' => (string) $order['pay_no'],
-                'location_info' => [
-                    'request_ip' => (string) ($order['client_ip'] ?? ''),
-                ],
+        $isMicropay = $this->orderPayProduct($order) === self::PRODUCT_MICROPAY;
+        $payNo = (string) $order['pay_no'];
+        $channelTradeNo = (string) ($order['chan_trade_no'] ?? '');
+
+        if ($this->isLegacyProfile() && !$isMicropay) {
+            throw new UnsupportedPaymentOperationException('彩虹私有协议只有付款码撤销证据，普通订单关单不可调用 revoked', 40200, [
+                'pay_product' => $this->orderPayProduct($order),
             ]);
+        }
+
+        try {
+            if ($this->isLegacyProfile()) {
+                $this->client()->execute('/api/v3/labs/relation/revoked', [
+                    'merchant_no' => $this->configText('merchant_no'),
+                    'term_no' => $this->configText('terminal_no'),
+                    'out_trade_no' => $this->relationOrderNo('C', $payNo),
+                    'origin_out_trade_no' => $payNo,
+                    'origin_trade_no' => $channelTradeNo,
+                    'location_info' => [
+                        'request_ip' => $this->terminalIp($order),
+                    ],
+                ]);
+            } else {
+                $params = [
+                    'mercId' => $this->configText('merchant_no'),
+                    'termNo' => $this->configText('terminal_no'),
+                    'ornOrderId' => $payNo,
+                ];
+                if ($channelTradeNo !== '') {
+                    $params['lklOrderNo'] = $channelTradeNo;
+                }
+                $path = LakalaOpenApiClient::LABS_CLOSE_PATH;
+                if ($isMicropay) {
+                    $path = LakalaOpenApiClient::LABS_MICROPAY_REVERSE_PATH;
+                    $params['orderId'] = $this->relationOrderNo('R', $payNo);
+                }
+                $this->client()->labs($path, $params, $this->termExtInfo($order));
+            }
 
             return [
-                'success' => true,
-                'msg' => '关单成功',
-                'raw_data' => $data,
+                'status' => PaymentPluginStatusConstant::CLOSED,
+                'pay_no' => $payNo,
+                'chan_order_no' => (string) ($order['chan_order_no'] ?? ''),
+                'chan_trade_no' => $channelTradeNo,
+                'message' => $isMicropay ? '付款码订单撤销成功' : '关单成功',
             ];
         } catch (LakalaSdkException $e) {
-            return [
-                'success' => false,
-                'msg' => $e->getMessage(),
-            ];
+            // 重复关单/撤销可能由上游以业务错误返回；仅在查单已明确 CLOSED/REVOKED 时按幂等成功收敛。
+            if (!$this->isLegacyProfile()) {
+                try {
+                    $queryResult = $this->query($order);
+                    if (($queryResult['status'] ?? '') === PaymentPluginStatusConstant::CLOSED) {
+                        return [
+                            'status' => PaymentPluginStatusConstant::CLOSED,
+                            'pay_no' => $payNo,
+                            'chan_order_no' => (string) ($order['chan_order_no'] ?? ''),
+                            'chan_trade_no' => $channelTradeNo,
+                            'message' => $isMicropay ? '付款码订单已撤销' : '订单已关闭',
+                        ];
+                    }
+                } catch (\Throwable) {
+                    // 保留原关单异常；查询失败不能覆盖真正的失败原因，也不能猜测成功。
+                }
+            }
+            throw new PaymentException(($isMicropay ? '拉卡拉付款码撤销失败：' : '拉卡拉关单失败：') . $e->getMessage(), 40200);
         }
     }
 
@@ -532,30 +884,57 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      */
     public function refund(array $order): array
     {
+        $refundNo = (string) $order['refund_no'];
+        $payNo = (string) $order['pay_no'];
+        $refundAmount = (int) $order['refund_amount'];
+        if ($refundAmount <= 0) {
+            throw new PaymentDefinitiveException('拉卡拉退款金额必须为正整数分', 40200);
+        }
+
         try {
-            $data = $this->client()->execute('/api/v3/labs/relation/refund', [
-                'merchant_no' => $this->configText('merchant_no'),
-                'term_no' => $this->configText('terminal_no'),
-                'out_trade_no' => (string) $order['refund_no'],
-                'refund_amount' => (string) (int) $order['refund_amount'],
-                'origin_out_trade_no' => (string) $order['pay_no'],
-                'origin_trade_no' => (string) ($order['chan_trade_no'] ?? ''),
-                'location_info' => [
-                    'request_ip' => (string) ($order['client_ip'] ?? ''),
-                ],
-            ]);
+            $data = $this->isLegacyProfile()
+                ? $this->client()->execute('/api/v3/labs/relation/refund', [
+                    'merchant_no' => $this->configText('merchant_no'),
+                    'term_no' => $this->configText('terminal_no'),
+                    'out_trade_no' => $refundNo,
+                    'refund_amount' => (string) $refundAmount,
+                    'origin_out_trade_no' => $payNo,
+                    'origin_trade_no' => (string) ($order['chan_trade_no'] ?? ''),
+                    'location_info' => [
+                        'request_ip' => $this->terminalIp($order),
+                    ],
+                ])
+                : $this->client()->labs(LakalaOpenApiClient::LABS_REFUND_PATH, array_filter([
+                    'mercId' => $this->configText('merchant_no'),
+                    'termNo' => $this->configText('terminal_no'),
+                    'refundOrderId' => $refundNo,
+                    'ornOrderId' => $payNo,
+                    'lklOrderNo' => (string) ($order['chan_trade_no'] ?? ''),
+                    'amount' => (string) $refundAmount,
+                ], static fn (mixed $value): bool => $value !== ''), $this->termExtInfo($order));
+
+            $responseCode = strtoupper((string) ($data['_response_code'] ?? ''));
+            if (in_array($responseCode, ['BBS10000', 'BPS10034', 'BBS11112', 'BBS00100', 'BBS00101'], true)) {
+                return [
+                    'status' => PaymentPluginStatusConstant::PENDING,
+                    'refund_no' => $refundNo,
+                    'pay_no' => $payNo,
+                    'refund_amount' => $refundAmount,
+                    'message' => '拉卡拉退款处理中，请使用同一退款单号查询或重试',
+                    'chan_refund_no' => (string) ($data['lklRefundOrderNo'] ?? $data['trade_no'] ?? $refundNo),
+                ];
+            }
 
             return [
-                'success' => true,
-                'msg' => '退款申请成功',
-                'chan_refund_no' => (string) ($data['trade_no'] ?? $order['refund_no']),
-                'raw_data' => $data,
+                'status' => PaymentPluginStatusConstant::SUCCESS,
+                'refund_no' => $refundNo,
+                'pay_no' => $payNo,
+                'refund_amount' => $refundAmount,
+                'message' => '退款申请成功',
+                'chan_refund_no' => (string) ($data['lklRefundOrderNo'] ?? $data['trade_no'] ?? $refundNo),
             ];
         } catch (LakalaSdkException $e) {
-            return [
-                'success' => false,
-                'msg' => $e->getMessage(),
-            ];
+            throw new PaymentUncertainException('拉卡拉退款失败：' . $e->getMessage(), 40200);
         }
     }
 
@@ -604,7 +983,10 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
             $data = $this->client()->mms(LakalaOpenApiClient::MMS_QUERY_PATH, [
                 'reqId' => 'Q' . date('YmdHis') . random_int(1000, 9999),
                 'version' => '1.0',
-                'orderNo' => (string) ($payload['onboarding_no'] ?? $payload['upstream_apply_id'] ?? ''),
+                'orderNo' => $this->firstText(
+                    $payload['upstream_apply_id'] ?? '',
+                    $this->mmsOrderNo((string) ($payload['onboarding_no'] ?? ''))
+                ),
                 'orgCode' => $this->orgCode(),
                 'contractId' => (string) ($payload['upstream_contract_id'] ?? $payload['contract_id'] ?? ''),
             ]);
@@ -649,23 +1031,61 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
             throw new PaymentException('拉卡拉回调报文不是合法 JSON', 40200);
         }
 
-        $outTradeNo = (string) ($data['out_trade_no'] ?? $data['out_order_no'] ?? '');
-        $tradeInfo = (array) ($data['order_trade_info'] ?? []);
-        $channelTradeNo = (string) ($data['trade_no'] ?? $tradeInfo['trade_no'] ?? $outTradeNo);
-        $channelStatus = (string) ($data['trade_status'] ?? $data['order_status'] ?? '');
+        $payload = (array) ($data['data'] ?? $data['respData'] ?? $data);
+        $outTradeNo = $this->firstText(
+            $payload['merchantOrderNo'] ?? '',
+            $payload['orderId'] ?? '',
+            $payload['out_trade_no'] ?? '',
+            $payload['out_order_no'] ?? ''
+        );
+        $tradeInfo = (array) ($payload['order_trade_info'] ?? []);
+        $channelTradeNo = $this->firstText(
+            $payload['payOrderNo'] ?? '',
+            $payload['lklOrderNo'] ?? '',
+            $payload['trade_no'] ?? '',
+            $tradeInfo['trade_no'] ?? ''
+        );
+        $channelStatus = $this->firstText(
+            $payload['payStatus'] ?? '',
+            $payload['tradeState'] ?? '',
+            $payload['trade_status'] ?? '',
+            $payload['order_status'] ?? ''
+        );
         $status = $this->notifyStatus($channelStatus);
 
         if ($outTradeNo === '') {
             throw new PaymentException('拉卡拉回调缺少商户订单号', 40200);
         }
+        if ($channelStatus === '') {
+            throw new PaymentException('拉卡拉回调缺少交易状态', 40200);
+        }
+
+        $paidAmount = $this->parseCentAmount($payload['amount'] ?? $payload['total_amount'] ?? null);
+        $currency = strtoupper($this->firstText(
+            $payload['currency'] ?? '',
+            $payload['currencyCode'] ?? '',
+            $payload['currency_code'] ?? ''
+        ));
+        if (!in_array($currency, ['156', 'CNY'], true)) {
+            throw new PaymentException('拉卡拉回调币种不是人民币', 40200, ['currency' => $currency]);
+        }
+        $identityPayload = array_replace($tradeInfo, $payload);
+        $this->assertNotifyMerchantIdentity($identityPayload);
+        if ($status === PaymentPluginStatusConstant::SUCCESS && $channelTradeNo === '') {
+            throw new PaymentException('拉卡拉成功通知缺少渠道交易号', 40200, ['pay_no' => $outTradeNo]);
+        }
 
         return [
             'status' => $status,
+            'pay_no' => $outTradeNo,
             'message' => $channelStatus,
-            'channel_order_no' => $outTradeNo,
-            'channel_trade_no' => $channelTradeNo !== '' ? $channelTradeNo : $outTradeNo,
+            'chan_order_no' => $outTradeNo,
+            'chan_trade_no' => $channelTradeNo,
             'channel_status' => $channelStatus,
-            'paid_at' => $status === PaymentPluginStatusConstant::SUCCESS ? ($data['pay_time'] ?? null) : null,
+            'paid_amount' => $paidAmount,
+            'paid_at' => $status === PaymentPluginStatusConstant::SUCCESS
+                ? ($payload['payTime'] ?? $payload['tradeTime'] ?? $payload['pay_time'] ?? null)
+                : null,
         ];
     }
 
@@ -692,11 +1112,18 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
         }
         // 官方进件通知把业务字段放在 data 下，兼容网关偶发的 respData 包裹。
         $payload = (array) ($data['data'] ?? $data['respData'] ?? $data['resp_data'] ?? $data);
+        $orderNo = $this->firstText($payload['orderNo'] ?? '', $payload['outOrderNo'] ?? '');
+        if ($orderNo === '') {
+            throw new PaymentException('拉卡拉进件回调缺少上游申请单号', 40200);
+        }
+        $notifyOrgCode = $this->firstText($payload['orgCode'] ?? '');
+        if ($notifyOrgCode === '' || !hash_equals($this->orgCode(), $notifyOrgCode)) {
+            throw new PaymentException('拉卡拉进件回调机构号不匹配', 40200);
+        }
 
         return [
-            'onboarding_no' => (string) ($payload['orderNo'] ?? $payload['outOrderNo'] ?? ''),
             'status' => $this->onboardingStatus((string) ($payload['contractStatus'] ?? $payload['status'] ?? 'pending')),
-            'upstream_apply_id' => (string) ($payload['orderNo'] ?? ''),
+            'upstream_apply_id' => $orderNo,
             'upstream_contract_id' => (string) ($payload['contractId'] ?? ''),
             'upstream_merchant_no' => (string) ($payload['merCupNo'] ?? $payload['merInnerNo'] ?? ''),
             'upstream_terminal_no' => $this->lakalaTerminalNo($payload),
@@ -752,6 +1179,7 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
             $data = $this->client()->mms(LakalaOpenApiClient::MMS_CARD_BIN_PATH, [
                 'reqId' => 'CB' . date('YmdHis') . random_int(1000, 9999),
                 'version' => '1.0',
+                'orderNo' => $this->mmsOrderNo('CB' . date('YmdHis') . hash('sha256', $cardNo)),
                 'orgCode' => $this->orgCode(),
                 'cardNo' => $cardNo,
             ]);
@@ -766,7 +1194,6 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
             'openning_bank_name' => (string) ($data['openningBankName'] ?? $data['openingBankName'] ?? $data['bankName'] ?? ''),
             'clearing_bank_code' => (string) ($data['clearingBankCode'] ?? $data['clearBankCode'] ?? ''),
             'bank_name' => (string) ($data['bankName'] ?? $data['openningBankName'] ?? ''),
-            'raw_data' => $data,
         ];
     }
 
@@ -775,7 +1202,12 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      */
     public function notifySuccess(): string|Response
     {
-        return 'success';
+        if ($this->isLegacyProfile()) {
+            return 'success';
+        }
+
+        return json_encode(['code' => 'SUCCESS', 'message' => '执行成功'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)
+            ?: '{"code":"SUCCESS","message":"执行成功"}';
     }
 
     /**
@@ -783,7 +1215,12 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      */
     public function notifyFail(): string|Response
     {
-        return 'fail';
+        if ($this->isLegacyProfile()) {
+            return 'fail';
+        }
+
+        return json_encode(['code' => 'FAIL', 'message' => '执行失败'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)
+            ?: '{"code":"FAIL","message":"执行失败"}';
     }
 
     /**
@@ -806,74 +1243,134 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      * 聚合预下单。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @param string $product 插件产品
+     * @param string $product 平台产品编码
      * @param string $accountType 拉卡拉账户类型
      * @param string $transType 拉卡拉交易类型
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付结果
      */
     private function preorder(array $order, string $product, string $accountType, string $transType): array
     {
         $this->ensureProduct($product);
+        $amount = (int) ($order['amount'] ?? 0);
+        if ($amount <= 0) {
+            throw new PaymentException('拉卡拉支付金额必须为正整数分', 40200);
+        }
 
-        $payload = [
+        $legacyPayload = [
             'merchant_no' => $this->configText('merchant_no'),
             'term_no' => $this->configText('terminal_no'),
             'out_trade_no' => (string) $order['pay_no'],
             'account_type' => $accountType,
             'trans_type' => $transType,
-            'total_amount' => (string) (int) $order['amount'],
+            'total_amount' => (string) $amount,
             'location_info' => [
-                'request_ip' => (string) $order['client_ip'],
+                'request_ip' => $this->terminalIp($order),
             ],
             'subject' => mb_strcut((string) $order['subject'], 0, 127, 'UTF-8'),
             'notify_url' => (string) $order['callback_url'],
         ];
 
-        $extend = $this->identityFields($order);
+        $extend = $this->identityFields($order, $product);
         if ($extend !== []) {
-            $payload['acc_busi_fields'] = $extend;
+            $legacyPayload['acc_busi_fields'] = $extend;
         }
 
         try {
-            $data = $this->client()->execute('/api/v3/labs/trans/preorder', $payload);
+            if ($this->isLegacyProfile()) {
+                $data = $this->client()->execute('/api/v3/labs/trans/preorder', $legacyPayload);
+            } else {
+                $officialPayload = [
+                    'mercId' => $this->configText('merchant_no'),
+                    'termNo' => $this->configText('terminal_no'),
+                    'payMode' => $accountType,
+                    'amount' => (string) $amount,
+                    'spbillCreateIp' => $this->terminalIp($order),
+                    'transType' => $transType,
+                    'orderId' => (string) $order['pay_no'],
+                    'subject' => mb_strcut((string) $order['subject'], 0, 127, 'UTF-8'),
+                ];
+                if ($this->configText('external_order_source') !== '') {
+                    $officialPayload['exterOrderSource'] = $this->configText('external_order_source');
+                    $officialPayload['exterMerOrderNo'] = (string) $order['pay_no'];
+                }
+                if ($extend !== []) {
+                    $officialPayload['openId'] = (string) $extend['user_id'];
+                    $officialPayload['appId'] = (string) ($extend['sub_appid'] ?? '');
+                }
+                if ($product === self::PRODUCT_BANK_JSAPI && trim((string) ($order['return_url'] ?? '')) !== '') {
+                    $officialPayload['frontUrl'] = (string) $order['return_url'];
+                    $officialPayload['frontFailUrl'] = (string) $order['return_url'];
+                }
+                $officialPayload = array_filter($officialPayload, static fn (mixed $value): bool => $value !== '');
+                $data = $this->client()->labs(
+                    LakalaOpenApiClient::LABS_PREORDER_PATH,
+                    $officialPayload,
+                    $this->termExtInfo($order)
+                );
+            }
         } catch (LakalaSdkException $e) {
             throw new PaymentException('拉卡拉下单失败：' . $e->getMessage(), 40200);
         }
 
-        $fields = (array) ($data['acc_resp_fields'] ?? []);
-        $payPage = str_ends_with($product, '_jsapi') ? 'jsapi' : 'qrcode';
-        $payParams = $payPage === 'jsapi'
-            ? array_replace($fields, ['raw' => $data])
-            : [
-                'qrcode' => (string) ($fields['code'] ?? $fields['redirect_url'] ?? ''),
-                'raw' => $data,
-            ];
+        $fields = $this->isLegacyProfile() ? (array) ($data['acc_resp_fields'] ?? []) : $data;
+        $payPage = match ($product) {
+            self::PRODUCT_ALIPAY_JSAPI, self::PRODUCT_WXPAY_JSAPI => 'jsapi',
+            self::PRODUCT_WXPAY_MINI => 'page',
+            self::PRODUCT_BANK_JSAPI => 'jump',
+            default => 'qrcode',
+        };
+        $payParams = match ($payPage) {
+            'jsapi' => $this->jsapiPresentation($fields, (string) $order['pay_type_code']),
+            'page' => [
+                '_page' => 'wechatMini',
+                'request_payment' => $this->jsapiPresentation($fields, 'wxpay'),
+                'app_id' => $this->configText('wx_mini_app_id'),
+                'description' => '小程序支付参数已生成，请在小程序容器中调用 wx.requestPayment。',
+            ],
+            'jump' => ['url' => $this->firstText($fields['redirectUrl'] ?? '', $fields['redirect_url'] ?? '', $fields['codeUrl'] ?? '')],
+            default => ['qrcode' => $this->firstText(
+                $fields['codeUrl'] ?? '',
+                $fields['qrCode'] ?? '',
+                $fields['code'] ?? '',
+                $fields['redirect_url'] ?? ''
+            )],
+        };
 
-        if ($payPage === 'qrcode' && $payParams['qrcode'] === '') {
-            throw new PaymentException('拉卡拉未返回二维码内容', 40200, ['response' => $data]);
+        if (($payPage === 'qrcode' && ($payParams['qrcode'] ?? '') === '')
+            || ($payPage === 'jump' && ($payParams['url'] ?? '') === '')
+            || ($payPage === 'jsapi' && $payParams === [])
+            || ($payPage === 'page' && ($payParams['request_payment'] ?? []) === [])
+        ) {
+            throw new PaymentException('拉卡拉未返回可用的支付参数', 40200, [
+                'response_code' => (string) ($data['_response_code'] ?? ''),
+                'product' => $product,
+            ]);
         }
 
-        return [
+        return $this->pendingPaymentResult($order, [
             'pay_page' => $payPage,
             'pay_type' => (string) $order['pay_type_code'],
             'pay_product' => $product,
             'pay_action' => 'preorder',
             'pay_params' => $payParams,
             'chan_order_no' => (string) $order['pay_no'],
-            'chan_trade_no' => (string) ($data['trade_no'] ?? ''),
-        ];
+            'chan_trade_no' => $this->firstText($data['lklOrderId'] ?? '', $data['lklOrderNo'] ?? '', $data['trade_no'] ?? ''),
+        ]);
     }
 
     /**
      * 聚合收银台下单。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @param string $payType 支付方式
-     * @return array<string, mixed>
+     * @param string $payType 平台支付方式编码
+     * @return array<string, mixed> 标准支付结果
      */
     private function cashierPay(array $order, string $payType): array
     {
         $this->ensureProduct(self::PRODUCT_CASHIER);
+        if (!$this->isLegacyProfile()) {
+            throw new PaymentException('当前公开 LABS 协议不提供彩虹私有 CCSS 收银台', 40200);
+        }
 
         $payMode = match ($payType) {
             'wxpay' => 'WECHAT',
@@ -899,29 +1396,28 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
 
         $url = (string) ($data['counter_url'] ?? '');
         if ($url === '') {
-            throw new PaymentException('拉卡拉收银台未返回支付地址', 40200, ['response' => $data]);
+            throw new PaymentException('拉卡拉收银台未返回支付地址', 40200, [
+                'response_code' => (string) ($data['_response_code'] ?? ''),
+            ]);
         }
 
-        return [
+        return $this->pendingPaymentResult($order, [
             'pay_page' => 'jump',
             'pay_type' => $payType,
             'pay_product' => self::PRODUCT_CASHIER,
             'pay_action' => 'cashierPay',
-            'pay_params' => [
-                'url' => $url,
-                'raw' => $data,
-            ],
+            'pay_params' => ['url' => $url],
             'chan_order_no' => (string) $order['pay_no'],
             'chan_trade_no' => (string) ($data['pay_order_no'] ?? ''),
-        ];
+        ]);
     }
 
     /**
      * 付款码支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @param string $payType 支付方式
-     * @return array<string, mixed>
+     * @param string $payType 平台支付方式编码
+     * @return array<string, mixed> 标准支付结果
      */
     private function micropay(array $order, string $payType): array
     {
@@ -933,54 +1429,99 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
         }
 
         try {
-            $data = $this->client()->execute('/api/v3/labs/trans/micropay', [
-                'merchant_no' => $this->configText('merchant_no'),
-                'term_no' => $this->configText('terminal_no'),
-                'out_trade_no' => (string) $order['pay_no'],
-                'auth_code' => $authCode,
-                'total_amount' => (string) (int) $order['amount'],
-                'location_info' => [
-                    'request_ip' => (string) $order['client_ip'],
-                ],
-                'subject' => mb_strcut((string) $order['subject'], 0, 127, 'UTF-8'),
-                'notify_url' => (string) $order['callback_url'],
-            ]);
+            $data = $this->isLegacyProfile()
+                ? $this->client()->execute('/api/v3/labs/trans/micropay', [
+                    'merchant_no' => $this->configText('merchant_no'),
+                    'term_no' => $this->configText('terminal_no'),
+                    'out_trade_no' => (string) $order['pay_no'],
+                    'auth_code' => $authCode,
+                    'total_amount' => (string) (int) $order['amount'],
+                    'location_info' => [
+                        'request_ip' => $this->terminalIp($order),
+                    ],
+                    'subject' => mb_strcut((string) $order['subject'], 0, 127, 'UTF-8'),
+                    'notify_url' => (string) $order['callback_url'],
+                ])
+                : $this->client()->labs(LakalaOpenApiClient::LABS_MICROPAY_PATH, [
+                    'mercId' => $this->configText('merchant_no'),
+                    'termNo' => $this->configText('terminal_no'),
+                    'payMode' => match ($payType) {
+                        'wxpay' => 'WECHAT',
+                        'bank' => 'UQRCODEPAY',
+                        default => 'ALIPAY',
+                    },
+                    'authCode' => $authCode,
+                    'amount' => (string) (int) $order['amount'],
+                    'orderId' => (string) $order['pay_no'],
+                    'subject' => mb_strcut((string) $order['subject'], 0, 127, 'UTF-8'),
+                ], $this->termExtInfo($order));
         } catch (LakalaSdkException $e) {
             throw new PaymentException('拉卡拉付款码支付失败：' . $e->getMessage(), 40200);
         }
 
-        $status = strtoupper((string) ($data['trade_state'] ?? ''));
+        $responseCode = strtoupper((string) ($data['_response_code'] ?? ''));
+        $status = strtoupper((string) ($data['tradeState'] ?? $data['trade_state'] ?? ''));
+        if ($status === '') {
+            $status = in_array($responseCode, ['000000', 'BBS00000'], true) ? 'SUCCESS' : 'UNKNOWN';
+        }
+        $mappedStatus = $this->tradeStatus($status);
+        if (in_array($mappedStatus, [PaymentPluginStatusConstant::FAILED, PaymentPluginStatusConstant::CLOSED], true)) {
+            throw new PaymentException('拉卡拉付款码支付失败：' . ($data['tradeStateDesc'] ?? $data['trade_state_desc'] ?? $status), 40200, [
+                'channel_status' => $status,
+            ]);
+        }
 
-        return [
-            'pay_page' => $status === 'SUCCESS' ? 'ok' : 'page',
+        return $this->pendingPaymentResult($order, [
+            // 插件不直接推进订单；即使同步明确成功，也等待标准通知/查单链路确认后再展示支付成功。
+            'pay_page' => 'page',
             'pay_type' => $payType,
             'pay_product' => self::PRODUCT_MICROPAY,
             'pay_action' => 'micropay',
             'pay_params' => [
-                '_page' => 'ok',
-                'raw' => $data,
+                '_page' => 'paymentPending',
+                'status' => $mappedStatus,
+                'channel_status' => $status,
+                'query_required' => $mappedStatus !== PaymentPluginStatusConstant::SUCCESS,
+                'description' => $mappedStatus === PaymentPluginStatusConstant::SUCCESS
+                    ? '拉卡拉已受理并返回成功，正在等待平台查单或通知确认。'
+                    : '付款码支付处理中，请勿重复收款；平台将继续查单，必要时可撤销。',
             ],
             'chan_order_no' => (string) $order['pay_no'],
-            'chan_trade_no' => (string) ($data['trade_no'] ?? ''),
-        ];
+            'chan_trade_no' => $this->firstText($data['lklOrderId'] ?? '', $data['lklOrderNo'] ?? '', $data['trade_no'] ?? ''),
+        ]);
     }
 
     /**
      * 构造 JSAPI 身份参数。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @param string $product 平台产品编码
+     * @return array<string, mixed> 渠道身份字段
      */
-    private function identityFields(array $order): array
+    private function identityFields(array $order, string $product): array
     {
         $payment = (array) ($order['extra']['payment'] ?? []);
-        $userId = (string) ($payment['buyer_id'] ?? $payment['mini_openid'] ?? $payment['openid'] ?? $payment['sub_openid'] ?? '');
-        if ($userId === '') {
+        $userId = match ($product) {
+            self::PRODUCT_ALIPAY_JSAPI => $this->firstText($payment['buyer_id'] ?? '', $payment['buyer_open_id'] ?? ''),
+            self::PRODUCT_WXPAY_JSAPI => $this->firstText($payment['openid'] ?? '', $payment['sub_openid'] ?? ''),
+            self::PRODUCT_WXPAY_MINI => $this->firstText($payment['mini_openid'] ?? ''),
+            self::PRODUCT_BANK_JSAPI => $this->firstText($payment['buyer_id'] ?? '', $payment['sub_openid'] ?? ''),
+            default => '',
+        };
+        if (!str_ends_with($product, '_jsapi') && $product !== self::PRODUCT_WXPAY_MINI) {
             return [];
+        }
+        if ($userId === '') {
+            throw new PaymentException('拉卡拉 ' . $product . ' 缺少用户标识', 40200, ['product' => $product]);
         }
 
         $fields = ['user_id' => $userId];
-        $subAppId = (string) ($payment['sub_appid'] ?? '');
+        $subAppId = match ($product) {
+            self::PRODUCT_ALIPAY_JSAPI => $this->firstText($payment['sub_appid'] ?? '', $this->configText('alipay_app_id')),
+            self::PRODUCT_WXPAY_JSAPI => $this->firstText($payment['sub_appid'] ?? '', $this->configText('wx_mp_app_id')),
+            self::PRODUCT_WXPAY_MINI => $this->firstText($payment['sub_appid'] ?? '', $this->configText('wx_mini_app_id')),
+            default => $this->firstText($payment['sub_appid'] ?? ''),
+        };
         if ($subAppId !== '') {
             $fields['sub_appid'] = $subAppId;
         }
@@ -999,7 +1540,7 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
         $form = (array) ($payload['form_data'] ?? []);
         $request = [
             'version' => '1.0',
-            'orderNo' => (string) ($payload['onboarding_no'] ?? ''),
+            'orderNo' => $this->mmsOrderNo((string) ($payload['onboarding_no'] ?? '')),
             'posType' => $this->formText($form, 'pos_type') ?: 'GENERAL_POS',
             'termNum' => $this->formText($form, 'term_num'),
             'orgCode' => $this->orgCode(),
@@ -1064,6 +1605,7 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      *
      * @param array<string, mixed> $request 上游 reqData
      * @param string $subjectType 平台主体类型
+     * @return void
      */
     private function assertLakalaAddMerPayload(array $request, string $subjectType): void
     {
@@ -1123,6 +1665,7 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      * 调用官方进件校验接口。
      *
      * @param array<string, mixed> $request addMer reqData
+     * @return void
      * @throws LakalaSdkException
      */
     private function verifyLakalaContractInfo(array $request): void
@@ -1189,7 +1732,8 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      * 拉卡拉官方附件枚举映射。
      *
      * @param array<string, mixed> $form 表单数据
-     * @return array<int, array{field: string, attType: string, title: string, required: bool}>
+     * @param string $subjectType 平台主体类型
+     * @return array<int, array{field: string, attType: string, title: string, required: bool}> 附件字段定义
      */
     private function lakalaAttachmentDefinitions(array $form, string $subjectType): array
     {
@@ -1245,6 +1789,9 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
 
     /**
      * 解析上传组件可能返回的 URL、object_key、response 或列表结构。
+     *
+     * @param mixed $value 上传组件回填值
+     * @return string 文件引用；无法识别时返回空字符串
      */
     private function uploadFieldValue(mixed $value): string
     {
@@ -1282,7 +1829,10 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     }
 
     /**
-     * 将公开上传 URL 或 object_key 转成本机文件路径。
+     * 将绝对路径、上传 URL 路径或 object_key 解析为现有本机文件。
+     *
+     * @param string $path 文件引用
+     * @return string 本机文件路径；无法解析时返回空字符串
      */
     private function resolveLocalUploadPath(string $path): string
     {
@@ -1315,9 +1865,10 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     }
 
     /**
-     * 远程公开 URL 附件兜底下载。
+     * 下载远程 HTTP(S) URL 附件。
      *
-     * @return array{content: string, ext: string}
+     * @param string $url 远程附件地址
+     * @return array{content: string, ext: string} 附件内容和扩展名
      */
     private function downloadRemoteUpload(string $url): array
     {
@@ -1346,7 +1897,10 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     }
 
     /**
-     * 校验附件大小。
+     * 校验附件内容与大小。
+     *
+     * @param string $content 附件内容
+     * @return string 已校验附件内容
      */
     private function assertOnboardingUploadContent(string $content): string
     {
@@ -1362,6 +1916,9 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
 
     /**
      * 归一化官方允许的附件后缀。
+     *
+     * @param string $ext 附件扩展名
+     * @return string 规范扩展名
      */
     private function normalizeUploadExt(string $ext): string
     {
@@ -1379,7 +1936,7 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      *
      * @param array<string, mixed> $form 表单数据
      * @param array<string, mixed> $rateConfig 后台预设费率
-     * @return array<string, mixed>
+     * @return array<string, mixed> 官方 feeData 明细
      */
     private function lakalaFeeData(array $form, array $rateConfig): array
     {
@@ -1399,7 +1956,8 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      *
      * @param array<string, mixed> $data 上游响应业务数据
      * @param array<string, mixed> $payload 标准进件上下文
-     * @return array<string, mixed>
+     * @param string $defaultMessage 默认状态说明
+     * @return array<string, mixed> 标准进件结果
      */
     private function standardOnboardingResult(array $data, array $payload, string $defaultMessage): array
     {
@@ -1408,7 +1966,11 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
         return [
             'success' => true,
             'status' => $this->onboardingStatus($status),
-            'upstream_apply_id' => (string) ($data['orderNo'] ?? $payload['onboarding_no'] ?? ''),
+            'upstream_apply_id' => $this->firstText(
+                $data['orderNo'] ?? '',
+                $payload['upstream_apply_id'] ?? '',
+                $this->mmsOrderNo((string) ($payload['onboarding_no'] ?? ''))
+            ),
             'upstream_contract_id' => (string) ($data['contractId'] ?? $payload['upstream_contract_id'] ?? ''),
             'upstream_merchant_no' => (string) ($data['merCupNo'] ?? $data['merInnerNo'] ?? $data['merchantNo'] ?? ''),
             'upstream_terminal_no' => $this->lakalaTerminalNo($data),
@@ -1421,6 +1983,8 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      * 读取表单字符串。
      *
      * @param array<string, mixed> $form 表单数据
+     * @param string $key 字段名
+     * @return string 字段值
      */
     private function formText(array $form, string $key): string
     {
@@ -1437,6 +2001,8 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      * 读取日期字段，统一裁剪为 yyyy-MM-dd。
      *
      * @param array<string, mixed> $form 表单数据
+     * @param string $key 字段名
+     * @return string 日期；空值时返回空字符串
      */
     private function dateText(array $form, string $key): string
     {
@@ -1450,6 +2016,9 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
 
     /**
      * 判断普通字段是否为空。
+     *
+     * @param mixed $value 字段值
+     * @return bool 是否为空
      */
     private function isBlank(mixed $value): bool
     {
@@ -1468,6 +2037,9 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
 
     /**
      * 判断上传字段是否为空。
+     *
+     * @param mixed $value 上传组件回填值
+     * @return bool 是否为空
      */
     private function isEmptyUploadValue(mixed $value): bool
     {
@@ -1478,6 +2050,7 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      * 判断结算人是否同法人。
      *
      * @param array<string, mixed> $form 表单数据
+     * @return bool 结算人是否同法人
      */
     private function settlementSameAsLegal(array $form): bool
     {
@@ -1513,6 +2086,8 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
 
     /**
      * 获取拉卡拉机构号。
+     *
+     * @return string 机构号
      */
     private function orgCode(): string
     {
@@ -1528,6 +2103,7 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      * 从拉卡拉响应里提取终端号。
      *
      * @param array<string, mixed> $data 上游响应或回调数据
+     * @return string 终端号
      */
     private function lakalaTerminalNo(array $data): string
     {
@@ -1538,7 +2114,7 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
             }
         }
 
-        $termInfo = $data['termInfo'] ?? $data['termList'] ?? [];
+        $termInfo = $data['termDatas'] ?? $data['termInfo'] ?? $data['termList'] ?? [];
         if (is_array($termInfo)) {
             $keys = array_keys($termInfo);
             $first = $keys === range(0, count($termInfo) - 1) ? ($termInfo[0] ?? []) : $termInfo;
@@ -1557,6 +2133,9 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
 
     /**
      * 脱敏银行卡号。
+     *
+     * @param string $cardNo 银行卡号
+     * @return string 脱敏银行卡号
      */
     private function maskCardNo(string $cardNo): string
     {
@@ -1569,7 +2148,27 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     }
 
     /**
+     * 生成官方 MMS 要求的 22 位数字单号（14 位时间 + 8 位数字尾码）。
+     *
+     * 平台进件单号中的时间段保持不变，尾码由完整本地单号稳定派生，重试时不会换单号。
+     *
+     * @param string $source 平台进件单号
+     * @return string 22 位 MMS 单号
+     */
+    private function mmsOrderNo(string $source): string
+    {
+        $digits = preg_replace('/\D+/', '', $source) ?: '';
+        $timestamp = strlen($digits) >= 14 ? substr($digits, 0, 14) : date('YmdHis');
+        $hashDigits = str_pad(sprintf('%u', crc32($source)), 10, '0', STR_PAD_LEFT);
+
+        return $timestamp . substr($hashDigits, -8);
+    }
+
+    /**
      * 映射进件状态为平台标准字符串。
+     *
+     * @param string $status 拉卡拉进件状态
+     * @return string 平台进件状态
      */
     private function onboardingStatus(string $status): string
     {
@@ -1585,9 +2184,11 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     }
 
     /**
-     * 获取 SDK 客户端。
+     * 获取当前通道的 SDK 客户端。
+     *
+     * @return LakalaOpenApiClient
      */
-    private function client(): LakalaOpenApiClient
+    protected function client(): LakalaOpenApiClient
     {
         if ($this->client === null) {
             $this->client = new LakalaOpenApiClient([
@@ -1599,6 +2200,7 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
                 'merchant_private_key_path' => $this->uploadedPrivateFilePath($this->configText('merchant_private_key_path')),
                 'sandbox' => $this->configBool('sandbox'),
                 'api_base_url' => $this->configText('api_base_url'),
+                'verify_legacy_response_signature' => $this->configBool('verify_legacy_response_signature'),
             ]);
         }
 
@@ -1606,7 +2208,12 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     }
 
     /**
-     * 将上传组件保存的 object_key 转为可读本机路径。
+     * 将证书路径配置转换为本机路径。
+     *
+     * 已配置绝对路径直接归一化目录分隔符；相对 object_key 按 runtime 目录解析。
+     *
+     * @param string $path 证书路径或 object_key
+     * @return string 本机证书路径
      */
     private function uploadedPrivateFilePath(string $path): string
     {
@@ -1672,6 +2279,9 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
 
     /**
      * 判断产品是否启用。
+     *
+     * @param string $product 平台产品编码
+     * @return bool 是否启用
      */
     private function productEnabled(string $product): bool
     {
@@ -1680,6 +2290,9 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
 
     /**
      * 校验产品是否启用。
+     *
+     * @param string $product 平台产品编码
+     * @return void
      */
     private function ensureProduct(string $product): void
     {
@@ -1712,33 +2325,243 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
 
     /**
      * 映射查单状态。
+     *
+     * @param string $status 拉卡拉交易状态
+     * @return string 平台支付状态
      */
     private function tradeStatus(string $status): string
     {
         return match (strtoupper($status)) {
-            'SUCCESS' => PaymentPluginStatusConstant::SUCCESS,
-            'CLOSED', 'REVOKED', 'FAIL', 'FAILED' => PaymentPluginStatusConstant::FAILED,
+            'SUCCESS', 'PART_REFUND', 'REFUND', '2', 'S' => PaymentPluginStatusConstant::SUCCESS,
+            'CLOSE', 'CLOSED', 'REVOKED', '3', 'C' => PaymentPluginStatusConstant::CLOSED,
+            'FAIL', 'FAILED', 'F' => PaymentPluginStatusConstant::FAILED,
             default => PaymentPluginStatusConstant::PENDING,
         };
     }
 
     /**
      * 映射通知状态。
+     *
+     * @param string $status 拉卡拉通知状态
+     * @return string 平台支付状态
      */
     private function notifyStatus(string $status): string
     {
         $status = strtoupper($status);
-        if ($status === 'SUCCESS' || $status === '2') {
+        if (in_array($status, ['SUCCESS', 'S', '2'], true)) {
             return PaymentPluginStatusConstant::SUCCESS;
         }
 
-        return in_array($status, ['CLOSED', 'REVOKED', 'FAIL', 'FAILED', '3'], true)
+        return in_array($status, ['C', 'CLOSE', 'CLOSED', 'REVOKED', 'FAIL', 'FAILED', 'F', '3'], true)
             ? PaymentPluginStatusConstant::FAILED
             : PaymentPluginStatusConstant::PENDING;
     }
 
     /**
+     * 获取支付接口协议 profile。
+     *
+     * @return string 协议 profile
+     */
+    private function paymentProfile(): string
+    {
+        return strtolower($this->configText('payment_api_profile') ?: self::PROFILE_OFFICIAL_LABS_V1);
+    }
+
+    private function isLegacyProfile(): bool
+    {
+        return $this->paymentProfile() === self::PROFILE_RAINBOW_V3;
+    }
+
+    /**
+     * 构造公开 LABS 所需的终端扩展信息。
+     *
+     * @param array<string, mixed> $order 插件动作参数
+     * @return array<string, string>
+     */
+    private function termExtInfo(array $order): array
+    {
+        $location = $this->configText('terminal_location');
+        if ($location !== '') {
+            return ['termLoc' => $location];
+        }
+
+        return ['termIp' => $this->terminalIp($order)];
+    }
+
+    /**
+     * 支付时优先使用真实客户端 IP，后台动作使用通道终端 IP。
+     *
+     * @param array<string, mixed> $order 插件动作参数
+     * @return string 合法终端 IP
+     */
+    private function terminalIp(array $order): string
+    {
+        $ip = $this->firstText($order['client_ip'] ?? '', $this->configText('terminal_ip'));
+        if ($ip === '' || filter_var($ip, FILTER_VALIDATE_IP) === false) {
+            throw new PaymentException('拉卡拉 LABS 请求缺少合法终端 IP', 40200);
+        }
+
+        return $ip;
+    }
+
+    /**
+     * 关系单号使用原单号稳定派生，保证重试不会生成新的撤销请求。
+     *
+     * @param string $prefix 关系单号前缀
+     * @param string $payNo 原支付单号
+     * @return string 稳定关系单号
+     */
+    private function relationOrderNo(string $prefix, string $payNo): string
+    {
+        return strtoupper(substr($prefix, 0, 1)) . substr(hash('sha256', $payNo), 0, 30);
+    }
+
+    /**
+     * 从关单动作携带的展示快照读取原支付产品。
+     *
+     * @param array<string, mixed> $order 关单参数
+     * @return string 原支付产品
+     */
+    private function orderPayProduct(array $order): string
+    {
+        $product = trim((string) ($order['pay_product'] ?? ''));
+        if ($product === '') {
+            throw new PaymentException('拉卡拉后续操作缺少原支付产品', 40200);
+        }
+
+        return $product;
+    }
+
+    /**
+     * 只向收银台输出实际调起所需的白名单字段。
+     *
+     * @param array<string, mixed> $fields 拉卡拉响应支付字段
+     * @param string $payType 平台支付方式编码
+     * @return array<string, string> 前端调起白名单字段
+     */
+    private function jsapiPresentation(array $fields, string $payType): array
+    {
+        if ($payType === 'alipay') {
+            $tradeNo = $this->firstText(
+                $fields['tradeNO'] ?? '',
+                $fields['tradeNo'] ?? '',
+                $fields['prepayId'] ?? '',
+                $fields['prepay_id'] ?? ''
+            );
+
+            return $tradeNo === '' ? [] : ['tradeNO' => $tradeNo];
+        }
+
+        $aliases = [
+            'appId' => ['appId', 'app_id'],
+            'timeStamp' => ['timeStamp', 'time_stamp'],
+            'nonceStr' => ['nonceStr', 'nonce_str'],
+            'package' => ['package'],
+            'paySign' => ['paySign', 'pay_sign'],
+            'signType' => ['signType', 'sign_type'],
+        ];
+        $result = [];
+        foreach ($aliases as $target => $sources) {
+            $values = [];
+            foreach ($sources as $source) {
+                $values[] = $fields[$source] ?? '';
+            }
+            $value = $this->firstText(...$values);
+            if ($value !== '') {
+                $result[$target] = $value;
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * 回调金额必须是无符号整数分，禁止小数和隐式元/分换算。
+     *
+     * @param mixed $value 回调金额
+     * @return int 金额，单位分
+     */
+    private function parseCentAmount(mixed $value): int
+    {
+        if (is_int($value) && $value >= 0) {
+            return $value;
+        }
+        if (!is_string($value) || preg_match('/^\d+$/', $value) !== 1) {
+            throw new PaymentException('拉卡拉回调金额必须是整数分', 40200);
+        }
+
+        return (int) $value;
+    }
+
+    /**
+     * 回调必须携带并匹配当前通道配置的商户、交易商户和终端身份。
+     *
+     * @param array<string, mixed> $payload 拉卡拉通知体
+     * @return void
+     */
+    private function assertNotifyMerchantIdentity(array $payload): void
+    {
+        $merchantNo = $this->firstText($payload['merchantNo'] ?? '', $payload['mercId'] ?? '', $payload['merchant_no'] ?? '');
+        $tradeMerchantNo = $this->firstText($payload['tradeMerchantNo'] ?? '', $payload['sub_merchant_no'] ?? '');
+        $terminalNo = $this->firstText($payload['termId'] ?? '', $payload['termNo'] ?? '', $payload['term_no'] ?? '');
+        $tradeTerminalNo = $this->firstText($payload['tradeTermId'] ?? '', $payload['trade_term_no'] ?? '');
+        $expectedMerchant = $this->configText('merchant_no');
+        $expectedTradeMerchant = $this->configText('sub_merchant_no') ?: $expectedMerchant;
+        $expectedTerminal = $this->configText('terminal_no');
+        $expectedTradeTerminal = $this->configText('trade_terminal_no') ?: $expectedTerminal;
+
+        if ($merchantNo === '' && $tradeMerchantNo === '') {
+            throw new PaymentException('拉卡拉回调缺少商户身份', 40200);
+        }
+        if ($merchantNo !== '' && !hash_equals($expectedMerchant, $merchantNo)) {
+            throw new PaymentException('拉卡拉回调商户号不匹配', 40200);
+        }
+        if ($tradeMerchantNo !== '' && !hash_equals($expectedTradeMerchant, $tradeMerchantNo)) {
+            throw new PaymentException('拉卡拉回调交易商户号不匹配', 40200);
+        }
+        if ($this->configText('sub_merchant_no') !== '' && $tradeMerchantNo === '') {
+            throw new PaymentException('拉卡拉回调缺少交易子商户号', 40200);
+        }
+        if ($terminalNo === '' && $tradeTerminalNo === '') {
+            throw new PaymentException('拉卡拉回调缺少终端号', 40200);
+        }
+        if ($terminalNo !== '' && !hash_equals($expectedTerminal, $terminalNo)) {
+            throw new PaymentException('拉卡拉回调终端号不匹配', 40200);
+        }
+        if ($tradeTerminalNo !== '' && !hash_equals($expectedTradeTerminal, $tradeTerminalNo)) {
+            throw new PaymentException('拉卡拉回调交易终端号不匹配', 40200);
+        }
+        if ($this->configText('trade_terminal_no') !== '' && $tradeTerminalNo === '') {
+            throw new PaymentException('拉卡拉回调缺少交易终端号', 40200);
+        }
+    }
+
+    /**
+     * 返回第一个非空标量文本。
+     *
+     * @param mixed ...$values 候选值
+     * @return string 首个非空文本
+     */
+    private function firstText(mixed ...$values): string
+    {
+        foreach ($values as $value) {
+            if (!is_scalar($value) && !$value instanceof \Stringable) {
+                continue;
+            }
+            $text = trim((string) $value);
+            if ($text !== '') {
+                return $text;
+            }
+        }
+
+        return '';
+    }
+
+    /**
      * 获取字符串配置。
+     *
+     * @param string $key 配置键
+     * @return string 配置值
      */
     private function configText(string $key): string
     {
@@ -1747,6 +2570,9 @@ class LakalaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
 
     /**
      * 获取布尔配置。
+     *
+     * @param string $key 配置键
+     * @return bool 配置值
      */
     private function configBool(string $key): bool
     {

@@ -38,7 +38,7 @@ class MerchantPortalController extends BaseController
     {
         $merchantId = $this->currentMerchantId($request);
         if ($merchantId <= 0) {
-            return $this->fail('未获取到当前商户信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         return $this->success($this->merchantPortalService->profile($merchantId));
@@ -54,7 +54,7 @@ class MerchantPortalController extends BaseController
     {
         $merchantId = $this->currentMerchantId($request);
         if ($merchantId <= 0) {
-            return $this->fail('未获取到当前商户信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         $data = $this->validated($this->payload($request), MerchantPortalValidator::class, 'profileUpdate');
@@ -72,7 +72,7 @@ class MerchantPortalController extends BaseController
     {
         $merchantId = $this->currentMerchantId($request);
         if ($merchantId <= 0) {
-            return $this->fail('未获取到当前商户信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         $data = $this->validated($this->payload($request), MerchantPortalValidator::class, 'passwordUpdate');
@@ -90,7 +90,7 @@ class MerchantPortalController extends BaseController
     {
         $merchantId = $this->currentMerchantId($request);
         if ($merchantId <= 0) {
-            return $this->fail('未获取到当前商户信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         $payload = $this->payload($request);
@@ -109,7 +109,7 @@ class MerchantPortalController extends BaseController
     {
         $merchantId = $this->currentMerchantId($request);
         if ($merchantId <= 0) {
-            return $this->fail('未获取到当前商户信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         $data = $this->validated($this->payload($request), MerchantPortalValidator::class, 'channelStore');
@@ -121,7 +121,7 @@ class MerchantPortalController extends BaseController
     {
         $merchantId = $this->currentMerchantId($request);
         if ($merchantId <= 0) {
-            return $this->fail('未获取到当前商户信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         $data = $this->validated(
@@ -142,7 +142,7 @@ class MerchantPortalController extends BaseController
     {
         $merchantId = $this->currentMerchantId($request);
         if ($merchantId <= 0) {
-            return $this->fail('未获取到当前商户信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         $data = $this->validated(['id' => (int) $id], MerchantPortalValidator::class, 'channelDestroy');
@@ -164,7 +164,7 @@ class MerchantPortalController extends BaseController
     {
         $merchantId = $this->currentMerchantId($request);
         if ($merchantId <= 0) {
-            return $this->fail('未获取到当前商户信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         $data = $this->validated(
@@ -189,7 +189,7 @@ class MerchantPortalController extends BaseController
     {
         $merchantId = $this->currentMerchantId($request);
         if ($merchantId <= 0) {
-            return $this->fail('未获取到当前商户信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         $payload = $this->validated(
@@ -207,7 +207,7 @@ class MerchantPortalController extends BaseController
     {
         $merchantId = $this->currentMerchantId($request);
         if ($merchantId <= 0) {
-            return $this->fail('未获取到当前商户信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         $payload = $this->validated($this->payload($request), MerchantPortalValidator::class, 'pluginConfigIndex');
@@ -221,7 +221,7 @@ class MerchantPortalController extends BaseController
     {
         $merchantId = $this->currentMerchantId($request);
         if ($merchantId <= 0) {
-            return $this->fail('未获取到当前商户信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         $data = $this->validated(['id' => (int) $id], MerchantPortalValidator::class, 'pluginConfigShow');
@@ -237,7 +237,7 @@ class MerchantPortalController extends BaseController
     {
         $merchantId = $this->currentMerchantId($request);
         if ($merchantId <= 0) {
-            return $this->fail('未获取到当前商户信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         $data = $this->validated($this->payload($request), MerchantPortalValidator::class, 'pluginConfigStore');
@@ -249,7 +249,7 @@ class MerchantPortalController extends BaseController
     {
         $merchantId = $this->currentMerchantId($request);
         if ($merchantId <= 0) {
-            return $this->fail('未获取到当前商户信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         $data = $this->validated(
@@ -270,7 +270,7 @@ class MerchantPortalController extends BaseController
     {
         $merchantId = $this->currentMerchantId($request);
         if ($merchantId <= 0) {
-            return $this->fail('未获取到当前商户信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         $data = $this->validated(['id' => (int) $id], MerchantPortalValidator::class, 'pluginConfigDestroy');
@@ -285,7 +285,7 @@ class MerchantPortalController extends BaseController
     {
         $merchantId = $this->currentMerchantId($request);
         if ($merchantId <= 0) {
-            return $this->fail('未获取到当前商户信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         return $this->success([
@@ -308,7 +308,7 @@ class MerchantPortalController extends BaseController
     {
         $merchantId = $this->currentMerchantId($request);
         if ($merchantId <= 0) {
-            return $this->fail('未获取到当前商户信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         $rawPayload = $this->payload($request);
@@ -334,7 +334,7 @@ class MerchantPortalController extends BaseController
     {
         $merchantId = $this->currentMerchantId($request);
         if ($merchantId <= 0) {
-            return $this->fail('未获取到当前商户信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         return $this->success($this->merchantPortalService->routeConfig($merchantId));
@@ -350,7 +350,7 @@ class MerchantPortalController extends BaseController
     {
         $merchantId = $this->currentMerchantId($request);
         if ($merchantId <= 0) {
-            return $this->fail('未获取到当前商户信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         $payload = $this->validated($this->payload($request), MerchantPortalValidator::class, 'routeConfigUpdate');
@@ -368,7 +368,7 @@ class MerchantPortalController extends BaseController
     {
         $merchantId = $this->currentMerchantId($request);
         if ($merchantId <= 0) {
-            return $this->fail('未获取到当前商户信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         return $this->success($this->merchantPortalService->apiCredential($merchantId));
@@ -384,7 +384,7 @@ class MerchantPortalController extends BaseController
     {
         $merchantId = $this->currentMerchantId($request);
         if ($merchantId <= 0) {
-            return $this->fail('未获取到当前商户信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         $data = $this->validated($this->payload($request), MerchantPortalValidator::class, 'issueCredential');
@@ -402,7 +402,7 @@ class MerchantPortalController extends BaseController
     {
         $merchantId = $this->currentMerchantId($request);
         if ($merchantId <= 0) {
-            return $this->fail('未获取到当前商户信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         $payload = $this->payload($request);
@@ -423,7 +423,7 @@ class MerchantPortalController extends BaseController
     {
         $merchantId = $this->currentMerchantId($request);
         if ($merchantId <= 0) {
-            return $this->fail('未获取到当前商户信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         $detail = $this->merchantPortalService->settlementRecordDetail($settleNo, $merchantId);
@@ -444,7 +444,7 @@ class MerchantPortalController extends BaseController
     {
         $merchantId = $this->currentMerchantId($request);
         if ($merchantId <= 0) {
-            return $this->fail('未获取到当前商户信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         return $this->success($this->merchantPortalService->withdrawableBalance($merchantId));
@@ -460,7 +460,7 @@ class MerchantPortalController extends BaseController
     {
         $merchantId = $this->currentMerchantId($request);
         if ($merchantId <= 0) {
-            return $this->fail('未获取到当前商户信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         $payload = $this->payload($request);

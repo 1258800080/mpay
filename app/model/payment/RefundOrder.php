@@ -33,6 +33,12 @@ class RefundOrder extends BaseModel
         'channel_id',
         'refund_amount',
         'fee_reverse_amount',
+        'account_reverse_status',
+        'account_reverse_required_amount',
+        'account_reverse_collected_amount',
+        'account_reverse_due_amount',
+        'account_reverse_recorded_at',
+        'account_reverse_recovered_at',
         'status',
         'channel_request_no',
         'channel_refund_no',
@@ -57,6 +63,12 @@ class RefundOrder extends BaseModel
         'channel_id' => 'integer',
         'refund_amount' => 'integer',
         'fee_reverse_amount' => 'integer',
+        'account_reverse_status' => 'integer',
+        'account_reverse_required_amount' => 'integer',
+        'account_reverse_collected_amount' => 'integer',
+        'account_reverse_due_amount' => 'integer',
+        'account_reverse_recorded_at' => 'datetime',
+        'account_reverse_recovered_at' => 'datetime',
         'status' => 'integer',
         'request_at' => 'datetime',
         'processing_at' => 'datetime',
@@ -68,6 +80,5 @@ class RefundOrder extends BaseModel
         'updated_at' => 'datetime',
     ];
 }
-
 
 

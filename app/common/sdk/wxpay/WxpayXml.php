@@ -22,17 +22,22 @@ class WxpayXml
     {
         $xml = '<xml>';
         foreach ($data as $key => $value) {
-            if ($value === null || $value === '') {
+            if ($value === null) {
                 continue;
             }
-            if (is_array($value)) {
-                $value = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+            if (!is_scalar($value) && !$value instanceof \Stringable) {
+                throw new WxpaySdkException('微信支付 V2 XML 字段必须是标量：' . (string) $key);
+            }
+
+            $value = (string) $value;
+            if ($value === '') {
+                continue;
             }
 
             $xml .= sprintf(
                 '<%1$s><![CDATA[%2$s]]></%1$s>',
                 htmlspecialchars((string) $key, ENT_XML1 | ENT_QUOTES, 'UTF-8'),
-                self::escapeCdata((string) $value)
+                self::escapeCdata($value)
             );
         }
 
@@ -52,8 +57,12 @@ class WxpayXml
             return [];
         }
 
+        if (stripos($xml, '<!DOCTYPE') !== false || stripos($xml, '<!ENTITY') !== false) {
+            throw new WxpaySdkException('微信支付 XML 不允许包含 DOCTYPE 或 ENTITY');
+        }
+
         $previous = libxml_use_internal_errors(true);
-        $element = simplexml_load_string($xml, 'SimpleXMLElement', LIBXML_NOCDATA);
+        $element = simplexml_load_string($xml, 'SimpleXMLElement', LIBXML_NOCDATA | LIBXML_NONET);
         $errors = libxml_get_errors();
         libxml_clear_errors();
         libxml_use_internal_errors($previous);
@@ -63,17 +72,23 @@ class WxpayXml
             throw new WxpaySdkException('微信支付 XML 解析失败：' . trim($message));
         }
 
-        $decoded = json_decode(json_encode($element, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?: '{}', true);
-        if (!is_array($decoded)) {
-            throw new WxpaySdkException('微信支付 XML 转数组失败');
+        if ($element->getName() !== 'xml') {
+            throw new WxpaySdkException('微信支付 XML 根节点必须是 xml');
         }
 
         $result = [];
-        foreach ($decoded as $key => $value) {
-            if (is_array($value)) {
-                $value = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        foreach ($element->children() as $child) {
+            $key = $child->getName();
+            if ($key === '' || array_key_exists($key, $result)) {
+                throw new WxpaySdkException('微信支付 XML 包含空字段名或重复字段：' . $key);
             }
-            $result[(string) $key] = (string) $value;
+            if ($child->count() > 0) {
+                throw new WxpaySdkException('微信支付 V2 XML 字段不允许嵌套：' . $key);
+            }
+
+            // 直接读取一层子节点，空节点必须保持为空字符串。不能经 JSON 中转，
+            // 否则 SimpleXML 会把 <field/> 转成 []，进而错误加入 V2 签名原文。
+            $result[$key] = (string) $child;
         }
 
         return $result;

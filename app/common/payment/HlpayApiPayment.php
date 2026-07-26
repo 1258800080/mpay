@@ -14,11 +14,16 @@ use app\common\sdk\hlpay\HlpaySdkException;
 use app\common\trait\DirectPaymentProductSelectorTrait;
 use app\common\util\FormatHelper;
 use app\exception\PaymentException;
+use app\exception\PaymentUncertainException;
+use app\exception\UnsupportedPaymentOperationException;
 use support\Request;
 use support\Response;
 
 /**
  * 汇联支付 API 插件。
+ *
+ * 提供支付宝、微信和银联的 JSAPI、扫码、支付通知与退款能力，并将平台场景映射为
+ * 汇联 payType/paySubType。当前适配协议没有可确认的主动查单和关单接口。
  */
 class HlpayApiPayment extends BasePayment implements PaymentInterface, PayPluginInterface
 {
@@ -79,7 +84,7 @@ class HlpayApiPayment extends BasePayment implements PaymentInterface, PayPlugin
      * 发起支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付结果
      */
     public function pay(array $order): array
     {
@@ -109,7 +114,7 @@ class HlpayApiPayment extends BasePayment implements PaymentInterface, PayPlugin
      * 扫码支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付结果
      */
     private function scanPay(array $order): array
     {
@@ -138,32 +143,32 @@ class HlpayApiPayment extends BasePayment implements PaymentInterface, PayPlugin
     }
 
     /**
-     * 汇联旧插件未提供主动查单链路。
+     * 当前适配协议未提供可确认的主动查单接口。
      *
      * @param array<string, mixed> $order 标准插件查单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付状态结果
      */
     public function query(array $order): array
     {
-        return ['success' => false, 'status' => PaymentPluginStatusConstant::PENDING, 'msg' => '汇联支付插件暂不支持主动查单'];
+        throw new UnsupportedPaymentOperationException('汇联支付插件暂不支持主动查单', 40200);
     }
 
     /**
-     * 汇联旧插件未提供关单链路。
+     * 当前适配协议未提供可确认的关单接口。
      *
      * @param array<string, mixed> $order 标准插件关单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准关单结果
      */
     public function close(array $order): array
     {
-        return ['success' => false, 'msg' => '汇联支付插件暂不支持关单'];
+        throw new UnsupportedPaymentOperationException('汇联支付插件暂不支持关单', 40200);
     }
 
     /**
      * 申请退款。
      *
      * @param array<string, mixed> $order 标准插件退款参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准退款结果
      */
     public function refund(array $order): array
     {
@@ -174,23 +179,28 @@ class HlpayApiPayment extends BasePayment implements PaymentInterface, PayPlugin
                 'amount' => FormatHelper::amount((int) $order['refund_amount']),
             ]);
         } catch (HlpaySdkException $e) {
-            return ['success' => false, 'msg' => $e->getMessage()];
+            throw new PaymentUncertainException('汇联支付退款结果不确定：' . $e->getMessage(), 40200);
         }
 
+        $refundAmount = isset($data['refundAmount'])
+            ? $this->yuanToCents($data['refundAmount'], '汇联支付退款金额')
+            : (int) $order['refund_amount'];
+
         return [
-            'success' => true,
-            'msg' => '退款申请成功',
-            'chan_refund_no' => (string) ($data['instOrderNo'] ?? $order['refund_no']),
-            'refund_amount' => (int) round(((float) ($data['refundAmount'] ?? 0)) * 100),
-            'raw_data' => $data,
+            'status' => PaymentPluginStatusConstant::SUCCESS,
+            'refund_no' => (string) $order['refund_no'],
+            'pay_no' => (string) $order['pay_no'],
+            'refund_amount' => $refundAmount,
+            'chan_refund_no' => (string) ($data['instOrderNo'] ?? ''),
+            'message' => '退款申请成功',
         ];
     }
 
     /**
-     * 解析支付回调。
+     * 解析并验签支付回调。
      *
      * @param Request $request 回调请求
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付通知结果
      */
     public function notify(Request $request): array
     {
@@ -204,9 +214,11 @@ class HlpayApiPayment extends BasePayment implements PaymentInterface, PayPlugin
 
         return [
             'status' => $success ? PaymentPluginStatusConstant::SUCCESS : PaymentPluginStatusConstant::PENDING,
+            'pay_no' => trim((string) ($data['mchOrderNo'] ?? '')),
+            'paid_amount' => $success ? $this->yuanToCents($data['amount'] ?? null, '汇联支付回调金额') : null,
             'message' => (string) ($data['state'] ?? ''),
-            'channel_order_no' => (string) ($data['mchOrderNo'] ?? ''),
-            'channel_trade_no' => (string) ($data['payOrderNo'] ?? ''),
+            'chan_order_no' => (string) ($data['mchOrderNo'] ?? ''),
+            'chan_trade_no' => (string) ($data['payOrderNo'] ?? ''),
             'channel_status' => (string) ($data['state'] ?? ''),
         ];
     }
@@ -228,10 +240,27 @@ class HlpayApiPayment extends BasePayment implements PaymentInterface, PayPlugin
     }
 
     /**
+     * 将渠道元金额转换为整数分。
+     *
+     * @param mixed $value 渠道金额
+     * @param string $field 金额字段说明
+     * @return int 金额，单位分
+     */
+    private function yuanToCents(mixed $value, string $field): int
+    {
+        $text = trim((string) $value);
+        if (preg_match('/^(0|[1-9]\d*)(?:\.(\d{1,2}))?$/', $text, $matches) !== 1) {
+            throw new PaymentException($field . '格式无效', 40200);
+        }
+
+        return ((int) $matches[1] * 100) + (int) str_pad((string) ($matches[2] ?? ''), 2, '0');
+    }
+
+    /**
      * JSAPI 支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付结果
      */
     private function jsapiPay(array $order): array
     {
@@ -266,7 +295,7 @@ class HlpayApiPayment extends BasePayment implements PaymentInterface, PayPlugin
      * 构造通用下单参数。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 渠道下单参数
      */
     private function basePayload(array $order): array
     {
@@ -289,14 +318,18 @@ class HlpayApiPayment extends BasePayment implements PaymentInterface, PayPlugin
     /**
      * 包装标准支付结果。
      *
+     * @param string $page 平台承接页类型
+     * @param string $payType 平台支付方式编码
+     * @param string $product 汇联产品编码
+     * @param string $action 渠道接口动作
      * @param array<string, mixed> $payParams 承接页参数
      * @param array<string, mixed> $data 上游响应
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付结果
      */
     private function payResult(string $page, string $payType, string $product, string $action, array $payParams, array $data, array $order): array
     {
-        return [
+        return $this->pendingPaymentResult($order, [
             'pay_page' => $page,
             'pay_type' => $payType,
             'pay_product' => $product,
@@ -304,11 +337,13 @@ class HlpayApiPayment extends BasePayment implements PaymentInterface, PayPlugin
             'pay_params' => $payParams,
             'chan_order_no' => (string) ($data['mchOrderNo'] ?? $order['pay_no']),
             'chan_trade_no' => (string) ($data['payOrderNo'] ?? ''),
-        ];
+        ]);
     }
 
     /**
-     * 获取 SDK 客户端。
+     * 获取当前通道的 SDK 客户端。
+     *
+     * @return HlpayClient
      */
     private function client(): HlpayClient
     {
@@ -326,6 +361,9 @@ class HlpayApiPayment extends BasePayment implements PaymentInterface, PayPlugin
 
     /**
      * 获取字符串配置。
+     *
+     * @param string $key 配置键
+     * @return string 配置值
      */
     private function configText(string $key): string
     {

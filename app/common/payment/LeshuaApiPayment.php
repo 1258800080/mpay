@@ -13,11 +13,16 @@ use app\common\sdk\leshua\LeshuaClient;
 use app\common\sdk\leshua\LeshuaSdkException;
 use app\common\trait\DirectPaymentProductSelectorTrait;
 use app\exception\PaymentException;
+use app\exception\PaymentUncertainException;
+use app\exception\UnsupportedPaymentOperationException;
 use support\Request;
 use support\Response;
 
 /**
  * 乐刷聚合支付 API 插件。
+ *
+ * 提供支付宝、微信和银联的扫码、支付宝/微信 JSAPI、付款码、支付通知与退款能力。
+ * 当前适配协议没有可确认的主动查单和关单接口。
  */
 class LeshuaApiPayment extends BasePayment implements PaymentInterface, PayPluginInterface
 {
@@ -75,7 +80,7 @@ class LeshuaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      * 发起支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付结果
      */
     public function pay(array $order): array
     {
@@ -113,7 +118,7 @@ class LeshuaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      * 二维码支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付结果
      */
     private function qrcodePay(array $order): array
     {
@@ -144,32 +149,32 @@ class LeshuaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     }
 
     /**
-     * 乐刷旧插件未提供主动查单链路。
+     * 当前适配协议未提供可确认的主动查单接口。
      *
      * @param array<string, mixed> $order 标准插件查单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付状态结果
      */
     public function query(array $order): array
     {
-        return ['success' => false, 'status' => PaymentPluginStatusConstant::PENDING, 'msg' => '乐刷插件暂不支持主动查单'];
+        throw new UnsupportedPaymentOperationException('乐刷插件暂不支持主动查单', 40200);
     }
 
     /**
-     * 乐刷旧插件未提供关单链路。
+     * 当前适配协议未提供可确认的关单接口。
      *
      * @param array<string, mixed> $order 标准插件关单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准关单结果
      */
     public function close(array $order): array
     {
-        return ['success' => false, 'msg' => '乐刷插件暂不支持关单'];
+        throw new UnsupportedPaymentOperationException('乐刷插件暂不支持关单', 40200);
     }
 
     /**
      * 申请退款。
      *
      * @param array<string, mixed> $order 标准插件退款参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准退款结果
      */
     public function refund(array $order): array
     {
@@ -181,23 +186,24 @@ class LeshuaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
                 'refund_amount' => (string) (int) $order['refund_amount'],
             ]);
         } catch (LeshuaSdkException $e) {
-            return ['success' => false, 'msg' => $e->getMessage()];
+            throw new PaymentUncertainException('乐刷退款结果不确定：' . $e->getMessage(), 40200);
         }
 
         return [
-            'success' => true,
-            'msg' => '退款申请成功',
-            'chan_refund_no' => (string) ($data['leshua_refund_id'] ?? $order['refund_no']),
+            'status' => PaymentPluginStatusConstant::SUCCESS,
+            'refund_no' => (string) $order['refund_no'],
+            'pay_no' => (string) $order['pay_no'],
             'refund_amount' => (int) ($data['refund_amount'] ?? $order['refund_amount']),
-            'raw_data' => $data,
+            'chan_refund_no' => (string) ($data['leshua_refund_id'] ?? ''),
+            'message' => '退款申请成功',
         ];
     }
 
     /**
-     * 解析支付回调。
+     * 解析并验签 XML 支付回调。
      *
      * @param Request $request 回调请求
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付通知结果
      */
     public function notify(Request $request): array
     {
@@ -210,9 +216,11 @@ class LeshuaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
 
         return [
             'status' => $success ? PaymentPluginStatusConstant::SUCCESS : PaymentPluginStatusConstant::PENDING,
+            'pay_no' => trim((string) ($payload['third_order_id'] ?? '')),
+            'paid_amount' => $success ? $this->integerCents($payload['amount'] ?? null, '乐刷回调金额') : null,
             'message' => (string) ($payload['status'] ?? ''),
-            'channel_order_no' => (string) ($payload['third_order_id'] ?? ''),
-            'channel_trade_no' => (string) ($payload['leshua_order_id'] ?? ''),
+            'chan_order_no' => (string) ($payload['third_order_id'] ?? ''),
+            'chan_trade_no' => (string) ($payload['leshua_order_id'] ?? ''),
             'channel_status' => (string) ($payload['status'] ?? ''),
         ];
     }
@@ -234,10 +242,27 @@ class LeshuaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     }
 
     /**
+     * 读取渠道整数分金额。
+     *
+     * @param mixed $value 渠道金额
+     * @param string $field 金额字段说明
+     * @return int 金额，单位分
+     */
+    private function integerCents(mixed $value, string $field): int
+    {
+        $text = trim((string) $value);
+        if (preg_match('/^\d+$/', $text) !== 1) {
+            throw new PaymentException($field . '格式无效', 40200);
+        }
+
+        return (int) $text;
+    }
+
+    /**
      * JSAPI 支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付结果
      */
     private function jsapiPay(array $order): array
     {
@@ -271,7 +296,7 @@ class LeshuaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
      * 付款码支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付成功结果
      */
     private function scanPay(array $order): array
     {
@@ -284,14 +309,21 @@ class LeshuaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
             throw new PaymentException('乐刷付款码下单失败：' . $e->getMessage(), 40200);
         }
 
-        return $this->payResult('ok', (string) $order['pay_type_code'], 'upload_authcode', 'upload_authcode', ['raw' => $data], $data, $order);
+        return $this->successfulPaymentResult($order, [
+            'paid_amount' => (int) ($order['amount'] ?? 0),
+            'pay_type' => (string) $order['pay_type_code'],
+            'pay_product' => 'upload_authcode',
+            'pay_action' => 'upload_authcode',
+            'chan_order_no' => (string) ($data['third_order_id'] ?? $order['pay_no']),
+            'chan_trade_no' => (string) ($data['leshua_order_id'] ?? ''),
+        ]);
     }
 
     /**
      * 构造通用下单参数。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 渠道下单参数
      */
     private function basePayload(array $order): array
     {
@@ -307,14 +339,18 @@ class LeshuaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
     /**
      * 包装标准支付结果。
      *
+     * @param string $page 平台承接页类型
+     * @param string $payType 平台支付方式编码
+     * @param string $product 乐刷产品编码
+     * @param string $action 渠道接口动作
      * @param array<string, mixed> $payParams 承接页参数
      * @param array<string, mixed> $data 上游响应
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付结果
      */
     private function payResult(string $page, string $payType, string $product, string $action, array $payParams, array $data, array $order): array
     {
-        return [
+        return $this->pendingPaymentResult($order, [
             'pay_page' => $page,
             'pay_type' => $payType,
             'pay_product' => $product,
@@ -322,11 +358,13 @@ class LeshuaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
             'pay_params' => $payParams,
             'chan_order_no' => (string) ($data['third_order_id'] ?? $order['pay_no']),
             'chan_trade_no' => (string) ($data['leshua_order_id'] ?? ''),
-        ];
+        ]);
     }
 
     /**
-     * 获取 SDK 客户端。
+     * 获取当前通道的 SDK 客户端。
+     *
+     * @return LeshuaClient
      */
     private function client(): LeshuaClient
     {
@@ -343,6 +381,9 @@ class LeshuaApiPayment extends BasePayment implements PaymentInterface, PayPlugi
 
     /**
      * 获取字符串配置。
+     *
+     * @param string $key 配置键
+     * @return string 配置值
      */
     private function configText(string $key): string
     {

@@ -162,7 +162,7 @@ class MerchantAuthService extends BaseService
             'last_login_ip' => trim($ip),
         ]);
 
-        return $this->issueToken((int) $merchant->id, 86400, $ip, $userAgent);
+        return $this->issueToken((int) $merchant->id, $ip, $userAgent);
     }
 
     /**
@@ -180,13 +180,12 @@ class MerchantAuthService extends BaseService
      * 签发新的商户登录 token。
      *
      * @param int $merchantId 商户ID
-     * @param int $ttlSeconds 过期秒数
      * @param string $ip 请求 IP
      * @param string $userAgent 用户代理
      * @return array{token: string, expires_in: int, merchant: Merchant, credential: array{status: int, last_used_at: mixed}|null} 登录结果
      * @throws ValidationException
      */
-    public function issueToken(int $merchantId, int $ttlSeconds = 86400, string $ip = '', string $userAgent = ''): array
+    public function issueToken(int $merchantId, string $ip = '', string $userAgent = ''): array
     {
         /** @var Merchant|null $merchant */
         $merchant = $this->merchantRepository->find($merchantId);
@@ -205,7 +204,7 @@ class MerchantAuthService extends BaseService
             'merchant_no' => (string) $merchant->merchant_no,
             'last_login_ip' => $ip,
             'user_agent' => $userAgent,
-        ], $ttlSeconds);
+        ]);
 
         return [
             'token' => $issued['token'],

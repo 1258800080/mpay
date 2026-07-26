@@ -301,6 +301,35 @@ class MerchantAccountService extends BaseService
     }
 
     /**
+     * 在当前事务中最多扣减指定金额的可用余额。
+     *
+     * @param int $merchantId 商户ID
+     * @param int $maxAmount 最大扣减金额（分）
+     * @param string $bizNo 业务单号
+     * @param string $idempotencyKey 幂等键
+     * @param array<string, mixed> $extJson 扩展字段
+     * @param string $traceNo 追踪号
+     * @return int 实际扣减金额
+     */
+    public function debitAvailableUpToInCurrentTransaction(
+        int $merchantId,
+        int $maxAmount,
+        string $bizNo,
+        string $idempotencyKey,
+        array $extJson = [],
+        string $traceNo = ''
+    ): int {
+        return $this->commandService->debitAvailableUpToInCurrentTransaction(
+            $merchantId,
+            $maxAmount,
+            $bizNo,
+            $idempotencyKey,
+            $extJson,
+            $traceNo
+        );
+    }
+
+    /**
      * 在当前事务中扣减自收通道支付平台服务费。
      *
      * @param int $merchantId 商户ID

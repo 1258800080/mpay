@@ -26,6 +26,7 @@ use GuzzleHttp\Exception\GuzzleException;
  * 当前覆盖的通用交易动作：
  * - 查询订单：alipay.trade.query
  * - 关闭订单：alipay.trade.close
+ * - 撤销不确定交易：alipay.trade.cancel
  * - 退款订单：alipay.trade.refund
  * - 退款查询：alipay.trade.fastpay.refund.query
  * - 小程序授权换取用户身份：alipay.system.oauth.token
@@ -41,6 +42,7 @@ class AlipayClient
     public const METHOD_TRADE_PAGE_PAY = 'alipay.trade.page.pay';
     public const METHOD_TRADE_QUERY = 'alipay.trade.query';
     public const METHOD_TRADE_CLOSE = 'alipay.trade.close';
+    public const METHOD_TRADE_CANCEL = 'alipay.trade.cancel';
     public const METHOD_TRADE_REFUND = 'alipay.trade.refund';
     public const METHOD_TRADE_REFUND_QUERY = 'alipay.trade.fastpay.refund.query';
 
@@ -246,6 +248,20 @@ class AlipayClient
     }
 
     /**
+     * 撤销交易。
+     *
+     * 仅用于付款码/订单码支付结果不确定时的收口，不代替退款接口。
+     *
+     * @param array<string, mixed> $bizContent 业务参数
+     * @param array<string, mixed> $options 公共参数覆盖项
+     * @return AlipayResponse 支付宝响应
+     */
+    public function cancel(array $bizContent, array $options = []): AlipayResponse
+    {
+        return $this->execute(self::METHOD_TRADE_CANCEL, $bizContent, $options);
+    }
+
+    /**
      * 发起退款。
      *
      * 常用业务参数包括 out_trade_no/trade_no、refund_amount、out_request_no。
@@ -354,7 +370,7 @@ class AlipayClient
     public function sdkExecute(string $method, array $bizContent, array $options = []): array
     {
         $params = $this->signedParams($method, $bizContent, $options);
-        $query = http_build_query($params, '', '&', PHP_QUERY_RFC3986);
+        $query = http_build_query($params);
 
         return [
             'order_string' => $query,
@@ -376,7 +392,9 @@ class AlipayClient
     {
         $httpMethod = strtoupper((string) ($options['http_method'] ?? 'POST'));
         $params = $this->signedParams($method, $bizContent, $options);
-        $url = $this->config->gateway() . '?' . http_build_query($params, '', '&', PHP_QUERY_RFC3986);
+        $url = $httpMethod === 'GET'
+            ? $this->config->gateway() . '?' . http_build_query($params)
+            : $this->config->gateway();
         $html = $httpMethod === 'GET'
             ? $this->buildGetRedirectHtml($url)
             : $this->buildPostFormHtml($this->config->gateway(), $params);
@@ -384,6 +402,8 @@ class AlipayClient
         return [
             'method' => $httpMethod,
             'url' => $url,
+            'action' => $this->config->gateway(),
+            'payload' => $params,
             'html' => $html,
             'params' => $params,
         ];
@@ -400,11 +420,17 @@ class AlipayClient
     public function verifyNotify(array $params): bool
     {
         $sign = (string) ($params['sign'] ?? '');
-        if ($sign === '') {
+        if ($sign === '' || strtoupper(trim((string) ($params['sign_type'] ?? ''))) !== 'RSA2') {
             return false;
         }
+        if ($this->config->isCertMode()) {
+            $certSn = trim((string) ($params['alipay_cert_sn'] ?? ''));
+            if ($certSn === '' || !hash_equals($this->alipayCertSn(), $certSn)) {
+                return false;
+            }
+        }
 
-        $content = AlipaySigner::signContent($params, true);
+        $content = AlipaySigner::notifyContent($params);
 
         return AlipaySigner::verify($content, $sign, $this->alipayPublicKey());
     }
@@ -430,7 +456,9 @@ class AlipayClient
 
         return [
             'verified' => true,
+            'notify_id' => (string) ($params['notify_id'] ?? ''),
             'app_id' => (string) ($params['app_id'] ?? ''),
+            'seller_id' => (string) ($params['seller_id'] ?? ''),
             'out_trade_no' => (string) ($params['out_trade_no'] ?? ''),
             'trade_no' => (string) ($params['trade_no'] ?? ''),
             'trade_status' => (string) ($params['trade_status'] ?? ''),
@@ -439,7 +467,8 @@ class AlipayClient
             'buyer_id' => (string) ($params['buyer_id'] ?? ''),
             'buyer_open_id' => (string) ($params['buyer_open_id'] ?? ''),
             'gmt_payment' => (string) ($params['gmt_payment'] ?? ''),
-            'raw' => $params,
+            'passback_params' => (string) ($params['passback_params'] ?? ''),
+            'alipay_cert_sn' => (string) ($params['alipay_cert_sn'] ?? ''),
         ];
     }
 
@@ -462,7 +491,7 @@ class AlipayClient
         }
 
         $params['sign'] = AlipaySigner::sign(
-            AlipaySigner::signContent($params),
+            AlipaySigner::requestContent($params),
             $this->config->privateKey()
         );
 
@@ -488,7 +517,7 @@ class AlipayClient
         }
 
         $params['sign'] = AlipaySigner::sign(
-            AlipaySigner::signContent($params),
+            AlipaySigner::requestContent($params),
             $this->config->privateKey()
         );
 
@@ -546,18 +575,22 @@ class AlipayClient
     {
         try {
             $response = $this->httpClient()->request('POST', $this->config->gateway(), [
-                'body' => http_build_query($params, '', '&', PHP_QUERY_RFC3986),
+                'body' => http_build_query($params),
                 'headers' => [
                     'Content-Type' => 'application/x-www-form-urlencoded;charset=' . $this->config->charset(),
                 ],
             ]);
         } catch (GuzzleException $e) {
-            throw new AlipaySdkException('支付宝请求失败：' . $e->getMessage(), previous: $e);
+            throw new AlipaySdkException('支付宝网关请求失败', 'transport', [
+                'exception' => $e::class,
+            ], $e);
         }
 
         $httpCode = $response->getStatusCode();
         if ($httpCode < 200 || $httpCode >= 300) {
-            throw new AlipaySdkException('支付宝 HTTP 状态异常：' . $httpCode);
+            throw new AlipaySdkException('支付宝 HTTP 状态异常', 'transport', [
+                'http_status' => $httpCode,
+            ]);
         }
 
         return (string) $response->getBody();
@@ -565,8 +598,6 @@ class AlipayClient
 
     /**
      * 获取支付宝网关 HTTP 客户端。
-     *
-     * 当前开发环境使用 phpstudy，暂时关闭 SSL 证书校验，避免本地 CA 根证书缺失阻断沙箱联调。
      *
      * @return Client Guzzle HTTP 客户端
      */
@@ -577,7 +608,7 @@ class AlipayClient
                 'timeout' => $this->config->timeout(),
                 'connect_timeout' => $this->config->connectTimeout(),
                 'http_errors' => false,
-                'verify' => false,
+                'verify' => true,
             ]);
         }
 
@@ -597,16 +628,17 @@ class AlipayClient
      */
     private function verifyGatewayResponse(string $method, string $rawBody, array $decoded): bool
     {
-        if (!$this->config->verifyResponse()) {
-            return false;
-        }
-
         $sign = (string) ($decoded['sign'] ?? '');
         if ($sign === '') {
-            if ($this->config->strictResponseSign()) {
-                throw new AlipaySdkException('支付宝响应缺少 sign');
+            throw new AlipaySdkException('支付宝响应缺少 sign', 'signature');
+        }
+        if ($this->config->isCertMode()) {
+            $certSn = trim((string) ($decoded['alipay_cert_sn'] ?? ''));
+            if ($certSn === '' || !hash_equals($this->alipayCertSn(), $certSn)) {
+                throw new AlipaySdkException('支付宝响应证书序列号不匹配', 'signature', [
+                    'alipay_cert_sn' => $certSn,
+                ]);
             }
-            return false;
         }
 
         $responseKey = str_replace('.', '_', $method) . '_response';
@@ -615,10 +647,10 @@ class AlipayClient
             $content = $this->extractResponseSignContent($rawBody, 'error_response');
         }
         if ($content === '') {
-            throw new AlipaySdkException('提取支付宝响应验签内容失败');
+            throw new AlipaySdkException('提取支付宝响应验签内容失败', 'protocol');
         }
         if (!AlipaySigner::verify($content, $sign, $this->alipayPublicKey())) {
-            throw new AlipaySdkException('支付宝响应验签失败');
+            throw new AlipaySdkException('支付宝响应验签失败', 'signature');
         }
 
         return true;
@@ -733,6 +765,16 @@ class AlipayClient
         }
 
         return $this->alipayPublicKey;
+    }
+
+    /**
+     * 获取配置的支付宝公钥证书序列号。
+     *
+     * @return string 支付宝公钥证书序列号
+     */
+    private function alipayCertSn(): string
+    {
+        return AlipayCertificate::alipayCertSn($this->config->alipayCertContent());
     }
 
     /**

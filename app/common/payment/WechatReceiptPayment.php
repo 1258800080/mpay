@@ -13,6 +13,7 @@ use app\common\interface\PaymentInterface;
 use app\common\interface\PayPluginInterface;
 use app\common\util\FormatHelper;
 use app\exception\PaymentException;
+use app\exception\UnsupportedPaymentOperationException;
 use app\model\payment\PayOrder;
 use app\repository\payment\trade\PayOrderRepository;
 use support\Cache;
@@ -204,14 +205,14 @@ class WechatReceiptPayment extends BasePayment implements PaymentInterface, PayP
             $params['qrcode_image'] = $image;
         }
 
-        return $this->payResult('page', $params, $payNo);
+        return $this->pendingPaymentResult($order, $this->payResult('page', $params, $payNo));
     }
 
     /**
      * 通道级通知定位支付单。
      *
-     * 这里是第一阶段，只根据 SmsForwarder 内容确认 pay_no，不做支付成功处理。
-     * 后续验签、幂等、订单状态流转仍由支付服务层继续调用 notify() 完成。
+     * 此入口先完成 SmsForwarder 验签，再根据通知内容定位 pay_no，但不直接推进支付状态。
+     * 服务层完成幂等编排后会调用 notify() 重新校验通知并生成标准支付结果。
      *
      * @param Request $request 请求对象
      * @return array{pay_no:string}
@@ -232,16 +233,19 @@ class WechatReceiptPayment extends BasePayment implements PaymentInterface, PayP
     public function query(array $order): array
     {
         return [
-            'success' => true,
             'status' => PaymentPluginStatusConstant::PENDING,
-            'channel_order_no' => (string) ($order['channel_order_no'] ?? $order['pay_no'] ?? ''),
-            'channel_trade_no' => (string) ($order['channel_trade_no'] ?? $order['pay_no'] ?? ''),
+            'pay_no' => (string) ($order['pay_no'] ?? ''),
+            'paid_amount' => null,
+            'chan_order_no' => (string) ($order['chan_order_no'] ?? ''),
+            'chan_trade_no' => (string) ($order['chan_trade_no'] ?? ''),
             'message' => '个人收款监听通道等待 SmsForwarder 通知',
         ];
     }
 
     /**
-     * 个人收款无上游关单接口。
+     * 结束本地个人收款等待状态。
+     *
+     * 通知栏监听没有上游订单可关闭，因此该结果只表达本地终止等待。
      *
      * @param array<string, mixed> $order 订单参数
      * @return array<string, mixed>
@@ -249,8 +253,11 @@ class WechatReceiptPayment extends BasePayment implements PaymentInterface, PayP
     public function close(array $order): array
     {
         return [
-            'success' => true,
-            'msg' => '个人收款监听通道无需上游关单',
+            'status' => PaymentPluginStatusConstant::CLOSED,
+            'pay_no' => (string) ($order['pay_no'] ?? ''),
+            'chan_order_no' => (string) ($order['chan_order_no'] ?? ''),
+            'chan_trade_no' => (string) ($order['chan_trade_no'] ?? ''),
+            'message' => '个人收款监听通道无需上游关单',
         ];
     }
 
@@ -262,7 +269,7 @@ class WechatReceiptPayment extends BasePayment implements PaymentInterface, PayP
      */
     public function refund(array $order): array
     {
-        throw new PaymentException('微信个人收款监听不支持接口退款', 40200);
+        throw new UnsupportedPaymentOperationException('微信个人收款监听不支持接口退款', 40200);
     }
 
     /**
@@ -282,14 +289,15 @@ class WechatReceiptPayment extends BasePayment implements PaymentInterface, PayP
         $payNo = $this->locatePayNo($payload);
         $notifiedAmount = $this->amountFromPayload($payload);
 
-        $this->restoreOriginalPayAmount($payNo, $payload, $tradeNo, $notifiedAmount);
+        $paidAmount = $this->restoreOriginalPayAmount($payNo, $payload, $tradeNo, $notifiedAmount);
 
         return [
             'status' => PaymentPluginStatusConstant::SUCCESS,
             'pay_no' => $payNo,
+            'paid_amount' => $paidAmount,
             'message' => mb_strcut(preg_replace('/\s+/', ' ', $content) ?? $content, 0, 180, 'UTF-8'),
-            'channel_order_no' => $tradeNo,
-            'channel_trade_no' => $tradeNo,
+            'chan_order_no' => $tradeNo,
+            'chan_trade_no' => $tradeNo,
             'channel_status' => 'sms_forwarder_received',
             'paid_at' => $this->paidAtFromPayload($payload),
         ];
@@ -327,7 +335,7 @@ class WechatReceiptPayment extends BasePayment implements PaymentInterface, PayP
             'pay_product' => 'receipt',
             'pay_action' => 'sms_forwarder',
             'pay_params' => $params,
-            'chan_order_no' => $payNo,
+            'chan_order_no' => '',
             'chan_trade_no' => '',
         ];
     }
@@ -512,11 +520,11 @@ class WechatReceiptPayment extends BasePayment implements PaymentInterface, PayP
      * @param array<string, mixed> $payload 通知载荷
      * @param string $tradeNo 渠道交易号
      * @param int|null $notifiedAmount 通知中的实际付款金额
-     * @return void
+     * @return int 原始业务金额，单位分
      */
-    private function restoreOriginalPayAmount(string $payNo, array $payload, string $tradeNo, ?int $notifiedAmount): void
+    private function restoreOriginalPayAmount(string $payNo, array $payload, string $tradeNo, ?int $notifiedAmount): int
     {
-        Db::transaction(function () use ($payNo, $payload, $tradeNo, $notifiedAmount): void {
+        return Db::transaction(function () use ($payNo, $payload, $tradeNo, $notifiedAmount): int {
             $payOrder = $this->lockedPayOrder($payNo);
             $extJson = (array) ($payOrder->ext_json ?? []);
             $receiptMeta = (array) ($extJson['personal_receipt'] ?? []);
@@ -534,6 +542,8 @@ class WechatReceiptPayment extends BasePayment implements PaymentInterface, PayP
             $extJson['personal_receipt'] = $receiptMeta;
             $payOrder->ext_json = $extJson;
             $payOrder->save();
+
+            return $originalAmount > 0 ? $originalAmount : (int) $payOrder->pay_amount;
         });
     }
 

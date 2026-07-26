@@ -13,6 +13,8 @@ use app\common\sdk\zyu\ZyuClient;
 use app\common\sdk\zyu\ZyuSdkException;
 use app\common\util\FormatHelper;
 use app\exception\PaymentException;
+use app\exception\PaymentUncertainException;
+use app\exception\UnsupportedPaymentOperationException;
 use support\Request;
 use support\Response;
 
@@ -113,7 +115,7 @@ class ZyuApiPayment extends BasePayment implements PaymentInterface, PayPluginIn
         $mode = $this->payMode();
 
         if ($mode === self::MODE_FORM) {
-            return [
+            return $this->pendingPaymentResult($order, [
                 'pay_page' => 'html',
                 'pay_type' => (string) $order['pay_type_code'],
                 'pay_product' => $this->configText('bank_code'),
@@ -123,19 +125,19 @@ class ZyuApiPayment extends BasePayment implements PaymentInterface, PayPluginIn
                 ],
                 'chan_order_no' => (string) $order['pay_no'],
                 'chan_trade_no' => '',
-            ];
+            ]);
         }
 
         try {
             $data = $this->client()->pay($payload);
         } catch (ZyuSdkException $e) {
-            throw new PaymentException('知宇支付下单失败：' . $e->getMessage(), 40200);
+            throw new PaymentUncertainException('知宇支付下单结果不确定：' . $e->getMessage(), 40200);
         }
 
         $url = $this->payUrl($data);
         $payPage = $mode === self::MODE_QRCODE ? 'qrcode' : 'jump';
 
-        return [
+        return $this->pendingPaymentResult($order, [
             'pay_page' => $payPage,
             'pay_type' => (string) $order['pay_type_code'],
             'pay_product' => $this->configText('bank_code'),
@@ -145,50 +147,40 @@ class ZyuApiPayment extends BasePayment implements PaymentInterface, PayPluginIn
                 : ['url' => $url, 'raw' => $data],
             'chan_order_no' => (string) $order['pay_no'],
             'chan_trade_no' => (string) ($data['transaction_id'] ?? ''),
-        ];
+        ]);
     }
 
     /**
-     * 知宇旧插件未提供主动查单。
+     * 当前适配协议未提供可确认的主动查单接口。
      *
      * @param array<string, mixed> $order 标准插件查单参数
      * @return array<string, mixed>
      */
     public function query(array $order): array
     {
-        return [
-            'success' => false,
-            'status' => PaymentPluginStatusConstant::PENDING,
-            'msg' => '知宇支付插件暂不支持主动查单',
-        ];
+        throw new UnsupportedPaymentOperationException('知宇支付插件暂不支持主动查单', 40200);
     }
 
     /**
-     * 知宇旧插件未提供关单。
+     * 当前适配协议未提供可确认的关单接口。
      *
      * @param array<string, mixed> $order 标准插件关单参数
      * @return array<string, mixed>
      */
     public function close(array $order): array
     {
-        return [
-            'success' => false,
-            'msg' => '知宇支付插件暂不支持关单',
-        ];
+        throw new UnsupportedPaymentOperationException('知宇支付插件暂不支持关单', 40200);
     }
 
     /**
-     * 知宇旧插件未提供退款。
+     * 当前适配协议未提供可确认的退款接口。
      *
      * @param array<string, mixed> $order 标准插件退款参数
      * @return array<string, mixed>
      */
     public function refund(array $order): array
     {
-        return [
-            'success' => false,
-            'msg' => '知宇支付插件暂不支持退款',
-        ];
+        throw new UnsupportedPaymentOperationException('知宇支付插件暂不支持退款', 40200);
     }
 
     /**
@@ -208,9 +200,11 @@ class ZyuApiPayment extends BasePayment implements PaymentInterface, PayPluginIn
 
         return [
             'status' => $success ? PaymentPluginStatusConstant::SUCCESS : PaymentPluginStatusConstant::FAILED,
+            'pay_no' => trim((string) ($payload['orderid'] ?? '')),
+            'paid_amount' => $success ? $this->yuanToCents($payload['amount'] ?? null, '知宇支付回调金额') : null,
             'message' => (string) ($payload['returncode'] ?? ''),
-            'channel_order_no' => (string) ($payload['orderid'] ?? ''),
-            'channel_trade_no' => (string) ($payload['transaction_id'] ?? ''),
+            'chan_order_no' => (string) ($payload['orderid'] ?? ''),
+            'chan_trade_no' => (string) ($payload['transaction_id'] ?? ''),
             'channel_status' => (string) ($payload['returncode'] ?? ''),
         ];
     }
@@ -318,5 +312,18 @@ class ZyuApiPayment extends BasePayment implements PaymentInterface, PayPluginIn
     private function configText(string $key): string
     {
         return trim((string) $this->getConfig($key, ''));
+    }
+
+    /**
+     * 将两位小数元金额转换为整数分。
+     */
+    private function yuanToCents(mixed $value, string $field): int
+    {
+        $text = trim((string) $value);
+        if (preg_match('/^(0|[1-9]\d*)(?:\.(\d{1,2}))?$/', $text, $matches) !== 1) {
+            throw new PaymentException($field . '格式无效', 40200);
+        }
+
+        return ((int) $matches[1] * 100) + (int) str_pad((string) ($matches[2] ?? ''), 2, '0');
     }
 }

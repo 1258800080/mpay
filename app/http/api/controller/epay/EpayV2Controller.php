@@ -6,6 +6,7 @@ use app\common\base\BaseController;
 use app\http\api\validation\EpayV2Validator;
 use app\service\payment\epay\EpayV2ProtocolService;
 use app\service\payment\order\PayOrderService;
+use app\service\payment\order\RefundOrderCallbackService;
 use support\limiter\Limiter;
 use support\Request;
 use support\Response;
@@ -22,10 +23,13 @@ class EpayV2Controller extends BaseController
      * 构造方法。
      *
      * @param EpayV2ProtocolService $epayV2ProtocolService V2 协议服务
+     * @param PayOrderService $payOrderService 支付单服务
+     * @param RefundOrderCallbackService $refundOrderCallbackService 退款通知服务
      */
     public function __construct(
         protected EpayV2ProtocolService $epayV2ProtocolService,
-        protected PayOrderService $payOrderService
+        protected PayOrderService $payOrderService,
+        protected RefundOrderCallbackService $refundOrderCallbackService
     ) {
     }
 
@@ -242,6 +246,18 @@ class EpayV2Controller extends BaseController
     public function callback(Request $request, string $payNo): string|Response
     {
         return $this->payOrderService->handlePluginCallback($payNo, $request);
+    }
+
+    /**
+     * 独立退款渠道回调入口。
+     *
+     * @param Request $request 渠道原始请求
+     * @param string $refundNo 退款单号
+     * @return string|Response 渠道协议应答
+     */
+    public function refundCallback(Request $request, string $refundNo): string|Response
+    {
+        return $this->refundOrderCallbackService->handlePluginCallback($refundNo, $request);
     }
 
     /**

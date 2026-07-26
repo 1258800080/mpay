@@ -5,43 +5,34 @@ declare(strict_types=1);
 namespace app\common\base;
 
 use app\common\constant\PaymentPluginTypeConstant;
+use app\common\constant\PaymentPluginStatusConstant;
 use app\common\interface\PayPluginInterface;
+use app\common\interface\PaymentInterface;
 use app\exception\PaymentException;
+use app\exception\PaymentDefinitiveException;
+use app\exception\PaymentUncertainException;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
 use Psr\Http\Message\ResponseInterface;
 use support\Log;
 
 /**
- * 支付插件基类（建议所有插件继承）
+ * 支付插件基类。
  *
- * 目标：把“插件共性”集中在这里，具体渠道差异留给子类补齐支付动作能力。
- *
- * 生命周期：
- * - 服务层会在每次动作前调用 `init($channelConfig)` 注入该通道配置。
- * - 子类可在 `init()` 中配置第三方 SDK 或读取必填参数。
- *
- * 约定：
- * - 这里的 `$channelConfig` 来源通常是 `ma_payment_plugin_conf.config`，并附带通道维度上下文。
- * - 业务级入参（如订单号、金额、回调地址等）不要混进 `$channelConfig`，应从 `pay()` 的 `$order` 参数获取。
+ * 负责通道配置、插件元信息、标准支付结果和 HTTP 请求等公共能力；订单号、金额和
+ * 回调地址等业务参数由各插件动作的标准入参提供，不写入通道配置。
  */
-abstract class BasePayment implements PayPluginInterface
+abstract class BasePayment implements PayPluginInterface, PaymentInterface
 {
     /**
-     * 插件元信息（子类必须覆盖）
-     *
-     * 常用字段：
-     * - code/name：后台展示与标识
-     * - pay_types：声明支持的支付方式编码（如 alipay/wechat）
-     * - config_schema：后台配置表单结构（fields...）
-     * - 包含：code, name, author, link, pay_types, transfer_types, config_schema 等
+     * 插件元信息。
      *
      * @var array<string, mixed>
      */
     protected array $paymentInfo = [];
 
     /**
-     * 进件能力元信息（子类按需覆盖）。
+     * 进件能力元信息。
      *
      * 与支付、转账能力分离，供后台进件配置和商户端在线签约页读取。
      *
@@ -50,37 +41,27 @@ abstract class BasePayment implements PayPluginInterface
     protected array $onboardingInfo = [];
 
     /**
-     * 通道配置（由 init 注入）
-     *
-     * 建议是“纯配置”：商户号/密钥/网关地址/产品开关等。
+     * 由运行时注入的通道配置。
      *
      * @var array<string, mixed>
      */
     protected array $channelConfig = [];
 
-    /**
-     * HTTP 请求客户端（GuzzleHttp）
-     *
-     * @var Client|null
-     */
     private ?Client $httpClient = null;
-
-    // ==================== 初始化 ====================
 
     /**
      * 初始化插件，加载通道配置并创建 HTTP 客户端。
      *
-     * @param array $channelConfig 渠道配置
-     * @return void
+     * @param array<string, mixed> $channelConfig 通道配置
      */
     public function init(array $channelConfig): void
     {
         $this->channelConfig = $channelConfig;
-        $this->httpClient    = new Client([
-            'timeout'         => 10,
+        $this->httpClient = new Client([
+            'timeout' => 10,
             'connect_timeout' => 10,
-            'verify'          => true,
-            'http_errors'     => false,
+            'verify' => true,
+            'http_errors' => false,
         ]);
     }
 
@@ -95,8 +76,6 @@ abstract class BasePayment implements PayPluginInterface
     {
         return $this->channelConfig[$key] ?? $default;
     }
-
-    // ==================== 插件元信息 ====================
 
     /**
      * 获取插件代码（唯一标识）。
@@ -162,12 +141,10 @@ abstract class BasePayment implements PayPluginInterface
         return PaymentPluginTypeConstant::isValid($type) ? $type : PaymentPluginTypeConstant::TYPE_DIRECT;
     }
 
-    // ==================== 能力声明 ====================
-
     /**
      * 获取插件支持的支付方式列表。
      *
-     * @return array 支持的支付方式编码
+     * @return array<int, string> 支持的支付方式编码
      */
     public function getEnabledPayTypes(): array
     {
@@ -177,7 +154,7 @@ abstract class BasePayment implements PayPluginInterface
     /**
      * 获取插件支持的转账方式列表。
      *
-     * @return array 支持的转账方式编码
+     * @return array<int, string> 支持的转账方式编码
      */
     public function getEnabledTransferTypes(): array
     {
@@ -187,7 +164,7 @@ abstract class BasePayment implements PayPluginInterface
     /**
      * 获取插件配置表单结构（用于后台配置界面）。
      *
-     * @return array 配置表单结构
+     * @return array<int, array<string, mixed>> 配置表单结构
      */
     public function getConfigSchema(): array
     {
@@ -197,8 +174,8 @@ abstract class BasePayment implements PayPluginInterface
     /**
      * 获取网页流水监听运行能力。
      *
-     * 只有实现 ChannelNotifyPayloadInterface 的插件会使用该声明。具体插件只需在
-     * paymentInfo.receipt_watcher 中声明运行时和是否支持预登录。
+     * 该能力来源于 paymentInfo.receipt_watcher，仅供实现 ChannelNotifyPayloadInterface
+     * 的插件声明运行时和预登录支持情况。
      *
      * @return array<string, mixed> 网页流水监听能力
      */
@@ -255,16 +232,75 @@ abstract class BasePayment implements PayPluginInterface
         return is_array($schema) ? array_values($schema) : [];
     }
 
-    // ==================== HTTP 请求 ====================
+    /**
+     * 构造等待用户承接或渠道异步确认的标准支付结果。
+     *
+     * 调用方必须明确提供支付产品和承接字段，本方法不判断渠道业务状态。
+     *
+     * @param array<string, mixed> $order 标准支付参数
+     * @param array<string, mixed> $result 插件已完成映射的支付结果字段
+     * @return array<string, mixed> 标准支付结果
+     */
+    protected function pendingPaymentResult(array $order, array $result): array
+    {
+        return [
+            'status' => PaymentPluginStatusConstant::PENDING,
+            'pay_no' => (string) ($order['pay_no'] ?? ''),
+            'paid_amount' => null,
+            'chan_order_no' => (string) ($result['chan_order_no'] ?? ''),
+            'chan_trade_no' => (string) ($result['chan_trade_no'] ?? ''),
+            'pay_type' => (string) ($result['pay_type'] ?? ''),
+            'pay_product' => (string) ($result['pay_product'] ?? ''),
+            'pay_action' => (string) ($result['pay_action'] ?? ''),
+            'channel_context' => (array) ($result['channel_context'] ?? []),
+            'presentation' => [
+                'pay_page' => (string) ($result['pay_page'] ?? ''),
+                'pay_type' => (string) ($result['pay_type'] ?? ''),
+                'pay_product' => (string) ($result['pay_product'] ?? ''),
+                'pay_action' => (string) ($result['pay_action'] ?? ''),
+                'pay_params' => (array) ($result['pay_params'] ?? []),
+            ],
+        ];
+    }
 
     /**
-     * 统一 HTTP 请求（对外调用支付渠道 API）。
+     * 构造渠道已明确支付成功的标准支付结果。
+     *
+     * 成功金额必须由插件依据渠道协议明确传入，不能由公共流程猜测。
+     *
+     * @param array<string, mixed> $order 标准支付参数
+     * @param array<string, mixed> $result 插件已完成映射的支付结果字段
+     * @return array<string, mixed> 标准支付结果
+     * @throws PaymentDefinitiveException 缺少明确实付金额时抛出
+     */
+    protected function successfulPaymentResult(array $order, array $result): array
+    {
+        if (!array_key_exists('paid_amount', $result) || !is_int($result['paid_amount']) || $result['paid_amount'] < 0) {
+            throw new PaymentDefinitiveException('渠道成功结果缺少有效实付金额', 40200);
+        }
+
+        return [
+            'status' => PaymentPluginStatusConstant::SUCCESS,
+            'pay_no' => (string) ($order['pay_no'] ?? ''),
+            'paid_amount' => $result['paid_amount'],
+            'chan_order_no' => (string) ($result['chan_order_no'] ?? ''),
+            'chan_trade_no' => (string) ($result['chan_trade_no'] ?? ''),
+            'pay_type' => (string) ($result['pay_type'] ?? ''),
+            'pay_product' => (string) ($result['pay_product'] ?? ''),
+            'pay_action' => (string) ($result['pay_action'] ?? ''),
+            'channel_context' => (array) ($result['channel_context'] ?? []),
+        ];
+    }
+
+    /**
+     * 请求支付渠道 API。
      *
      * @param string $method 请求方法
      * @param string $url 请求地址
-     * @param array $options 请求选项
+     * @param array<string, mixed> $options 请求选项
      * @return ResponseInterface 响应对象
-     * @throws PaymentException
+     * @throws PaymentException 插件未初始化时抛出
+     * @throws PaymentUncertainException 渠道通信结果无法确认时抛出
      */
     protected function request(string $method, string $url, array $options = []): ResponseInterface
     {
@@ -276,7 +312,7 @@ abstract class BasePayment implements PayPluginInterface
             return $this->httpClient->request($method, $url, $options);
         } catch (GuzzleException $e) {
             Log::error(sprintf('[BasePayment] HTTP 请求失败: %s %s, error=%s', $method, $url, $e->getMessage()));
-            throw new PaymentException('渠道请求失败', 402, [
+            throw new PaymentUncertainException('渠道请求结果不确定', 40200, [
                 'method' => $method,
                 'url' => $url,
                 'error' => $e->getMessage(),
@@ -284,8 +320,3 @@ abstract class BasePayment implements PayPluginInterface
         }
     }
 }
-
-
-
-
-

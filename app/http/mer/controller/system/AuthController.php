@@ -61,7 +61,7 @@ class AuthController extends BaseController
         $token = preg_replace('/^Bearer\s+/i', '', $token) ?: $token;
 
         if ($token === '') {
-            return $this->fail('未获取到登录令牌', 401);
+            return $this->success(true);
         }
 
         $this->merchantAuthService->revokeToken($token);
@@ -79,7 +79,7 @@ class AuthController extends BaseController
     {
         $merchantId = $this->currentMerchantId($request);
         if ($merchantId <= 0) {
-            return $this->fail('未获取到当前商户信息', 401);
+            return $this->fail('登录上下文异常，请刷新后重试');
         }
 
         $merchantNo = $this->currentMerchantNo($request);

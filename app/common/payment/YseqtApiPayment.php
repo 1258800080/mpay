@@ -13,7 +13,10 @@ use app\common\sdk\yseqt\YseqtClient;
 use app\common\sdk\yseqt\YseqtSdkException;
 use app\common\trait\DirectPaymentProductSelectorTrait;
 use app\common\util\FormatHelper;
+use app\exception\PaymentDefinitiveException;
 use app\exception\PaymentException;
+use app\exception\PaymentUncertainException;
+use app\exception\UnsupportedPaymentOperationException;
 use support\Request;
 use support\Response;
 
@@ -164,25 +167,25 @@ class YseqtApiPayment extends BasePayment implements PaymentInterface, PayPlugin
     }
 
     /**
-     * 银盛 e企通旧插件未提供主动查单链路。
+     * 当前适配协议未提供可确认的主动查单接口。
      *
      * @param array<string, mixed> $order 标准插件查单参数
      * @return array<string, mixed>
      */
     public function query(array $order): array
     {
-        return ['success' => false, 'status' => PaymentPluginStatusConstant::PENDING, 'msg' => '银盛e企通插件暂不支持主动查单'];
+        throw new UnsupportedPaymentOperationException('银盛e企通插件暂不支持主动查单', 40200);
     }
 
     /**
-     * 银盛 e企通旧插件未提供关单链路。
+     * 当前适配协议未提供可确认的关单接口。
      *
      * @param array<string, mixed> $order 标准插件关单参数
      * @return array<string, mixed>
      */
     public function close(array $order): array
     {
-        return ['success' => false, 'msg' => '银盛e企通插件暂不支持关单'];
+        throw new UnsupportedPaymentOperationException('银盛e企通插件暂不支持关单', 40200);
     }
 
     /**
@@ -203,19 +206,24 @@ class YseqtApiPayment extends BasePayment implements PaymentInterface, PayPlugin
                 'isDivision' => 'N',
             ]);
         } catch (YseqtSdkException $e) {
-            return ['success' => false, 'msg' => $e->getMessage()];
+            throw new PaymentUncertainException('银盛e企通退款结果不确定：' . $e->getMessage(), 40200);
         }
 
         if (!in_array((string) ($data['subCode'] ?? ''), ['COM000', 'COM004'], true)) {
-            return ['success' => false, 'msg' => (string) ($data['subMsg'] ?? '退款失败'), 'raw_data' => $data];
+            throw new PaymentDefinitiveException((string) ($data['subMsg'] ?? '银盛e企通退款失败'), 40200);
         }
 
+        $refundAmount = isset($data['amount'])
+            ? $this->yuanToCents($data['amount'], '银盛e企通退款金额')
+            : (int) $order['refund_amount'];
+
         return [
-            'success' => true,
-            'msg' => '退款申请成功',
-            'chan_refund_no' => (string) ($data['refundSn'] ?? $order['refund_no']),
-            'refund_amount' => (int) round(((float) ($data['amount'] ?? 0)) * 100),
-            'raw_data' => $data,
+            'status' => PaymentPluginStatusConstant::SUCCESS,
+            'refund_no' => (string) $order['refund_no'],
+            'pay_no' => (string) $order['pay_no'],
+            'refund_amount' => $refundAmount,
+            'chan_refund_no' => (string) ($data['refundSn'] ?? ''),
+            'message' => '退款申请成功',
         ];
     }
 
@@ -241,9 +249,11 @@ class YseqtApiPayment extends BasePayment implements PaymentInterface, PayPlugin
 
         return [
             'status' => $success ? PaymentPluginStatusConstant::SUCCESS : PaymentPluginStatusConstant::PENDING,
+            'pay_no' => trim((string) ($biz['requestNo'] ?? '')),
+            'paid_amount' => $success ? $this->yuanToCents($biz['amount'] ?? null, '银盛e企通回调金额') : null,
             'message' => (string) ($biz['state'] ?? ''),
-            'channel_order_no' => (string) ($biz['requestNo'] ?? ''),
-            'channel_trade_no' => (string) ($biz['tradeSn'] ?? ''),
+            'chan_order_no' => (string) ($biz['requestNo'] ?? ''),
+            'chan_trade_no' => (string) ($biz['tradeSn'] ?? ''),
             'channel_status' => (string) ($biz['state'] ?? ''),
         ];
     }
@@ -262,6 +272,16 @@ class YseqtApiPayment extends BasePayment implements PaymentInterface, PayPlugin
     public function notifyFail(): string|Response
     {
         return 'fail';
+    }
+
+    private function yuanToCents(mixed $value, string $field): int
+    {
+        $text = trim((string) $value);
+        if (preg_match('/^(0|[1-9]\d*)(?:\.(\d{1,2}))?$/', $text, $matches) !== 1) {
+            throw new PaymentException($field . '格式无效', 40200);
+        }
+
+        return ((int) $matches[1] * 100) + (int) str_pad((string) ($matches[2] ?? ''), 2, '0');
     }
 
     /**
@@ -360,7 +380,7 @@ class YseqtApiPayment extends BasePayment implements PaymentInterface, PayPlugin
      */
     private function payResult(string $page, string $payType, string $product, string $action, array $payParams, array $data, array $order): array
     {
-        return [
+        return $this->pendingPaymentResult($order, [
             'pay_page' => $page,
             'pay_type' => $payType,
             'pay_product' => $product,
@@ -368,7 +388,7 @@ class YseqtApiPayment extends BasePayment implements PaymentInterface, PayPlugin
             'pay_params' => $payParams,
             'chan_order_no' => (string) ($data['requestNo'] ?? $order['pay_no']),
             'chan_trade_no' => (string) ($data['tradeSn'] ?? ''),
-        ];
+        ]);
     }
 
     /**

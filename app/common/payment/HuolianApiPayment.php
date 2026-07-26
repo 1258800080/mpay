@@ -14,11 +14,16 @@ use app\common\sdk\huolian\HuolianSdkException;
 use app\common\trait\DirectPaymentProductSelectorTrait;
 use app\common\util\FormatHelper;
 use app\exception\PaymentException;
+use app\exception\PaymentUncertainException;
+use app\exception\UnsupportedPaymentOperationException;
 use support\Request;
 use support\Response;
 
 /**
  * 火脸支付 API 插件。
+ *
+ * 提供支付宝、微信和银联的扫码、H5、微信小程序/JSAPI、支付通知与退款能力。
+ * 当前适配协议没有可确认的主动查单和关单接口。
  */
 class HuolianApiPayment extends BasePayment implements PaymentInterface, PayPluginInterface
 {
@@ -78,7 +83,7 @@ class HuolianApiPayment extends BasePayment implements PaymentInterface, PayPlug
      * 发起支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付结果
      */
     public function pay(array $order): array
     {
@@ -129,7 +134,7 @@ class HuolianApiPayment extends BasePayment implements PaymentInterface, PayPlug
      * 二维码支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付结果
      */
     private function qrcodePay(array $order): array
     {
@@ -155,32 +160,32 @@ class HuolianApiPayment extends BasePayment implements PaymentInterface, PayPlug
     }
 
     /**
-     * 火脸旧插件未提供主动查单链路。
+     * 当前适配协议未提供可确认的主动查单接口。
      *
      * @param array<string, mixed> $order 标准插件查单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付状态结果
      */
     public function query(array $order): array
     {
-        return ['success' => false, 'status' => PaymentPluginStatusConstant::PENDING, 'msg' => '火脸支付插件暂不支持主动查单'];
+        throw new UnsupportedPaymentOperationException('火脸支付插件暂不支持主动查单', 40200);
     }
 
     /**
-     * 火脸旧插件未提供关单链路。
+     * 当前适配协议未提供可确认的关单接口。
      *
      * @param array<string, mixed> $order 标准插件关单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准关单结果
      */
     public function close(array $order): array
     {
-        return ['success' => false, 'msg' => '火脸支付插件暂不支持关单'];
+        throw new UnsupportedPaymentOperationException('火脸支付插件暂不支持关单', 40200);
     }
 
     /**
      * 申请退款。
      *
      * @param array<string, mixed> $order 标准插件退款参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准退款结果
      */
     public function refund(array $order): array
     {
@@ -194,23 +199,30 @@ class HuolianApiPayment extends BasePayment implements PaymentInterface, PayPlug
                 'operatorAccount' => $this->configText('operator_account'),
             ]);
         } catch (HuolianSdkException $e) {
-            return ['success' => false, 'msg' => $e->getMessage()];
+            throw new PaymentUncertainException('火脸支付退款结果不确定：' . $e->getMessage(), 40200);
         }
 
+        $refundAmount = isset($data['refundAmount'])
+            ? $this->yuanToCents($data['refundAmount'], '火脸支付退款金额')
+            : (int) $order['refund_amount'];
+
         return [
-            'success' => true,
-            'msg' => '退款申请成功',
-            'chan_refund_no' => (string) ($data['refundNo'] ?? $order['refund_no']),
-            'refund_amount' => (int) round(((float) ($data['refundAmount'] ?? 0)) * 100),
-            'raw_data' => $data,
+            'status' => PaymentPluginStatusConstant::SUCCESS,
+            'refund_no' => (string) $order['refund_no'],
+            'pay_no' => (string) $order['pay_no'],
+            'refund_amount' => $refundAmount,
+            'chan_refund_no' => (string) ($data['refundNo'] ?? ''),
+            'message' => '退款申请成功',
         ];
     }
 
     /**
-     * 解析支付回调。
+     * 解析并验签支付回调。
+     *
+     * 外层报文验签通过后再解析 respBody，只有 orderStatus=2 才返回支付成功。
      *
      * @param Request $request 回调请求
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付通知结果
      */
     public function notify(Request $request): array
     {
@@ -225,9 +237,11 @@ class HuolianApiPayment extends BasePayment implements PaymentInterface, PayPlug
 
         return [
             'status' => $success ? PaymentPluginStatusConstant::SUCCESS : PaymentPluginStatusConstant::PENDING,
+            'pay_no' => trim((string) ($data['businessOrderNo'] ?? '')),
+            'paid_amount' => $success ? $this->yuanToCents($data['payAmount'] ?? null, '火脸支付回调金额') : null,
             'message' => (string) ($data['orderStatus'] ?? ''),
-            'channel_order_no' => (string) ($data['businessOrderNo'] ?? ''),
-            'channel_trade_no' => (string) ($data['orderNo'] ?? ''),
+            'chan_order_no' => (string) ($data['businessOrderNo'] ?? ''),
+            'chan_trade_no' => (string) ($data['orderNo'] ?? ''),
             'channel_status' => (string) ($data['orderStatus'] ?? ''),
         ];
     }
@@ -249,10 +263,27 @@ class HuolianApiPayment extends BasePayment implements PaymentInterface, PayPlug
     }
 
     /**
+     * 将渠道元金额转换为整数分。
+     *
+     * @param mixed $value 渠道金额
+     * @param string $field 金额字段说明
+     * @return int 金额，单位分
+     */
+    private function yuanToCents(mixed $value, string $field): int
+    {
+        $text = trim((string) $value);
+        if (preg_match('/^(0|[1-9]\d*)(?:\.(\d{1,2}))?$/', $text, $matches) !== 1) {
+            throw new PaymentException($field . '格式无效', 40200);
+        }
+
+        return ((int) $matches[1] * 100) + (int) str_pad((string) ($matches[2] ?? ''), 2, '0');
+    }
+
+    /**
      * H5 预下单。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付结果
      */
     private function h5Pay(array $order): array
     {
@@ -274,7 +305,7 @@ class HuolianApiPayment extends BasePayment implements PaymentInterface, PayPlug
      * 小程序/JSAPI 预下单。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付结果
      */
     private function appletPay(array $order): array
     {
@@ -302,7 +333,7 @@ class HuolianApiPayment extends BasePayment implements PaymentInterface, PayPlug
      * 构造通用下单参数。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 渠道下单参数
      */
     private function basePayload(array $order): array
     {
@@ -320,14 +351,18 @@ class HuolianApiPayment extends BasePayment implements PaymentInterface, PayPlug
     /**
      * 包装标准支付结果。
      *
+     * @param string $page 平台承接页类型
+     * @param string $payType 平台支付方式编码
+     * @param string $product 火脸产品编码
+     * @param string $action 渠道接口动作
      * @param array<string, mixed> $payParams 承接页参数
      * @param array<string, mixed> $data 上游响应
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @return array<string, mixed> 标准支付结果
      */
     private function payResult(string $page, string $payType, string $product, string $action, array $payParams, array $data, array $order): array
     {
-        return [
+        return $this->pendingPaymentResult($order, [
             'pay_page' => $page,
             'pay_type' => $payType,
             'pay_product' => $product,
@@ -335,11 +370,13 @@ class HuolianApiPayment extends BasePayment implements PaymentInterface, PayPlug
             'pay_params' => $payParams,
             'chan_order_no' => (string) ($data['businessOrderNo'] ?? $order['pay_no']),
             'chan_trade_no' => (string) ($data['orderNo'] ?? ''),
-        ];
+        ]);
     }
 
     /**
-     * 获取 SDK 客户端。
+     * 获取当前通道的 SDK 客户端。
+     *
+     * @return HuolianClient
      */
     private function client(): HuolianClient
     {
@@ -355,6 +392,9 @@ class HuolianApiPayment extends BasePayment implements PaymentInterface, PayPlug
 
     /**
      * 获取字符串配置。
+     *
+     * @param string $key 配置键
+     * @return string 配置值
      */
     private function configText(string $key): string
     {

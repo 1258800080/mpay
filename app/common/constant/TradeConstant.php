@@ -109,6 +109,19 @@ final class TradeConstant
     public const REFUND_STATUS_CLOSED = 4;
 
     /**
+     * 退款无需执行本地账户冲减。
+     */
+    public const REFUND_ACCOUNT_REVERSE_NOT_REQUIRED = 0;
+    /**
+     * 退款本地账户冲减仍有欠款。
+     */
+    public const REFUND_ACCOUNT_REVERSE_DUE = 1;
+    /**
+     * 退款本地账户冲减已经完成。
+     */
+    public const REFUND_ACCOUNT_REVERSE_RECOVERED = 2;
+
+    /**
      * 获取清算周期映射。
      *
      * @return array<int, string> 清算周期名称表
@@ -300,4 +313,3 @@ final class TradeConstant
         return in_array($status, self::settlementTerminalStatuses(), true);
     }
 }
-

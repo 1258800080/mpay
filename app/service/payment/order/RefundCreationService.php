@@ -97,7 +97,9 @@ class RefundCreationService extends BaseService
                 /** @var RefundOrder|null $existingByMerchantNo */
                 $existingByMerchantNo = $this->refundOrderRepository->findByMerchantRefundNo((int) $payOrder->merchant_id, $merchantRefundNo);
                 if ($existingByMerchantNo) {
-                    if ((string) $existingByMerchantNo->pay_no !== $payNo || (int) $existingByMerchantNo->refund_amount !== $refundAmount) {
+                    $amountConflicts = !$isFullRemainingRefund
+                        && (int) $existingByMerchantNo->refund_amount !== $refundAmount;
+                    if ((string) $existingByMerchantNo->pay_no !== $payNo || $amountConflicts) {
                         throw new ConflictException('幂等冲突', [
                             'refund_no' => (string) $existingByMerchantNo->refund_no,
                             'pay_no' => (string) $existingByMerchantNo->pay_no,
@@ -114,9 +116,13 @@ class RefundCreationService extends BaseService
                 TradeConstant::REFUND_STATUS_CREATED,
                 TradeConstant::REFUND_STATUS_PROCESSING,
                 TradeConstant::REFUND_STATUS_SUCCESS,
-            ], ['refund_amount']);
+                // 失败退款仍可能被可信查单或迟到通知修正为成功，必须继续占用可退额度。
+                TradeConstant::REFUND_STATUS_FAILED,
+            ], ['refund_amount', 'fee_reverse_amount']);
+            $previousFeeReverseAmount = 0;
             foreach ($reservedRefunds as $reservedRefund) {
                 $reservedRefundAmount += (int) $reservedRefund->refund_amount;
+                $previousFeeReverseAmount += (int) $reservedRefund->fee_reverse_amount;
             }
 
             $remainingRefundable = max(0, (int) $payOrder->pay_amount - $reservedRefundAmount);
@@ -140,8 +146,15 @@ class RefundCreationService extends BaseService
 
             $feeReverseAmount = 0;
             if ((int) $payOrder->channel_type === RouteConstant::CHANNEL_MODE_COLLECT && (int) $payOrder->pay_amount > 0) {
-                $feeReverseAmount = (int) floor(((int) $payOrder->service_fee_amount) * $refundAmount / max(1, (int) $payOrder->pay_amount));
+                $cumulativeRefundAmount = $reservedRefundAmount + $refundAmount;
+                $cumulativeFeeReverse = intdiv(
+                    (int) $payOrder->service_fee_amount * $cumulativeRefundAmount,
+                    (int) $payOrder->pay_amount
+                );
+                $feeReverseAmount = max(0, $cumulativeFeeReverse - $previousFeeReverseAmount);
             }
+
+            $extJson = (array) ($input['ext_json'] ?? []);
 
             return $this->refundOrderRepository->create([
                 'refund_no' => $this->generateNo('RFD'),
@@ -161,7 +174,7 @@ class RefundCreationService extends BaseService
                 'processing_at' => null,
                 'retry_count' => 0,
                 'last_error' => '',
-                'ext_json' => (array) ($input['ext_json'] ?? []),
+                'ext_json' => $extJson,
             ]);
         });
     }

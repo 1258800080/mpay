@@ -6,36 +6,54 @@ namespace app\common\sdk\fuiou;
 
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
+use OpenSSLAsymmetricKey;
 
 /**
- * 富友合作方聚合支付轻量客户端。
+ * 富友合作方聚合支付协议客户端。
  *
- * 迁移自彩虹 `PayService`：统一公共参数、GBK XML 报文、RSA-MD5 签名、
- * 富友响应验签和回调验签。业务产品字段由支付插件层传入。
+ * 协议边界固定为：UTF-8 业务字段 -> GBK 字段/XML -> RSA-MD5 -> req 双重
+ * application/x-www-form-urlencoded 编码。响应和通知均严格要求 RSA-MD5 验签。
  */
 class FuiouPayClient
 {
+    public const PATH_PRECREATE = '/preCreate';
+    public const PATH_WX_PRECREATE = '/wxPreCreate';
+    public const PATH_MICROPAY = '/micropay';
+    public const PATH_QUERY = '/commonQuery';
+    public const PATH_CLOSE = '/closeorder';
+    public const PATH_CANCEL = '/cancelorder';
+    public const PATH_REFUND = '/commonRefund';
+
+    public const RESULT_SUCCESS = '000000';
+
+    /**
+     * 付款码结果未知，必须查单，不能直接判失败。
+     */
+    public const MICROPAY_PENDING_CODES = [
+        '030010',
+        '010002',
+        '9999',
+        '010001',
+        '2001',
+        '2002',
+    ];
+
     private const VERSION = '1.0';
     private const TERM_ID = '88888888';
     private const PROD_GATEWAY = 'https://spay-mc.fuioupay.com';
-    private const TEST_GATEWAY = 'https://fundwx.fuiou.com';
+    private const TEST_GATEWAY = 'https://fundwx.payfuiouo2o.com';
 
     /**
-     * SDK 配置。
-     *
      * @var array<string, mixed>
      */
     private array $config;
 
-    /**
-     * HTTP 客户端。
-     */
     private Client $httpClient;
 
     /**
      * 构造方法。
      *
-     * @param array<string, mixed> $config SDK 配置
+     * @param array<string, mixed> $config
      */
     public function __construct(array $config)
     {
@@ -51,20 +69,14 @@ class FuiouPayClient
     /**
      * 发起富友接口请求。
      *
-     * @param string $path 接口路径
-     * @param array<string, mixed> $params 业务参数
-     * @return array<string, mixed>
+     * @param array<string, mixed> $params UTF-8 业务参数
+     * @return array<string, mixed> UTF-8 响应
      */
     public function submit(string $path, array $params): array
     {
-        $payload = array_merge([
-            'version' => self::VERSION,
-            'ins_cd' => $this->configText('institution_code'),
-            'mchnt_cd' => $this->configText('merchant_no'),
-            'term_id' => self::TERM_ID,
-            'random_str' => bin2hex(random_bytes(8)),
-        ], $this->toGbkPayload($params));
-        $payload['sign'] = $this->sign($payload);
+        $payload = $this->requestPayload($params);
+        $gbkPayload = $this->toGbkPayload($payload);
+        $gbkPayload['sign'] = $this->signProtocolPayload($gbkPayload);
 
         try {
             $response = $this->httpClient->post($this->gatewayUrl() . $path, [
@@ -72,30 +84,41 @@ class FuiouPayClient
                     'Accept' => '*/*',
                     'Content-Type' => 'application/x-www-form-urlencoded; charset=GBK',
                 ],
-                'body' => 'req=' . urlencode(urlencode($this->toXml($payload))),
+                'body' => 'req=' . urlencode(urlencode($this->toXml($gbkPayload))),
             ]);
         } catch (GuzzleException $e) {
             throw new FuiouSdkException('富友网关请求失败：' . $e->getMessage(), 0, $e);
         }
 
-        $result = $this->parseXml(urldecode((string) $response->getBody()));
-        $resultCode = (string) ($result['result_code'] ?? '');
-        if (in_array($resultCode, ['000000', '030010'], true)) {
-            if (!$this->verifyResponse($result)) {
-                throw new FuiouSdkException('富友响应验签失败');
-            }
+        if ($response->getStatusCode() < 200 || $response->getStatusCode() >= 300) {
+            throw new FuiouSdkException('富友网关 HTTP 状态异常：' . $response->getStatusCode());
+        }
 
+        $body = (string) $response->getBody();
+        $result = $this->parseXml(urldecode($body));
+        if (!$this->verify($result)) {
+            throw new FuiouSdkException('富友响应验签失败');
+        }
+
+        $resultCode = trim((string) ($result['result_code'] ?? ''));
+        if ($resultCode === self::RESULT_SUCCESS
+            || ($path === self::PATH_MICROPAY && in_array($resultCode, self::MICROPAY_PENDING_CODES, true))
+            || ($path === self::PATH_QUERY && $resultCode === '9999')) {
             return $result;
         }
 
-        throw new FuiouSdkException((string) ($result['result_msg'] ?? '富友返回失败'));
+        throw new FuiouSdkException(
+            trim((string) ($result['result_msg'] ?? '')) ?: '富友返回失败',
+            0,
+            null,
+            $this->safeResponse($result)
+        );
     }
 
     /**
-     * 兼容彩虹旧插件里的 request 命名，语义与 submit 一致。
+     * 发送渠道请求。
      *
-     * @param string $path 接口路径
-     * @param array<string, mixed> $params 业务参数
+     * @param array<string, mixed> $params
      * @return array<string, mixed>
      */
     public function request(string $path, array $params): array
@@ -104,9 +127,8 @@ class FuiouPayClient
     }
 
     /**
-     * 解析富友回调中的 XML 报文。
+     * 解析 GBK XML。libxml 会按 XML 声明把文本节点转换为 UTF-8。
      *
-     * @param string $xml XML 文本
      * @return array<string, mixed>
      */
     public function parseXml(string $xml): array
@@ -114,11 +136,15 @@ class FuiouPayClient
         if ($xml === '') {
             throw new FuiouSdkException('富友响应为空');
         }
+        if (stripos($xml, '<!DOCTYPE') !== false || stripos($xml, '<!ENTITY') !== false) {
+            throw new FuiouSdkException('富友 XML 包含不允许的声明');
+        }
 
         $previous = libxml_use_internal_errors(true);
-        $element = simplexml_load_string($xml, 'SimpleXMLElement', LIBXML_NONET);
+        $element = simplexml_load_string($xml, 'SimpleXMLElement', LIBXML_NONET | LIBXML_NOCDATA);
+        libxml_clear_errors();
         libxml_use_internal_errors($previous);
-        if ($element === false) {
+        if ($element === false || $element->getName() !== 'xml') {
             throw new FuiouSdkException('富友 XML 解析失败');
         }
 
@@ -132,41 +158,120 @@ class FuiouPayClient
     }
 
     /**
-     * 验证富友回调签名。
+     * 校验渠道通知签名。
      *
-     * @param array<string, mixed> $payload 回调参数
+     * @param array<string, mixed> $payload
      */
     public function verifyNotify(array $payload): bool
     {
-        return $this->verify($payload, false);
+        return $this->verify($payload);
     }
 
     /**
-     * 验证富友响应签名。
+     * 对 UTF-8 字段生成 RSA-MD5 签名，供固定向量和通知夹具复用。
      *
-     * 富友响应字段参与签名前需要按旧 SDK 逻辑转为 GBK。
-     *
-     * @param array<string, mixed> $payload 响应参数
+     * @param array<string, mixed> $payload
      */
-    private function verifyResponse(array $payload): bool
+    public function sign(array $payload): string
     {
-        return $this->verify($this->toGbkPayload($payload), true);
+        return $this->signProtocolPayload($this->toGbkPayload($payload));
     }
 
     /**
-     * 生成 RSA-MD5 签名。
+     * 校验渠道签名。
      *
-     * @param array<string, mixed> $payload 待签名参数
+     * @param array<string, mixed> $payload
      */
-    private function sign(array $payload): string
+    public function verify(array $payload): bool
     {
-        $privateKey = openssl_pkey_get_private($this->pemKey($this->configText('merchant_private_key'), 'private'));
-        if ($privateKey === false) {
-            throw new FuiouSdkException('富友商户私钥不正确');
+        $signature = trim((string) ($payload['sign'] ?? ''));
+        $decoded = $signature === '' ? false : base64_decode($signature, true);
+        if ($decoded === false) {
+            return false;
         }
 
+        $publicKey = $this->publicKey();
+
+        return openssl_verify(
+            $this->protocolSignContent($this->toGbkPayload($payload)),
+            $decoded,
+            $publicKey,
+            OPENSSL_ALGO_MD5
+        ) === 1;
+    }
+
+    /**
+     * 返回 UTF-8 参数对应的 GBK 待签名字节，用于协议固定向量测试。
+     *
+     * @param array<string, mixed> $payload
+     */
+    public function canonicalSignContent(array $payload): string
+    {
+        return $this->protocolSignContent($this->toGbkPayload($payload));
+    }
+
+    /**
+     * 将 UTF-8 字段编码成富友要求的 GBK XML。
+     *
+     * @param array<string, mixed> $payload
+     */
+    public function encodeXml(array $payload): string
+    {
+        return $this->toXml($this->toGbkPayload($payload));
+    }
+
+    /**
+     * 获取渠道网关地址。
+     *
+     * @return string 网关地址
+     */
+    public function gatewayUrl(): string
+    {
+        $custom = $this->configText('api_base_url');
+        if ($custom !== '') {
+            return rtrim($custom, '/');
+        }
+
+        return $this->configBool('sandbox') ? self::TEST_GATEWAY : self::PROD_GATEWAY;
+    }
+
+    /**
+     * 构建协议请求载荷。
+     *
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function requestPayload(array $params): array
+    {
+        $factory = $this->config['random_str_factory'] ?? null;
+        $random = is_callable($factory) ? (string) $factory() : bin2hex(random_bytes(8));
+        if ($random === '') {
+            throw new FuiouSdkException('富友请求随机串不能为空');
+        }
+
+        return array_merge([
+            'version' => self::VERSION,
+            'ins_cd' => $this->configText('institution_code'),
+            'mchnt_cd' => $this->configText('merchant_no'),
+            'term_id' => self::TERM_ID,
+            'random_str' => $random,
+        ], $params);
+    }
+
+    /**
+     * 生成协议载荷签名。
+     *
+     * @param array<string, mixed> $payload
+     */
+    private function signProtocolPayload(array $payload): string
+    {
         $signature = '';
-        if (!openssl_sign($this->signContent($payload), $signature, $privateKey, OPENSSL_ALGO_MD5)) {
+        if (!openssl_sign(
+            $this->protocolSignContent($payload),
+            $signature,
+            $this->privateKey(),
+            OPENSSL_ALGO_MD5
+        )) {
             throw new FuiouSdkException('富友请求签名失败');
         }
 
@@ -174,38 +279,17 @@ class FuiouPayClient
     }
 
     /**
-     * 验证 RSA-MD5 签名。
+     * 构建协议签名原文。
      *
-     * @param array<string, mixed> $payload 待验签参数
-     * @param bool $strict 是否严格要求 sign 字段存在
+     * @param array<string, mixed> $payload
      */
-    private function verify(array $payload, bool $strict): bool
+    private function protocolSignContent(array $payload): string
     {
-        $signature = (string) ($payload['sign'] ?? '');
-        if ($signature === '') {
-            return !$strict;
-        }
-
-        $publicKey = openssl_pkey_get_public($this->pemKey($this->configText('platform_public_key'), 'public'));
-        if ($publicKey === false) {
-            throw new FuiouSdkException('富友平台公钥不正确');
-        }
-
-        return openssl_verify($this->signContent($payload), base64_decode($signature), $publicKey, OPENSSL_ALGO_MD5) === 1;
-    }
-
-    /**
-     * 构造待签名字符串。
-     *
-     * @param array<string, mixed> $payload 参数
-     */
-    private function signContent(array $payload): string
-    {
-        ksort($payload);
-
+        ksort($payload, SORT_STRING);
         $pieces = [];
         foreach ($payload as $key => $value) {
-            if ($key === 'sign' || str_starts_with((string) $key, 'reserved')) {
+            $key = (string) $key;
+            if ($key === 'sign' || str_starts_with($key, 'reserved')) {
                 continue;
             }
             $pieces[] = $key . '=' . (is_array($value) ? '' : (string) $value);
@@ -215,9 +299,9 @@ class FuiouPayClient
     }
 
     /**
-     * 构造富友 XML 报文。
+     * 生成 XML 请求正文。
      *
-     * @param array<string, mixed> $payload 参数
+     * @param array<string, mixed> $payload
      */
     private function toXml(array $payload): string
     {
@@ -227,76 +311,131 @@ class FuiouPayClient
     }
 
     /**
-     * 递归构造 XML 节点。
+     * 生成 XML 节点。
      *
-     * @param array<string, mixed> $payload 参数
+     * @param array<string, mixed> $payload
      */
     private function xmlNodes(array $payload): string
     {
         $xml = '';
         foreach ($payload as $key => $value) {
+            if (!preg_match('/^[A-Za-z_][A-Za-z0-9_.-]*$/', (string) $key)) {
+                throw new FuiouSdkException('富友 XML 字段名不合法');
+            }
             if (is_array($value)) {
                 $xml .= '<' . $key . '>' . $this->xmlNodes($value) . '</' . $key . '>';
                 continue;
             }
-
-            $xml .= '<' . $key . '>' . htmlspecialchars((string) $value, ENT_XML1 | ENT_COMPAT, 'GBK') . '</' . $key . '>';
+            // PHP 的 htmlspecialchars 并不稳定支持 GBK 字节串；XML 五个保留字符
+            // 都是 ASCII，直接在 GBK 字节上替换不会破坏多字节字符。
+            $escaped = str_replace(
+                ['&', '<', '>', '"', "'"],
+                ['&amp;', '&lt;', '&gt;', '&quot;', '&apos;'],
+                (string) $value
+            );
+            $xml .= '<' . $key . '>' . $escaped . '</' . $key . '>';
         }
 
         return $xml;
     }
 
     /**
-     * 将请求字段转换为富友要求的 GBK 编码。
+     * 将请求载荷转换为 GBK。
      *
-     * @param array<string, mixed> $payload 参数
+     * @param array<string, mixed> $payload
      * @return array<string, mixed>
      */
     private function toGbkPayload(array $payload): array
     {
         foreach ($payload as $key => $value) {
-            if (is_string($value) && $value !== '') {
-                $payload[$key] = mb_convert_encoding($value, 'GBK', 'UTF-8');
+            if (is_array($value)) {
+                $payload[$key] = $this->toGbkPayload($value);
+            } elseif (is_string($value) && $value !== '') {
+                $converted = mb_convert_encoding($value, 'GBK', 'UTF-8');
+                if ($converted === '') {
+                    throw new FuiouSdkException('富友字段 GBK 编码失败');
+                }
+                $payload[$key] = $converted;
             }
         }
 
         return $payload;
     }
 
-    /**
-     * 规范化 PEM 密钥。
-     */
-    private function pemKey(string $key, string $type): string
+    private function privateKey(): OpenSSLAsymmetricKey
     {
-        if (str_contains($key, 'BEGIN')) {
-            return $key;
+        foreach ($this->keyCandidates($this->configText('merchant_private_key'), true) as $candidate) {
+            $key = openssl_pkey_get_private($candidate);
+            if ($key !== false) {
+                return $key;
+            }
         }
 
-        $header = $type === 'private' ? 'RSA PRIVATE KEY' : 'PUBLIC KEY';
+        throw new FuiouSdkException('富友商户私钥不正确（支持 PKCS#8/PKCS#1 PEM 或裸 Base64）');
+    }
 
-        return "-----BEGIN {$header}-----\n"
-            . wordwrap(str_replace(["\r", "\n"], '', $key), 64, "\n", true)
-            . "\n-----END {$header}-----";
+    private function publicKey(): OpenSSLAsymmetricKey
+    {
+        foreach ($this->keyCandidates($this->configText('platform_public_key'), false) as $candidate) {
+            $key = openssl_pkey_get_public($candidate);
+            if ($key !== false) {
+                return $key;
+            }
+        }
+
+        throw new FuiouSdkException('富友平台公钥不正确（支持 PEM/证书或裸 Base64）');
     }
 
     /**
-     * 获取网关地址。
+     * 构建签名密钥候选列表。
+     *
+     * @return array<int, string>
      */
-    private function gatewayUrl(): string
+    private function keyCandidates(string $key, bool $private): array
     {
-        $custom = $this->configText('api_base_url');
-        if ($custom !== '') {
-            return rtrim($custom, '/');
+        $key = trim($key);
+        if ($key === '') {
+            return [];
+        }
+        if (str_contains($key, '-----BEGIN')) {
+            return [$key];
         }
 
-        return (bool) ($this->config['sandbox'] ?? false) ? self::TEST_GATEWAY : self::PROD_GATEWAY;
+        $body = wordwrap(preg_replace('/\s+/', '', $key) ?: '', 64, "\n", true);
+        $types = $private ? ['PRIVATE KEY', 'RSA PRIVATE KEY'] : ['PUBLIC KEY', 'RSA PUBLIC KEY', 'CERTIFICATE'];
+
+        return array_map(
+            static fn (string $type): string => "-----BEGIN {$type}-----\n{$body}\n-----END {$type}-----",
+            $types
+        );
     }
 
     /**
-     * 获取字符串配置。
+     * 生成脱敏响应摘要。
+     *
+     * @param array<string, mixed> $payload
+     * @return array<string, mixed>
      */
+    private function safeResponse(array $payload): array
+    {
+        return array_intersect_key($payload, array_flip([
+            'result_code',
+            'result_msg',
+            'mchnt_cd',
+            'mchnt_order_no',
+            'refund_order_no',
+            'order_type',
+            'trans_stat',
+        ]));
+    }
+
     private function configText(string $key): string
     {
         return trim((string) ($this->config[$key] ?? ''));
+    }
+
+    private function configBool(string $key): bool
+    {
+        return filter_var($this->config[$key] ?? false, FILTER_VALIDATE_BOOL);
     }
 }

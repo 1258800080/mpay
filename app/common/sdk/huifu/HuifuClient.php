@@ -6,12 +6,13 @@ namespace app\common\sdk\huifu;
 
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
+use JsonException;
 
 /**
  * 汇付斗拱平台轻量客户端。
  *
- * 迁移自彩虹 `HuifuClient`：请求体为 `sys_id/product_id/data/sign`，
- * `data` 按 key 排序后用 RSA-SHA256 签名，响应和通知用汇付公钥验签。
+ * 请求体使用 `sys_id/product_id/data/sign`；`data` 排序后使用
+ * RSA-SHA256 签名，响应和通知使用平台公钥验签。
  */
 class HuifuClient
 {
@@ -54,6 +55,16 @@ class HuifuClient
      */
     public function request(string $path, array $data): array
     {
+        $path = trim($path);
+        if ($path === '' || $path[0] !== '/') {
+            throw new HuifuSdkException('汇付接口路径必须以 / 开头');
+        }
+        foreach (['sys_id' => '系统号', 'product_id' => '产品号', 'merchant_private_key' => '商户私钥', 'huifu_public_key' => '汇付公钥'] as $field => $label) {
+            if ($this->configText($field) === '') {
+                throw new HuifuSdkException('汇付' . $label . '不能为空');
+            }
+        }
+
         $body = [
             'sys_id' => $this->configText('sys_id'),
             'product_id' => $this->configText('product_id'),
@@ -62,18 +73,32 @@ class HuifuClient
         $body['sign'] = $this->sign($data);
 
         try {
+            $requestBody = json_encode(
+                $body,
+                JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR
+            );
+        } catch (JsonException $e) {
+            throw new HuifuSdkException('汇付请求报文编码失败', 0, $e);
+        }
+
+        try {
             $response = $this->httpClient->post($this->gatewayUrl() . $path, [
                 'headers' => [
                     'Accept' => 'application/json',
                     'Content-Type' => 'application/json; charset=utf-8',
                 ],
-                'json' => $body,
+                'body' => $requestBody,
             ]);
         } catch (GuzzleException $e) {
             throw new HuifuSdkException('汇付网关请求失败：' . $e->getMessage(), 0, $e);
         }
 
-        $payload = json_decode((string) $response->getBody(), true);
+        $statusCode = $response->getStatusCode();
+        $responseText = (string) $response->getBody();
+        $payload = json_decode($responseText, true);
+        if ($statusCode < 200 || $statusCode >= 300) {
+            throw new HuifuSdkException('汇付网关 HTTP 状态异常', $statusCode);
+        }
         if (!is_array($payload) || !is_array($payload['data'] ?? null) || (string) ($payload['sign'] ?? '') === '') {
             throw new HuifuSdkException('汇付响应解析失败');
         }
@@ -133,7 +158,12 @@ class HuifuClient
             throw new HuifuSdkException('汇付公钥不正确');
         }
 
-        return openssl_verify($content, base64_decode($sign), $publicKey, OPENSSL_ALGO_SHA256) === 1;
+        $signature = base64_decode($sign, true);
+        if ($signature === false) {
+            return false;
+        }
+
+        return openssl_verify($content, $signature, $publicKey, OPENSSL_ALGO_SHA256) === 1;
     }
 
     /**
@@ -146,7 +176,14 @@ class HuifuClient
         $data = array_filter($data, static fn ($value): bool => $value !== null);
         ksort($data);
 
-        return json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?: '{}';
+        try {
+            return json_encode(
+                $data,
+                JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR
+            );
+        } catch (JsonException $e) {
+            throw new HuifuSdkException('汇付签名数据编码失败', 0, $e);
+        }
     }
 
     /**
@@ -171,8 +208,12 @@ class HuifuClient
     private function gatewayUrl(): string
     {
         $gateway = $this->configText('api_base_url');
+        $gateway = $gateway !== '' ? rtrim($gateway, '/') : self::DEFAULT_GATEWAY;
+        if (!str_starts_with(strtolower($gateway), 'https://')) {
+            throw new HuifuSdkException('汇付网关必须使用 HTTPS');
+        }
 
-        return $gateway !== '' ? rtrim($gateway, '/') : self::DEFAULT_GATEWAY;
+        return $gateway;
     }
 
     /**

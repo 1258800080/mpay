@@ -197,12 +197,18 @@ class PaymentPluginFactoryService extends BaseService
         $config['plugin_code'] = (string) $plugin->code;
         $config['plugin_name'] = (string) $plugin->name;
         $config['channel_id'] = (int) $channel->id;
-        $config['merchant_id'] = (int) $channel->merchant_id;
         $config['channel_mode'] = (int) $channel->channel_mode;
         $config['pay_type_id'] = (int) $channel->pay_type_id;
         $config['api_config_id'] = $configId;
         $config['enabled_pay_types'] = $this->normalizeCodes($plugin->pay_types ?? []);
         $config['enabled_transfer_types'] = $this->normalizeCodes($plugin->transfer_types ?? []);
+        $config['_runtime'] = [
+            'merchant_id' => (int) $channel->merchant_id,
+            'channel_id' => (int) $channel->id,
+            'pay_type_id' => (int) $channel->pay_type_id,
+            'api_config_id' => $configId,
+            'plugin_code' => (string) $plugin->code,
+        ];
 
         return $config;
     }

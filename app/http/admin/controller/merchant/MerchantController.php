@@ -144,7 +144,6 @@ class MerchantController extends BaseController
         $merchant = $this->merchantService->ensureMerchantEnabled((int) $data['id']);
         $issued = $this->merchantAuthService->issueToken(
             (int) $merchant->id,
-            3600,
             (string) $request->getRealIp(),
             (string) $request->header('user-agent', '')
         );

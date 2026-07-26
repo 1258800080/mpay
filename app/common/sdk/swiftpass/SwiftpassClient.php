@@ -39,7 +39,7 @@ class SwiftpassClient
             'timeout' => 15,
             'connect_timeout' => 10,
             'http_errors' => false,
-            'verify' => false,
+            'verify' => true,
         ]);
     }
 

@@ -14,11 +14,16 @@ use app\common\sdk\yinyingtong\YinyingtongSdkException;
 use app\common\trait\DirectPaymentProductSelectorTrait;
 use app\common\util\FormatHelper;
 use app\exception\PaymentException;
+use app\exception\PaymentUncertainException;
+use app\exception\UnsupportedPaymentOperationException;
 use support\Request;
 use support\Response;
 
 /**
  * 银盈通支付 API 插件。
+ *
+ * 负责支付宝/微信预下单、微信小程序 Scheme、银行卡快捷支付、退款和两种格式的异步通知适配。
+ * 当前协议未接入可确认的主动查单与关单能力。
  */
 class YinyingtongApiPayment extends BasePayment implements PaymentInterface, PayPluginInterface
 {
@@ -75,7 +80,8 @@ class YinyingtongApiPayment extends BasePayment implements PaymentInterface, Pay
      * 发起支付。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准待支付结果
      */
     public function pay(array $order): array
     {
@@ -133,9 +139,10 @@ class YinyingtongApiPayment extends BasePayment implements PaymentInterface, Pay
      * 预下单并按承接页类型返回。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @param string $payType 支付方式
+     * @param string $payType 标准支付方式代码
      * @param string $payPage 承接页类型
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准跳转或二维码待支付结果
      */
     private function prepayPay(array $order, string $payType, string $payPage): array
     {
@@ -157,25 +164,25 @@ class YinyingtongApiPayment extends BasePayment implements PaymentInterface, Pay
     }
 
     /**
-     * 银盈通旧插件未提供主动查单链路。
+     * 当前适配协议未提供可确认的主动查单接口。
      *
      * @param array<string, mixed> $order 标准插件查单参数
      * @return array<string, mixed>
      */
     public function query(array $order): array
     {
-        return ['success' => false, 'status' => PaymentPluginStatusConstant::PENDING, 'msg' => '银盈通插件暂不支持主动查单'];
+        throw new UnsupportedPaymentOperationException('银盈通插件暂不支持主动查单', 40200);
     }
 
     /**
-     * 银盈通旧插件未提供关单链路。
+     * 当前适配协议未提供可确认的关单接口。
      *
      * @param array<string, mixed> $order 标准插件关单参数
      * @return array<string, mixed>
      */
     public function close(array $order): array
     {
-        return ['success' => false, 'msg' => '银盈通插件暂不支持关单'];
+        throw new UnsupportedPaymentOperationException('银盈通插件暂不支持关单', 40200);
     }
 
     /**
@@ -195,27 +202,31 @@ class YinyingtongApiPayment extends BasePayment implements PaymentInterface, Pay
                 'old_order_id' => (string) ($order['chan_trade_no'] ?? ''),
                 'amount' => FormatHelper::amount((int) $order['refund_amount']),
                 'currency' => 'CNY',
-                'async_notification_addr' => (string) ($order['callback_url'] ?? ''),
+                'async_notification_addr' => (string) ($order['refund_callback_url'] ?? ''),
                 'memo' => '订单退款',
             ], (string) ($order['client_ip'] ?? ''), (string) ($order['_env'] ?? 'pc'));
         } catch (YinyingtongSdkException $e) {
-            return ['success' => false, 'msg' => $e->getMessage()];
+            throw new PaymentUncertainException('银盈通退款结果不确定：' . $e->getMessage(), 40200);
         }
 
         return [
-            'success' => true,
-            'msg' => '退款申请成功',
-            'chan_refund_no' => (string) ($data['order_id'] ?? $order['refund_no']),
+            'status' => PaymentPluginStatusConstant::SUCCESS,
+            'refund_no' => (string) $order['refund_no'],
+            'pay_no' => (string) $order['pay_no'],
             'refund_amount' => (int) $order['refund_amount'],
-            'raw_data' => $data,
+            'chan_refund_no' => (string) ($data['order_id'] ?? ''),
+            'message' => '退款申请成功',
         ];
     }
 
     /**
      * 解析支付回调。
      *
+     * 兼容签名 JSON 与 dstbdatasign 加密通知：前者验签后解析 data，后者通过 SDK 解密后再归一化状态。
+     *
      * @param Request $request 回调请求
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准支付通知结果
      */
     public function notify(Request $request): array
     {
@@ -239,12 +250,16 @@ class YinyingtongApiPayment extends BasePayment implements PaymentInterface, Pay
 
         $status = (string) ($data['orderstatus'] ?? $data['status'] ?? '');
         $success = in_array($status, ['00', 'SUCCESS'], true);
+        $payNo = isset($data['dsorderid']) ? (string) $data['dsorderid'] : (string) ($data['order_number'] ?? '');
+        $amount = isset($data['amount']) ? $data['amount'] : ($data['total_amount'] ?? null);
 
         return [
             'status' => $success ? PaymentPluginStatusConstant::SUCCESS : PaymentPluginStatusConstant::FAILED,
+            'pay_no' => trim($payNo),
+            'paid_amount' => $success ? $this->yuanToCents($amount, '银盈通回调金额') : null,
             'message' => $status,
-            'channel_order_no' => (string) ($data['dsorderid'] ?? $data['order_number'] ?? ''),
-            'channel_trade_no' => (string) ($data['orderid'] ?? $data['order_id'] ?? ''),
+            'chan_order_no' => (string) ($data['dsorderid'] ?? $data['order_number'] ?? ''),
+            'chan_trade_no' => (string) ($data['orderid'] ?? $data['order_id'] ?? ''),
             'channel_status' => $status,
         ];
     }
@@ -263,6 +278,22 @@ class YinyingtongApiPayment extends BasePayment implements PaymentInterface, Pay
     public function notifyFail(): string|Response
     {
         return '01';
+    }
+
+    /**
+     * 将渠道元金额严格换算为分，拒绝负数及超过两位的小数。
+     *
+     * @param mixed $value 渠道元金额原值
+     * @param string $field 用于异常提示的字段名称
+     */
+    private function yuanToCents(mixed $value, string $field): int
+    {
+        $text = trim((string) $value);
+        if (preg_match('/^(0|[1-9]\d*)(?:\.(\d{1,2}))?$/', $text, $matches) !== 1) {
+            throw new PaymentException($field . '格式无效', 40200);
+        }
+
+        return ((int) $matches[1] * 100) + (int) str_pad((string) ($matches[2] ?? ''), 2, '0');
     }
 
     /**
@@ -324,7 +355,10 @@ class YinyingtongApiPayment extends BasePayment implements PaymentInterface, Pay
      * 支付预下单。
      *
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     * @param string $payType 银盈通支付类型
+     * @param string $bankServiceType 银行服务类型；无需该字段时传空字符串
+     *
+     * @return array<string, mixed> 上游预下单响应
      */
     private function prepay(array $order, string $payType, string $bankServiceType): array
     {
@@ -349,16 +383,21 @@ class YinyingtongApiPayment extends BasePayment implements PaymentInterface, Pay
     }
 
     /**
-     * 包装标准支付结果。
+     * 将上游支付凭据包装为标准待支付结果。
      *
+     * @param string $page 收银台承接页类型
+     * @param string $payType 标准支付方式代码
+     * @param string $product 银盈通产品代码
+     * @param string $action 实际调用的上游接口
      * @param array<string, mixed> $payParams 承接页参数
      * @param array<string, mixed> $data 上游响应
      * @param array<string, mixed> $order 标准插件下单参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准待支付结果
      */
     private function payResult(string $page, string $payType, string $product, string $action, array $payParams, array $data, array $order): array
     {
-        return [
+        return $this->pendingPaymentResult($order, [
             'pay_page' => $page,
             'pay_type' => $payType,
             'pay_product' => $product,
@@ -366,11 +405,11 @@ class YinyingtongApiPayment extends BasePayment implements PaymentInterface, Pay
             'pay_params' => $payParams,
             'chan_order_no' => (string) ($data['order_number'] ?? $order['pay_no']),
             'chan_trade_no' => (string) ($data['order_id'] ?? ''),
-        ];
+        ]);
     }
 
     /**
-     * 渠道商户号支持按逗号配置多个值，用于银盈通多渠道号轮询。
+     * 从逗号分隔的渠道商户号中随机选择一个值。
      */
     private function channelMerchantNo(): string
     {
@@ -384,7 +423,7 @@ class YinyingtongApiPayment extends BasePayment implements PaymentInterface, Pay
     }
 
     /**
-     * 获取 SDK 客户端。
+     * 获取按应用和产品密钥初始化的 SDK 客户端。
      */
     private function client(): YinyingtongClient
     {
@@ -400,7 +439,9 @@ class YinyingtongApiPayment extends BasePayment implements PaymentInterface, Pay
     }
 
     /**
-     * 获取字符串配置。
+     * 读取字符串配置，缺失时返回空字符串。
+     *
+     * @param string $key 配置键
      */
     private function configText(string $key): string
     {

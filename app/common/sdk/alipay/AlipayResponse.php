@@ -187,7 +187,35 @@ class AlipayResponse
     }
 
     /**
-     * 转换为数组，便于插件保存 raw 或统一处理。
+     * 获取支付宝链路请求标识，供脱敏诊断使用。
+     *
+     * @return string 请求标识
+     */
+    public function requestId(): string
+    {
+        $data = $this->data();
+        foreach (['trace_id', 'request_id', 'alipay_request_id'] as $key) {
+            $value = trim((string) ($data[$key] ?? $this->decoded[$key] ?? ''));
+            if ($value !== '') {
+                return $value;
+            }
+        }
+
+        return '';
+    }
+
+    /**
+     * 获取证书模式响应声明的支付宝公钥证书序列号。
+     *
+     * @return string 支付宝公钥证书序列号
+     */
+    public function alipayCertSn(): string
+    {
+        return trim((string) ($this->decoded['alipay_cert_sn'] ?? ''));
+    }
+
+    /**
+     * 转换为不包含完整响应和用户身份信息的诊断摘要。
      *
      * @return array<string, mixed> 响应摘要
      */
@@ -202,8 +230,8 @@ class AlipayResponse
             'msg' => $this->msg(),
             'sub_code' => $this->subCode(),
             'sub_msg' => $this->subMsg(),
-            'data' => $this->data(),
-            'raw' => $this->decoded,
+            'request_id' => $this->requestId(),
+            'alipay_cert_sn' => $this->alipayCertSn(),
         ];
     }
 }

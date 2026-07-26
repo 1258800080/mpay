@@ -44,6 +44,15 @@ class WxpayClient
     private const V2_TRADE_TYPE_H5 = 'MWEB';
     private const V2_TRADE_TYPE_NATIVE = 'NATIVE';
 
+    private const V3_NOTIFY_MAX_TIME_SKEW = 300;
+
+    /**
+     * V2 沙箱验签密钥进程内缓存。
+     *
+     * @var array<string, array{key:string,expires_at:int}>
+     */
+    private static array $sandboxSignKeyCache = [];
+
     /**
      * 微信支付 SDK 配置。
      *
@@ -286,6 +295,11 @@ class WxpayClient
      */
     public function parseV3Notify(array $headers, string $body): array
     {
+        $timestamp = $this->headerValue($headers, 'Wechatpay-Timestamp');
+        if ($timestamp === '' || !ctype_digit($timestamp)
+            || abs(time() - (int) $timestamp) > self::V3_NOTIFY_MAX_TIME_SKEW) {
+            throw new WxpaySdkException('微信支付 V3 通知时间戳无效或已过期');
+        }
         if (!$this->verifyV3Message($headers, $body)) {
             throw new WxpaySdkException('微信支付 V3 通知验签失败');
         }
@@ -298,10 +312,22 @@ class WxpayClient
         if (!is_array($payload)) {
             throw new WxpaySdkException('微信支付 V3 通知不是有效 JSON');
         }
+        if (strtoupper((string) ($payload['event_type'] ?? '')) !== 'TRANSACTION.SUCCESS') {
+            throw new WxpaySdkException('微信支付 V3 通知事件类型不是 TRANSACTION.SUCCESS');
+        }
+        if ((string) ($payload['resource_type'] ?? '') !== 'encrypt-resource') {
+            throw new WxpaySdkException('微信支付 V3 通知资源类型不是 encrypt-resource');
+        }
 
         $resource = $payload['resource'] ?? [];
         if (!is_array($resource)) {
             throw new WxpaySdkException('微信支付 V3 通知缺少 resource');
+        }
+        if ((string) ($resource['original_type'] ?? '') !== 'transaction') {
+            throw new WxpaySdkException('微信支付 V3 通知原始资源不是 transaction');
+        }
+        if ((string) ($resource['algorithm'] ?? '') !== 'AEAD_AES_256_GCM') {
+            throw new WxpaySdkException('微信支付 V3 通知加密算法不是 AEAD_AES_256_GCM');
         }
 
         return WxpaySigner::decryptResource($resource, $this->config->apiV3Key());
@@ -324,7 +350,16 @@ class WxpayClient
         $timestamp = $this->headerValue($headers, 'Wechatpay-Timestamp');
         $nonce = $this->headerValue($headers, 'Wechatpay-Nonce');
         $signature = $this->headerValue($headers, 'Wechatpay-Signature');
-        if ($timestamp === '' || $nonce === '' || $signature === '') {
+        $serial = $this->headerValue($headers, 'Wechatpay-Serial');
+        if ($timestamp === '' || $nonce === '' || $signature === '' || $serial === '') {
+            return false;
+        }
+
+        $expectedIdentifier = $this->config->platformKeyIdentifier();
+        $identifierMatches = $this->config->usesWechatpayPublicKey()
+            ? hash_equals($expectedIdentifier, $serial)
+            : hash_equals(strtoupper($expectedIdentifier), strtoupper($serial));
+        if ($expectedIdentifier === '' || !$identifierMatches) {
             return false;
         }
 
@@ -340,8 +375,28 @@ class WxpayClient
     public function parseV2Notify(string $xml): array
     {
         $data = WxpayXml::decode($xml);
-        if (!WxpaySigner::verifyV2($data, $this->config->apiKey())) {
-            throw new WxpaySdkException('微信支付 V2 通知验签失败');
+        if (strtoupper((string) ($data['return_code'] ?? '')) !== 'SUCCESS') {
+            throw new WxpaySdkException('微信支付 V2 通知通信失败：' . (string) ($data['return_msg'] ?? 'UNKNOWN'));
+        }
+
+        $apiKeys = $this->v2NotificationApiKeys();
+        if (!WxpaySigner::verifyV2($data, $apiKeys)) {
+            $emptyFields = array_keys(array_filter($data, static fn (string $value): bool => $value === ''));
+            $reportedSignType = strtoupper(trim((string) ($data['sign_type'] ?? $data['signType'] ?? '')));
+            $effectiveSignType = $reportedSignType !== ''
+                ? $reportedSignType
+                : (strlen((string) ($data['sign'] ?? '')) === 64 ? 'HMAC-SHA256(inferred)' : 'MD5(default)');
+            $fingerprints = array_map(
+                static fn (string $key): string => substr(hash('sha256', $key), 0, 12),
+                $apiKeys
+            );
+            throw new WxpaySdkException(sprintf(
+                '微信支付 V2 通知验签失败（sign_type=%s, field_count=%d, empty_fields=%s, key_fingerprints=%s）',
+                $effectiveSignType,
+                count($data),
+                $emptyFields === [] ? '-' : implode(',', $emptyFields),
+                implode(',', $fingerprints)
+            ));
         }
 
         return $data;
@@ -409,7 +464,7 @@ class WxpayClient
             $httpResponse->getHeaders()
         );
 
-        if ($this->config->verifyResponse() && $this->config->platformPublicKeyOrCert() !== '') {
+        if ($this->config->verifyResponse()) {
             if (!$this->verifyV3Message($httpResponse->getHeaders(), $rawBody)) {
                 throw new WxpaySdkException('微信支付 V3 响应验签失败');
             }
@@ -428,9 +483,35 @@ class WxpayClient
      */
     public function requestV2(string $path, array $params, bool $requiresCert = false): WxpayResponse
     {
-        $path = $this->v2Path($path);
+        $apiKey = $this->config->sandbox() ? $this->sandboxSignKey() : $this->config->apiKey();
+
+        return $this->sendV2Request($this->v2Path($path), $params, $requiresCert, $apiKey, true);
+    }
+
+    /**
+     * 发送已经确定路径和签名密钥的 V2 请求。
+     *
+     * @param string $path 实际请求路径
+     * @param array<string, mixed> $params XML 参数
+     * @param bool $requiresCert 是否需要双向证书
+     * @param string $apiKey 本次请求使用的签名密钥
+     * @param bool $verifyResponse 是否验证成功响应签名
+     * @return WxpayResponse 微信支付响应
+     */
+    private function sendV2Request(
+        string $path,
+        array $params,
+        bool $requiresCert,
+        string $apiKey,
+        bool $verifyResponse
+    ): WxpayResponse {
+        $path = '/' . ltrim($path, '/');
         $params = $this->filterEmpty($params);
-        $params['sign'] = WxpaySigner::signV2($params, $this->config->apiKey(), (string) ($params['sign_type'] ?? $this->config->v2SignType()));
+        $params['sign'] = WxpaySigner::signV2(
+            $params,
+            $apiKey,
+            (string) ($params['sign_type'] ?? $this->config->v2SignType())
+        );
         $xml = WxpayXml::encode($params);
 
         $requestOptions = [
@@ -462,6 +543,13 @@ class WxpayClient
 
         $rawBody = (string) $httpResponse->getBody();
         $data = WxpayXml::decode($rawBody);
+
+        $returnSuccess = strtoupper((string) ($data['return_code'] ?? '')) === 'SUCCESS';
+        $resultSuccess = !array_key_exists('result_code', $data)
+            || strtoupper((string) $data['result_code']) === 'SUCCESS';
+        if ($verifyResponse && $returnSuccess && $resultSuccess && !WxpaySigner::verifyV2($data, $apiKey)) {
+            throw new WxpaySdkException('微信支付 V2 响应验签失败');
+        }
 
         return new WxpayResponse(
             self::API_VERSION_V2,
@@ -615,9 +703,11 @@ class WxpayClient
 
         $timeStamp = (string) time();
         $nonceStr = WxpaySigner::nonceStr();
+        $appId = $this->frontendAppId($request);
+        $partnerId = $this->frontendPartnerId($apiVersion, $request);
         if ($apiVersion === self::API_VERSION_V3) {
             $sign = WxpaySigner::appPaySign(
-                $this->frontendAppId($request),
+                $appId,
                 $timeStamp,
                 $nonceStr,
                 $prepayId,
@@ -625,8 +715,8 @@ class WxpayClient
             );
         } else {
             $sign = WxpaySigner::signV2([
-                'appid' => $this->frontendAppId($request),
-                'partnerid' => $this->config->mchId(),
+                'appid' => $appId,
+                'partnerid' => $partnerId,
                 'prepayid' => $prepayId,
                 'package' => 'Sign=WXPay',
                 'noncestr' => $nonceStr,
@@ -635,8 +725,8 @@ class WxpayClient
         }
 
         return [
-            'appId' => $this->frontendAppId($request),
-            'partnerId' => $this->config->mchId(),
+            'appId' => $appId,
+            'partnerId' => $partnerId,
             'prepayId' => $prepayId,
             'packageValue' => 'Sign=WXPay',
             'nonceStr' => $nonceStr,
@@ -866,6 +956,94 @@ class WxpayClient
             ?? $request['sp_appid']
             ?? $this->config->appId()
         );
+    }
+
+    /**
+     * 获取 APP 调起支付使用的商户号。
+     *
+     * V2 服务商 APP 支付文档要求 partnerid 使用子商户号。V3 则与
+     * 实际调起的 AppID 保持同一主体：使用 sub_appid 时传 sub_mchid，
+     * 否则传 sp_mchid。
+     *
+     * @param string $apiVersion API 版本
+     * @param array<string, mixed> $request 下单请求
+     * @return string APP 调起支付的 partnerId
+     */
+    private function frontendPartnerId(string $apiVersion, array $request): string
+    {
+        if (!$this->config->isPartner()) {
+            return $this->config->mchId();
+        }
+
+        $subMchId = (string) ($request['sub_mch_id'] ?? $request['sub_mchid'] ?? $this->config->subMchId());
+        if ($apiVersion === self::API_VERSION_V2 || (string) ($request['sub_appid'] ?? '') !== '') {
+            return $subMchId;
+        }
+
+        return (string) ($request['sp_mchid'] ?? $request['mch_id'] ?? $this->config->mchId());
+    }
+
+    /**
+     * 获取 V2 通知允许使用的验签密钥。
+     *
+     * 生产环境在 APIv2 密钥轮换期允许主密钥和显式配置的上一把密钥；沙箱环境
+     * 必须使用 getsignkey 接口返回的 sandbox_signkey。
+     *
+     * @return array<int, string> 候选验签密钥
+     */
+    private function v2NotificationApiKeys(): array
+    {
+        if ($this->config->sandbox()) {
+            return [$this->sandboxSignKey()];
+        }
+
+        return array_values(array_filter([
+            $this->config->apiKey(),
+            $this->config->previousApiKey(),
+        ], static fn (string $key): bool => $key !== ''));
+    }
+
+    /**
+     * 获取并缓存微信支付 V2 沙箱验签密钥。
+     *
+     * getsignkey 请求本身使用生产 APIv2 密钥和 MD5 签名；后续沙箱接口请求、
+     * 响应及通知均使用返回的 sandbox_signkey。
+     *
+     * @return string 沙箱验签密钥
+     */
+    private function sandboxSignKey(): string
+    {
+        $cacheKey = hash('sha256', $this->config->mchId() . "\0" . $this->config->apiKey());
+        $cached = self::$sandboxSignKeyCache[$cacheKey] ?? null;
+        if (is_array($cached) && ($cached['expires_at'] ?? 0) > time() && ($cached['key'] ?? '') !== '') {
+            return (string) $cached['key'];
+        }
+
+        $response = $this->sendV2Request(
+            '/sandboxnew/pay/getsignkey',
+            [
+                'mch_id' => $this->config->mchId(),
+                'nonce_str' => WxpaySigner::nonceStr(),
+                'sign_type' => 'MD5',
+            ],
+            false,
+            $this->config->apiKey(),
+            false
+        );
+        $data = $response->data();
+        $sandboxSignKey = (string) ($data['sandbox_signkey'] ?? '');
+        if (strtoupper((string) ($data['return_code'] ?? '')) !== 'SUCCESS' || strlen($sandboxSignKey) !== 32) {
+            throw new WxpaySdkException(
+                '微信支付 V2 沙箱验签密钥获取失败：' . (string) ($data['return_msg'] ?? '响应缺少有效 sandbox_signkey')
+            );
+        }
+
+        self::$sandboxSignKeyCache[$cacheKey] = [
+            'key' => $sandboxSignKey,
+            'expires_at' => time() + 3600,
+        ];
+
+        return $sandboxSignKey;
     }
 
     /**

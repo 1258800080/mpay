@@ -13,6 +13,7 @@ use app\common\interface\PaymentInterface;
 use app\common\interface\PayPluginInterface;
 use app\common\util\FormatHelper;
 use app\exception\PaymentException;
+use app\exception\UnsupportedPaymentOperationException;
 use app\model\payment\PayOrder;
 use app\repository\payment\config\PaymentChannelRepository;
 use app\repository\payment\config\PaymentTypeRepository;
@@ -25,7 +26,10 @@ use support\Request;
 use support\Response;
 
 /**
- * 天阙Pretran二维码牌网页流水监听插件。
+ * 天阙 Pretran 二维码牌网页流水监听插件。
+ *
+ * 负责生成码牌收银台参数，并将 receipt_watcher 投递的列表流水补查为详情后匹配本地支付单。
+ * 支付确认依赖网页流水而非标准支付回调，不提供实时查单或统一退款 API，关单只结束本地等待状态。
  */
 class TianquePretranReceiptPayment extends BasePayment implements PaymentInterface, PayPluginInterface, ChannelNotifyPayloadInterface
 {
@@ -56,7 +60,11 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
     ];
 
     /**
-     * 构造方法只接收容器注入的仓库依赖。
+     * 构造码牌流水匹配所需的仓储依赖。
+     *
+     * @param PayOrderRepository $payOrderRepository 支付单候选、锁定与金额变更仓储
+     * @param PaymentChannelRepository $paymentChannelRepository 插件配置关联通道查询仓储
+     * @param PaymentTypeRepository $paymentTypeRepository 流水支付方式解析仓储
      */
     public function __construct(
         private readonly PayOrderRepository $payOrderRepository,
@@ -244,7 +252,8 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
      * 发起码牌收款，按匹配模式准备收银台承接参数。
      *
      * @param array<string, mixed> $order 支付单快照
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准页面待支付结果
      */
     public function pay(array $order): array
     {
@@ -295,37 +304,48 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
             $params['raw'] = $prepared['raw'];
         }
 
-        return $this->payResult($params, $payNo, (string) ($order['pay_type_code'] ?? ''));
+        return $this->pendingPaymentResult(
+            $order,
+            $this->payResult($params, $payNo, (string) ($order['pay_type_code'] ?? ''))
+        );
     }
 
     /**
      * 网页流水场景无实时查单接口，主动查询保持待支付状态。
      *
      * @param array<string, mixed> $order 支付单快照
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 不确认终态的标准待支付结果
      */
     public function query(array $order): array
     {
         return [
-            'success' => true,
             'status' => PaymentPluginStatusConstant::PENDING,
-            'channel_order_no' => (string) ($order['channel_order_no'] ?? $order['pay_no'] ?? ''),
-            'channel_trade_no' => (string) ($order['channel_trade_no'] ?? $order['pay_no'] ?? ''),
+            'pay_no' => (string) ($order['pay_no'] ?? ''),
+            'paid_amount' => null,
+            'chan_order_no' => (string) ($order['chan_order_no'] ?? ''),
+            'chan_trade_no' => (string) ($order['chan_trade_no'] ?? ''),
             'message' => '等待 receipt_watcher 查询' . $this->getName() . '流水',
         ];
     }
 
     /**
-     * 码牌收款不需要通知上游关单。
+     * 结束本地码牌收款等待状态。
+     *
+     * 网页流水侧没有上游订单可关闭，因此此结果只表达本地终止等待，不代表调用了渠道关单接口。
      *
      * @param array<string, mixed> $order 支付单快照
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准本地关单结果
      */
     public function close(array $order): array
     {
         return [
-            'success' => true,
-            'msg' => $this->getName() . '收款无需上游关单',
+            'status' => PaymentPluginStatusConstant::CLOSED,
+            'pay_no' => (string) ($order['pay_no'] ?? ''),
+            'chan_order_no' => (string) ($order['chan_order_no'] ?? ''),
+            'chan_trade_no' => (string) ($order['chan_trade_no'] ?? ''),
+            'message' => $this->getName() . '收款无需上游关单',
         ];
     }
 
@@ -333,17 +353,20 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
      * 码牌收款没有统一退款 API。
      *
      * @param array<string, mixed> $order 支付单快照
+     *
      * @return array<string, mixed>
      */
     public function refund(array $order): array
     {
-        throw new PaymentException($this->getName() . '收款不支持接口退款', 40200);
+        throw new UnsupportedPaymentOperationException($this->getName() . '收款不支持接口退款', 40200);
     }
 
     /**
      * 兼容标准 HTTP 回调入口，实际处理统一交给 notifyPayload()。
      *
-     * @return array<string, mixed>
+     * @param Request $request HTTP 回调请求
+     *
+     * @return array<string, mixed> 标准支付通知结果
      */
     public function notify(Request $request): array
     {
@@ -351,9 +374,12 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
     }
 
     /**
-     * 队列通知第一步：根据流水定位 MPAY 支付单号。
+     * 队列通知第一步：补查流水详情并定位唯一的 MPAY 支付单号。
+     *
+     * 定位结果短暂缓存，供同一通知后续的状态归一化复用，避免重复查询 Pretran 详情。
      *
      * @param array<string, mixed> $payload receipt_watcher 投递的标准流水
+     *
      * @return array{pay_no:string}
      */
     public function channelNotifyPayload(array $payload): array
@@ -370,7 +396,8 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
      * 返回前会恢复金额变动模式下临时改写的订单金额。
      *
      * @param array<string, mixed> $payload receipt_watcher 投递的标准流水
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 标准支付成功通知结果
      */
     public function notifyPayload(array $payload): array
     {
@@ -382,14 +409,15 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
         $tradeNo = $this->channelTradeNo($detail);
         $notifiedAmount = $this->moneyToCents((string) ($detail['price'] ?? ''));
 
-        $this->restoreOriginalPayAmount($payNo, $detail, $tradeNo, $notifiedAmount);
+        $paidAmount = $this->restoreOriginalPayAmount($payNo, $detail, $tradeNo, $notifiedAmount);
 
         return [
             'status' => PaymentPluginStatusConstant::SUCCESS,
             'pay_no' => $payNo,
+            'paid_amount' => $paidAmount,
             'message' => '天阙Pretran流水详情备注已确认收款',
-            'channel_order_no' => $tradeNo,
-            'channel_trade_no' => $tradeNo,
+            'chan_order_no' => $tradeNo,
+            'chan_trade_no' => $tradeNo,
             'channel_status' => 'receipt_watcher_received',
             'paid_at' => $this->paidAtFromRecord($detail),
         ];
@@ -413,6 +441,10 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
 
     /**
      * 准备金额变动模式的收款金额。
+     *
+     * 同一收款账号下串行分配未占用的分金额偏移，并在支付单快照中同时保存原金额和实收识别金额。
+     *
+     * @param string $payNo 本地支付单号
      *
      * @return array<string, mixed>
      */
@@ -462,6 +494,8 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
     /**
      * 准备付款备注模式的备注码。
      *
+     * @param string $payNo 本地支付单号
+     *
      * @return array<string, mixed>
      */
     private function prepareRemarkReceipt(string $payNo): array
@@ -494,6 +528,8 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
 
     /**
      * 准备动态收款码模式的二维码。
+     *
+     * @param string $payNo 本地支付单号
      *
      * @return array<string, mixed>
      */
@@ -551,6 +587,7 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
      * 根据列表流水补查详情并定位支付单。
      *
      * @param array<string, mixed> $payload receipt_watcher 投递的标准流水
+     *
      * @return array{pay_no:string, record:array<string,mixed>, detail:array<string,mixed>}
      */
     private function resolveFlow(array $payload): array
@@ -574,7 +611,10 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
     /**
      * 根据列表流水筛选候选支付单。
      *
+     * 列表字段只用于按通道、金额、支付方式、有效期和订单模式缩小范围，最终确认仍依赖详情。
+     *
      * @param array<string, mixed> $record 标准流水记录
+     *
      * @return array<int, PayOrder>
      */
     private function candidateOrdersByListRecord(array $record): array
@@ -653,7 +693,10 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
     /**
      * 通过列表 UUID 查询流水详情并归一化字段。
      *
+     * 详情必须是收款成功状态，并通过已配置终端号约束后才能进入订单匹配。
+     *
      * @param array<string, mixed> $record 标准流水记录
+     *
      * @return array<string, mixed>
      */
     private function queryFlowDetail(array $record): array
@@ -734,11 +777,14 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
     /**
      * 确认收款后恢复原始订单金额并保存流水摘要。
      *
+     * @param string $payNo 本地支付单号
      * @param array<string, mixed> $record 已确认的流水详情
+     * @param string $tradeNo 渠道流水号
+     * @param int $notifiedAmount 流水实收分金额
      */
-    private function restoreOriginalPayAmount(string $payNo, array $record, string $tradeNo, int $notifiedAmount): void
+    private function restoreOriginalPayAmount(string $payNo, array $record, string $tradeNo, int $notifiedAmount): int
     {
-        Db::transaction(function () use ($payNo, $record, $tradeNo, $notifiedAmount): void {
+        return Db::transaction(function () use ($payNo, $record, $tradeNo, $notifiedAmount): int {
             $payOrder = $this->lockedPayOrder($payNo);
             $extJson = (array) ($payOrder->ext_json ?? []);
             $receiptMeta = (array) ($extJson['personal_receipt'] ?? []);
@@ -754,12 +800,15 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
             $extJson['personal_receipt'] = $receiptMeta;
             $payOrder->ext_json = $extJson;
             $payOrder->save();
+
+            return $originalAmount > 0 ? $originalAmount : (int) $payOrder->pay_amount;
         });
     }
 
     /**
      * 保存码牌识别信息到支付单扩展数据。
      *
+     * @param PayOrder $payOrder 已锁定的支付单
      * @param array<string, mixed> $meta 码牌识别信息
      */
     private function persistReceiptMeta(PayOrder $payOrder, array $meta): void
@@ -774,6 +823,8 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
 
     /**
      * 锁定并读取支付单。
+     *
+     * @param string $payNo 本地支付单号
      */
     private function lockedPayOrder(string $payNo): PayOrder
     {
@@ -787,6 +838,8 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
 
     /**
      * 读取支付单原始业务金额。
+     *
+     * @param PayOrder $payOrder 支付单
      */
     private function originalAmount(PayOrder $payOrder): int
     {
@@ -799,6 +852,8 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
 
     /**
      * 读取支付单创建时使用的匹配模式。
+     *
+     * @param PayOrder $payOrder 支付单
      */
     private function orderMode(PayOrder $payOrder): string
     {
@@ -810,6 +865,8 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
 
     /**
      * 读取支付单付款备注码。
+     *
+     * @param PayOrder $payOrder 支付单
      */
     private function orderRemarkCode(PayOrder $payOrder): string
     {
@@ -821,6 +878,9 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
 
     /**
      * 创建动态收款二维码。
+     *
+     * @param int $amount 本地分金额
+     * @param string $remarkCode 本单付款备注码
      *
      * @return array<string, mixed>
      */
@@ -839,8 +899,13 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
     /**
      * 请求 Pretran 接口并校验响应。
      *
+     * 请求强制启用 TLS 证书校验，并使用 receipt_watcher 同步的短期登录态；代理仅在配置显式启用时生效。
+     *
+     * @param string $method HTTP 方法
+     * @param string $path Pretran 接口路径
      * @param array<string, mixed> $options Guzzle 请求参数
-     * @return array<string, mixed>
+     *
+     * @return array<string, mixed> 业务成功的 JSON 响应
      */
     private function pretranRequest(string $method, string $path, array $options): array
     {
@@ -859,7 +924,7 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
         if (isset($options['form_params'])) {
             $options['headers']['content-type'] = 'application/x-www-form-urlencoded';
         }
-        $options['verify'] = false;
+        $options['verify'] = true;
         $proxy = $this->proxyUrl();
         if ($proxy !== '') {
             $options['proxy'] = $proxy;
@@ -891,6 +956,8 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
     /**
      * 读取监听工具同步的 Redis 登录态。
      *
+     * 缺少 token 或登录态已过期时拒绝继续调用 Pretran，等待监听工具刷新。
+     *
      * @return array<string, mixed>
      */
     private function redisSession(): array
@@ -917,7 +984,10 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
      * 返回收银台页面承接参数。
      *
      * @param array<string, mixed> $params 页面展示参数
-     * @return array<string, mixed>
+     * @param string $payNo 本地支付单号
+     * @param string $payType 标准支付方式代码
+     *
+     * @return array<string, mixed> 标准页面承接参数
      */
     private function payResult(array $params, string $payNo, string $payType): array
     {
@@ -930,7 +1000,7 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
             'pay_product' => 'receipt_plate',
             'pay_action' => $this->receiptMatchMode(),
             'pay_params' => $params,
-            'chan_order_no' => $payNo,
+            'chan_order_no' => '',
             'chan_trade_no' => '',
         ];
     }
@@ -973,6 +1043,8 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
 
     /**
      * 分配 4 位付款备注码。
+     *
+     * @param string $payNo 本地支付单号
      */
     private function allocateRemarkCode(string $payNo): string
     {
@@ -990,6 +1062,10 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
 
     /**
      * 按收款账号串行执行识别信息分配。
+     *
+     * 缓存锁使用随机令牌校验所有权，避免一个请求释放另一个请求刚取得的锁。
+     *
+     * @param callable $callback 持有账号锁时执行的分配逻辑
      */
     private function withAccountLock(callable $callback): mixed
     {
@@ -1016,6 +1092,8 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
 
     /**
      * 获取当前插件配置关联的通道 ID。
+     *
+     * 优先返回共享同一插件配置的全部通道，使流水候选范围覆盖真实账号复用关系。
      *
      * @return array<int, int>
      */
@@ -1047,6 +1125,9 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
 
     /**
      * 判断流水支付时间是否落在订单识别窗口内。
+     *
+     * @param PayOrder $payOrder 支付单候选
+     * @param int $paidAt 流水支付时间戳
      */
     private function paidAtInOrderWindow(PayOrder $payOrder, int $paidAt): bool
     {
@@ -1060,6 +1141,7 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
      * 读取载荷中的归一化流水记录。
      *
      * @param array<string, mixed> $payload receipt_watcher 投递载荷
+     *
      * @return array<string, mixed>
      */
     private function recordPayload(array $payload): array
@@ -1071,6 +1153,8 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
 
     /**
      * 将金额文本转换为分。
+     *
+     * @param string $money 最多两位小数的非负元金额
      */
     private function moneyToCents(string $money): int
     {
@@ -1085,6 +1169,8 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
 
     /**
      * 将平台金额字段规整为两位小数文本。
+     *
+     * @param mixed $value 平台金额原值
      */
     private function amountText(mixed $value): string
     {
@@ -1101,6 +1187,8 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
 
     /**
      * 从流水记录读取标准支付时间。
+     *
+     * @param array<string, mixed> $record 标准流水记录或详情
      */
     private function paidAtFromRecord(array $record): ?string
     {
@@ -1111,6 +1199,10 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
 
     /**
      * 从流水记录读取支付时间戳。
+     *
+     * 秒、毫秒时间戳及可解析时间文本会归一为秒级时间戳。
+     *
+     * @param array<string, mixed> $record 标准流水记录或详情
      */
     private function paidAtTimestamp(array $record): ?int
     {
@@ -1131,6 +1223,8 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
 
     /**
      * 将平台支付方式转换为系统支付方式。
+     *
+     * @param string $value 平台支付方式代码
      */
     private function normalizePayType(string $value): string
     {
@@ -1144,6 +1238,8 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
 
     /**
      * 将系统支付方式转换为平台详情查询参数。
+     *
+     * @param string $payType 标准支付方式代码
      */
     private function pretranPayType(string $payType): string
     {
@@ -1157,6 +1253,8 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
 
     /**
      * 校验流水终端号是否匹配配置。
+     *
+     * 未配置终端号时不施加此约束；配置后任一详情候选字段匹配即可。
      *
      * @param array<int, string> $channels 流水终端号候选值
      */
@@ -1200,6 +1298,8 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
 
     /**
      * 生成付款备注码缓存键。
+     *
+     * @param string $code 四位付款备注码
      */
     private function remarkCacheKey(string $code): string
     {
@@ -1234,6 +1334,8 @@ class TianquePretranReceiptPayment extends BasePayment implements PaymentInterfa
 
     /**
      * 读取布尔型插件配置。
+     *
+     * @param string $key 配置键
      */
     private function configBool(string $key): bool
     {
