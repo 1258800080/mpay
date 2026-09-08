@@ -22,6 +22,8 @@ class PayCallbackLogValidator extends Validator
         'callback_type' => 'sometimes|integer|in:0,1',
         'verify_status' => 'sometimes|integer|in:0,1,2',
         'process_status' => 'sometimes|integer|in:0,1,2',
+        'start_time' => 'sometimes|date_format:Y-m-d H:i:s',
+        'end_time' => 'sometimes|date_format:Y-m-d H:i:s',
         'page' => 'sometimes|integer|min:1',
         'page_size' => 'sometimes|integer|min:1|max:100',
     ];
@@ -49,7 +51,7 @@ class PayCallbackLogValidator extends Validator
      * @var array
      */
     protected array $scenes = [
-        'index' => ['keyword', 'merchant_id', 'channel_id', 'callback_type', 'verify_status', 'process_status', 'page', 'page_size'],
+        'index' => ['keyword', 'merchant_id', 'channel_id', 'callback_type', 'verify_status', 'process_status', 'start_time', 'end_time', 'page', 'page_size'],
         'show' => ['id'],
     ];
 }

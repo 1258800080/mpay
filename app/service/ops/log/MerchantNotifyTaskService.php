@@ -62,6 +62,16 @@ class MerchantNotifyTaskService extends BaseService
             $query->where('n.status', (int) $status);
         }
 
+        $startTime = trim((string) ($filters['start_time'] ?? ''));
+        if ($startTime !== '') {
+            $query->where('n.created_at', '>=', $startTime);
+        }
+
+        $endTime = trim((string) ($filters['end_time'] ?? ''));
+        if ($endTime !== '') {
+            $query->where('n.created_at', '<', $endTime);
+        }
+
         $paginator = $query
             ->orderByDesc('n.id')
             ->paginate(max(1, $pageSize), ['*'], 'page', max(1, $page));

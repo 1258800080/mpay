@@ -20,6 +20,8 @@ class MerchantFundFreezeValidator extends Validator
         'merchant_id' => 'sometimes|integer|min:1',
         'freeze_type' => 'sometimes|integer|in:1,2,3',
         'status' => 'sometimes|integer|in:1,2',
+        'start_time' => 'sometimes|date_format:Y-m-d H:i:s',
+        'end_time' => 'sometimes|date_format:Y-m-d H:i:s',
         'page' => 'sometimes|integer|min:1',
         'page_size' => 'sometimes|integer|min:1|max:100',
     ];
@@ -45,7 +47,7 @@ class MerchantFundFreezeValidator extends Validator
      * @var array
      */
     protected array $scenes = [
-        'index' => ['keyword', 'merchant_id', 'freeze_type', 'status', 'page', 'page_size'],
+        'index' => ['keyword', 'merchant_id', 'freeze_type', 'status', 'start_time', 'end_time', 'page', 'page_size'],
         'show' => ['id'],
     ];
 }

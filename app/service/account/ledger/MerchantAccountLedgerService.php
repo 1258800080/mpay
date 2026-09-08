@@ -71,6 +71,16 @@ class MerchantAccountLedgerService extends BaseService
             $query->where('l.direction', (int) $direction);
         }
 
+        $startTime = trim((string) ($filters['start_time'] ?? ''));
+        if ($startTime !== '') {
+            $query->where('l.created_at', '>=', $startTime);
+        }
+
+        $endTime = trim((string) ($filters['end_time'] ?? ''));
+        if ($endTime !== '') {
+            $query->where('l.created_at', '<', $endTime);
+        }
+
         $paginator = $query
             ->orderByDesc('l.id')
             ->paginate(max(1, $pageSize), ['*'], 'page', max(1, $page));

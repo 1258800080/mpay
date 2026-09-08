@@ -12,21 +12,13 @@ use Throwable;
 /**
  * Webman 运行监控聚合服务。
  *
- * 只做只读状态聚合，不在这里触发 reload/restart 等高风险动作。
+ * 只聚合可观测状态，不提供服务启停、重载或重启能力。
  * 数据来源包含 Webman 配置、插件进程配置、runtime 文件、进程心跳、基础依赖探测和日志尾部摘要。
  */
 class SystemOpsStatusService extends BaseService
 {
-    /**
-     * 构造方法。
-     *
-     * @param SystemOpsHeartbeatService $heartbeatService 系统运维心跳服务
-     * @param SystemOpsOperationLogService $operationLogService 系统运维操作日志服务
-     * @return void
-     */
     public function __construct(
         protected SystemOpsHeartbeatService $heartbeatService,
-        protected SystemOpsOperationLogService $operationLogService,
         protected ReceiptWatcherRuntimeStatusService $receiptWatcherRuntimeStatusService
     ) {
     }
@@ -61,12 +53,6 @@ class SystemOpsStatusService extends BaseService
             'receipt_watcher_runtime' => $receiptWatcherRuntime,
             'processes' => $processes,
             'logs' => $logs,
-            'operations' => $this->operationLogService->latest(8),
-            'actions' => [
-                'reload' => $this->canRunCommand(),
-                'restart' => $this->canRunCommand(),
-                'tips' => '仅允许执行白名单运维动作，重启会短暂影响请求处理。',
-            ],
         ];
     }
 
@@ -93,7 +79,7 @@ class SystemOpsStatusService extends BaseService
         };
         $pidFileExists = is_file($pidFile);
         $statusFileExists = is_file($statusFile);
-        $fileMissingText = DIRECTORY_SEPARATOR === '\\' ? 'Windows 模式未生成' : '未生成';
+        $fileMissingText = DIRECTORY_SEPARATOR === '\\' ? '当前运行模式不使用' : '未生成';
 
         $startedAt = $pidFileExists ? (int) filemtime($pidFile) : 0;
 
@@ -169,9 +155,8 @@ class SystemOpsStatusService extends BaseService
         return [
             ['key' => 'runtime', 'label' => '服务状态', 'value' => $warning === 0 ? '正常' : '关注', 'tone' => $warning === 0 ? 'success' : 'warning'],
             ['key' => 'process', 'label' => '长驻进程', 'value' => $healthy . ' / ' . count($processes), 'tone' => $warning === 0 ? 'success' : 'warning'],
-            ['key' => 'memory', 'label' => '当前内存', 'value' => $this->formatBytes(memory_get_usage(true)), 'tone' => 'primary'],
-            ['key' => 'log', 'label' => '日志告警', 'value' => (string) ($logs['error_count'] ?? 0), 'tone' => ((int) ($logs['error_count'] ?? 0)) > 0 ? 'danger' : 'success'],
             ['key' => 'dependency', 'label' => '依赖异常', 'value' => (string) $dependencyWarning, 'tone' => $dependencyWarning > 0 ? 'danger' : 'success'],
+            ['key' => 'log', 'label' => '近期日志异常', 'value' => (string) ($logs['error_count'] ?? 0), 'tone' => ((int) ($logs['error_count'] ?? 0)) > 0 ? 'danger' : 'success'],
             ['key' => 'receipt_watcher', 'label' => '网页监听', 'value' => (string) ($receiptWatcherRuntime['summary_value'] ?? '—'), 'tone' => (string) ($receiptWatcherRuntime['tone'] ?? 'gray')],
         ];
     }
@@ -540,22 +525,6 @@ class SystemOpsStatusService extends BaseService
             $output = (string) shell_exec('tasklist /FI "PID eq ' . $pid . '" /FO CSV /NH 2>NUL');
 
             return str_contains($output, '"' . $pid . '"') || preg_match('/(^|,|\s)' . preg_quote((string) $pid, '/') . '($|,|\s)/', $output) === 1;
-        }
-
-        return false;
-    }
-
-    /**
-     * 判断当前 PHP 环境是否允许提交后台命令。
-     *
-     * @return bool 是否允许提交后台命令
-     */
-    private function canRunCommand(): bool
-    {
-        foreach (['proc_open', 'exec', 'shell_exec'] as $function) {
-            if (function_exists($function) && !in_array($function, $this->disabledFunctions(), true)) {
-                return true;
-            }
         }
 
         return false;

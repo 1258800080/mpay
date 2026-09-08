@@ -4,6 +4,7 @@ namespace app\command;
 
 use app\common\constant\AuthConstant;
 use app\common\constant\CommonConstant;
+use app\common\util\EpayPlatformKeyFile;
 use app\common\util\FormatHelper;
 use app\exception\CommandException;
 use app\model\merchant\Merchant;
@@ -88,14 +89,22 @@ class EpayV2Bootstrap extends Command
     /**
      * 生成或复用平台 RSA 密钥。
      *
+     * 平台密钥路径与安装流程共用同一定位规则；Docker Compose 通过
+     * EPAY_PLATFORM_KEY_DIR 指向持久化配置目录，本地开发未配置时仍落到项目根目录。
+     *
      * @param bool $force 是否强制覆盖
      * @return array{private: string, public: string}
      * @throws CommandException
      */
     private function bootstrapPlatformKeys(bool $force): array
     {
-        $privatePath = base_path(false) . DIRECTORY_SEPARATOR . 'epay-platform-private.pem';
-        $publicPath = base_path(false) . DIRECTORY_SEPARATOR . 'epay-platform-public.pem';
+        $directory = EpayPlatformKeyFile::directory();
+        if (!is_dir($directory) && !mkdir($directory, 0777, true) && !is_dir($directory)) {
+            throw new CommandException('创建平台密钥目录失败: ' . $directory);
+        }
+
+        $privatePath = EpayPlatformKeyFile::privatePath();
+        $publicPath = EpayPlatformKeyFile::publicPath();
 
         if (!$force && is_file($privatePath) && is_file($publicPath)) {
             return ['private' => $privatePath, 'public' => $publicPath];

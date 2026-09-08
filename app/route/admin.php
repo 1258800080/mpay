@@ -16,6 +16,7 @@ use app\http\admin\controller\ops\ChannelDailyStatController;
 use app\http\admin\controller\ops\ChannelNotifyLogController;
 use app\http\admin\controller\ops\MerchantNotifyTaskController;
 use app\http\admin\controller\ops\PayCallbackLogController;
+use app\http\admin\controller\ops\PaymentExceptionController;
 use app\http\admin\controller\payment\PaymentChannelController;
 use app\http\admin\controller\payment\PaymentOnboardingConfigController;
 use app\http\admin\controller\payment\PaymentPluginConfController;
@@ -318,6 +319,16 @@ Route::group('/adminapi', function () {
             Route::post('/{notifyNo}/retry', [MerchantNotifyTaskController::class, 'retry'])->name('adminApiMerchantNotifyTasksRetry')->setParams(['real_name' => '商户通知任务重试']);
         });
 
+        Route::group('/payment-exceptions', function () {
+            Route::get('', [PaymentExceptionController::class, 'exceptionIndex'])->name('adminApiPaymentExceptionsIndex')->setParams(['real_name' => '支付业务异常列表']);
+            Route::get('/{id}', [PaymentExceptionController::class, 'exceptionShow'])->name('adminApiPaymentExceptionsShow')->setParams(['real_name' => '支付业务异常详情']);
+        });
+
+        Route::group('/payment-recovery-tasks', function () {
+            Route::get('', [PaymentExceptionController::class, 'recoveryIndex'])->name('adminApiPaymentRecoveryTasksIndex')->setParams(['real_name' => '支付恢复任务列表']);
+            Route::get('/{id}', [PaymentExceptionController::class, 'recoveryShow'])->name('adminApiPaymentRecoveryTasksShow')->setParams(['real_name' => '支付恢复任务详情']);
+        });
+
         // 资金账户
         Route::group('/merchant-accounts', function () {
             Route::get('', [MerchantAccountController::class, 'index'])->name('adminApiMerchantAccountsIndex')->setParams(['real_name' => '资金账户列表']);
@@ -352,10 +363,8 @@ Route::group('/adminapi', function () {
         Route::group('/system', function () {
             Route::get('/menu-tree', [SystemController::class, 'menuTree'])->name('adminApiMenuTree')->setParams(['real_name' => '菜单树']);
             Route::get('/dict-items', [SystemController::class, 'dictItems'])->name('adminApiDictItems')->setParams(['real_name' => '字典项']);
-            // 运行监控只暴露总览和白名单运维动作，命令安全校验统一放在服务层。
+            // 运行监控只提供健康状态查询，服务生命周期由部署环境的进程守护工具管理。
             Route::get('/ops/overview', [SystemOpsController::class, 'overview'])->name('adminApiSystemOpsOverview')->setParams(['real_name' => '运行监控总览']);
-            Route::post('/ops/reload', [SystemOpsController::class, 'reload'])->name('adminApiSystemOpsReload')->setParams(['real_name' => '平滑重载服务']);
-            Route::post('/ops/restart', [SystemOpsController::class, 'restart'])->name('adminApiSystemOpsRestart')->setParams(['real_name' => '重启服务']);
         });
 
         Route::group('/system-config-pages', function () {

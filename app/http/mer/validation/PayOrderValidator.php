@@ -17,6 +17,7 @@ class PayOrderValidator extends Validator
      * @var array
      */
     protected array $rules = [
+        'pay_no' => 'sometimes|string|max:32',
         'search_field' => 'sometimes|string|in:pay_no,biz_no,trace_no,merchant_order_no,channel_request_no,channel_order_no,channel_trade_no',
         'keyword' => 'sometimes|string|max:128',
         'merchant_id' => 'sometimes|integer|min:1',
@@ -24,6 +25,8 @@ class PayOrderValidator extends Validator
         'status' => 'sometimes|integer|in:0,1,2,3,4,5',
         'channel_mode' => 'sometimes|integer|in:0,1',
         'callback_status' => 'sometimes|integer|in:0,1,2',
+        'start_time' => 'sometimes|date_format:Y-m-d H:i:s',
+        'end_time' => 'sometimes|date_format:Y-m-d H:i:s',
         'page' => 'sometimes|integer|min:1',
         'page_size' => 'sometimes|integer|min:1|max:100',
     ];
@@ -51,6 +54,7 @@ class PayOrderValidator extends Validator
      * @var array
      */
     protected array $scenes = [
-        'index' => ['search_field', 'keyword', 'merchant_id', 'pay_type_id', 'status', 'channel_mode', 'callback_status', 'page', 'page_size'],
+        'index' => ['search_field', 'keyword', 'merchant_id', 'pay_type_id', 'status', 'channel_mode', 'callback_status', 'start_time', 'end_time', 'page', 'page_size'],
+        'show' => ['pay_no'],
     ];
 }

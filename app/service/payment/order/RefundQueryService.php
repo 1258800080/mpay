@@ -63,6 +63,10 @@ class RefundQueryService extends BaseService
             $query->where('ro.merchant_id', $merchantFilter);
         }
 
+        if (($channelId = (int) ($filters['channel_id'] ?? 0)) > 0) {
+            $query->where('ro.channel_id', $channelId);
+        }
+
         if (($payTypeId = (int) ($filters['pay_type_id'] ?? 0)) > 0) {
             $query->where('po.pay_type_id', $payTypeId);
         }
@@ -73,6 +77,16 @@ class RefundQueryService extends BaseService
 
         if (array_key_exists('channel_mode', $filters) && $filters['channel_mode'] !== '') {
             $query->where('po.channel_mode', (int) $filters['channel_mode']);
+        }
+
+        $startTime = trim((string) ($filters['start_time'] ?? ''));
+        if ($startTime !== '') {
+            $query->where('ro.created_at', '>=', $startTime);
+        }
+
+        $endTime = trim((string) ($filters['end_time'] ?? ''));
+        if ($endTime !== '') {
+            $query->where('ro.created_at', '<', $endTime);
         }
 
         $paginator = $query

@@ -46,6 +46,15 @@
 | [码牌类插件配置使用教程](https://gitee.com/technical-laohu/mpay_v2_webman/wikis/%E7%A0%81%E7%89%8C%E7%B1%BB%E6%8F%92%E4%BB%B6%E9%85%8D%E7%BD%AE%E4%BD%BF%E7%94%A8%E6%95%99%E7%A8%8B) | receipt_watcher 网页流水/二维码牌监听场景，适用于收钱吧、付呗、USDT TRC20 等码牌类插件 |
 | [支付宝微信个人收款监听配置教程](https://gitee.com/technical-laohu/mpay_v2_webman/wikis/%E6%94%AF%E4%BB%98%E5%AE%9D%E5%BE%AE%E4%BF%A1%E4%B8%AA%E4%BA%BA%E6%94%B6%E6%AC%BE%E7%9B%91%E5%90%AC%E9%85%8D%E7%BD%AE%E6%95%99%E7%A8%8B#%E6%94%AF%E4%BB%98%E5%AE%9D%E5%BE%AE%E4%BF%A1%E4%B8%AA%E4%BA%BA%E6%94%B6%E6%AC%BE%E7%9B%91%E5%90%AC%E9%85%8D%E7%BD%AE%E6%95%99%E7%A8%8B) | SmsForwarder 手机通知栏监听场景，适用于支付宝/微信个人收款码 |
 
+## 🎥 视频教程
+
+视频教程用于演示 MPAY V2 的实际安装流程，建议结合上方文字教程一起阅读。
+
+| 教程 | 适用场景 | 视频地址 |
+| --- | --- | --- |
+| 📌 宝塔面板源码安装教程 | 使用 `mpay.zip` 发行版，在宝塔面板部署 MPAY V2 | [哔哩哔哩观看](https://www.bilibili.com/video/BV138bw6aEK5/?share_source=copy_web) |
+| 📌 Docker 安装教程 | 使用 Docker 发行版一键部署 MPAY V2 服务 | 视频教程即将发布 |
+
 ## ✨ 项目介绍
 
 **MPAY V2** 的核心目标是把支付系统里容易分散的能力统一起来：商户、支付方式、支付插件、插件配置、支付通道、轮询组、路由策略、业务单、支付单、回调通知、退款、清算和资金账户都由后端统一建模和管理。
@@ -396,21 +405,9 @@ php webman start -d
 
 ### 8. 配置伪静态反向代理
 
-进入站点设置的「伪静态」，写入 Nginx 规则并保存。规则的核心是：静态文件优先由 Nginx 直接处理，不存在的动态请求交给 Webman；同时兼容 ePay V1 的 `/submit.php`、`/mapi.php`、`/api.php` 入口。
+进入站点设置的「伪静态」，写入 Nginx 规则并保存。规则的核心是：静态文件优先由 Nginx 直接处理，不存在的动态请求交给 Webman；ePay V1 的 `/submit.php`、`/mapi.php`、`/api.php` 入口由 Webman 路由直接承接，不需要 Nginx 单独改写。
 
 ```nginx
-# ePay V1 兼容入口：/submit.php /mapi.php /api.php
-location ~ ^/(submit|mapi|api)\.php$ {
-    proxy_set_header Host $http_host;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_http_version 1.1;
-    proxy_set_header Connection "";
-
-    proxy_pass http://127.0.0.1:8787/$1;
-}
-
 # 静态文件优先由 Nginx 处理，不存在再交给 Webman
 location / {
     try_files $uri $uri/ @webman;
@@ -426,11 +423,6 @@ location @webman {
     proxy_set_header Connection "";
 
     proxy_pass http://127.0.0.1:8787;
-}
-
-# 拒绝访问其它 PHP 文件
-location ~ \.php$ {
-    return 404;
 }
 
 # 允许访问 .well-known 目录
@@ -739,18 +731,6 @@ Linux 生产环境使用 `php webman start` 会按 Webman 配置启动相关进�
 ### Nginx 反向代理伪静态配置
 
 ```nginx
-# ePay V1 兼容入口：/submit.php /mapi.php /api.php
-location ~ ^/(submit|mapi|api)\.php$ {
-    proxy_set_header Host $http_host;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_http_version 1.1;
-    proxy_set_header Connection "";
-
-    proxy_pass http://127.0.0.1:8787/$1;
-}
-
 # 静态文件优先由 Nginx 处理，不存在再交给 Webman
 location / {
     try_files $uri $uri/ @webman;
@@ -768,11 +748,6 @@ location @webman {
     proxy_pass http://127.0.0.1:8787;
 }
 
-# 拒绝访问其它 PHP 文件
-location ~ \.php$ {
-    return 404;
-}
-
 # 允许访问 .well-known 目录
 location ^~ /.well-known/ {
     allow all;
@@ -784,7 +759,7 @@ location ~ /\. {
 }
 ```
 
-`/submit.php`、`/mapi.php`、`/api.php`，这些是 ePay V1 兼容入口，不是传统 PHP-FPM 文件执行入口。
+`/submit.php`、`/mapi.php`、`/api.php` 是 ePay V1 兼容入口，由 Webman 路由直接承接。不要再把它们改写成无后缀路径，也不要为当前 Webman 站点额外配置 PHP-FPM 的 `.php` location。
 
 
 生产环境建议：

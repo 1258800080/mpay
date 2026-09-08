@@ -48,10 +48,21 @@ class PayOrderController extends BaseController
 
         return $this->success($this->payOrderService->paginate($data, $page, $pageSize, $merchantId));
     }
+    /**
+     * 查询当前商户的支付订单详情。
+     *
+     * @param Request $request 请求对象
+     * @param string $payNo 支付单号
+     * @return Response 响应对象
+     */
+    public function show(Request $request, string $payNo): Response
+    {
+        $merchantId = $this->currentMerchantId($request);
+        if ($merchantId <= 0) {
+            return $this->fail('登录上下文异常，请刷新后重试');
+        }
+
+        $data = $this->validated(['pay_no' => $payNo], PayOrderValidator::class, 'show');
+        return $this->success($this->payOrderService->detail((string) $data['pay_no'], $merchantId));
+    }
 }
-
-
-
-
-
-

@@ -11,6 +11,7 @@ use app\common\base\BaseService;
  * @property MerchantPortalChannelService $channelService 渠道服务
  * @property MerchantPortalCredentialService $credentialService 凭证服务
  * @property MerchantPortalFinanceService $financeService 财务服务
+ * @property MerchantPortalDashboardService $dashboardService 首页工作台服务
  */
 class MerchantPortalService extends BaseService
 {
@@ -26,8 +27,15 @@ class MerchantPortalService extends BaseService
         protected MerchantPortalProfileService $profileService,
         protected MerchantPortalChannelService $channelService,
         protected MerchantPortalCredentialService $credentialService,
-        protected MerchantPortalFinanceService $financeService
+        protected MerchantPortalFinanceService $financeService,
+        protected MerchantPortalDashboardService $dashboardService
     ) {
+    }
+
+    /** 获取当前商户业务工作台总览。 */
+    public function dashboardOverview(int $merchantId): array
+    {
+        return $this->dashboardService->overview($merchantId);
     }
 
     /**

@@ -19,6 +19,8 @@ class MerchantNotifyTaskValidator extends Validator
         'keyword' => 'sometimes|string|max:128',
         'merchant_id' => 'sometimes|integer|min:1',
         'status' => 'sometimes|integer|in:0,1,2',
+        'start_time' => 'sometimes|date_format:Y-m-d H:i:s',
+        'end_time' => 'sometimes|date_format:Y-m-d H:i:s',
         'page' => 'sometimes|integer|min:1',
         'page_size' => 'sometimes|integer|min:1|max:100',
     ];
@@ -43,7 +45,7 @@ class MerchantNotifyTaskValidator extends Validator
      * @var array
      */
     protected array $scenes = [
-        'index' => ['keyword', 'merchant_id', 'status', 'page', 'page_size'],
+        'index' => ['keyword', 'merchant_id', 'status', 'start_time', 'end_time', 'page', 'page_size'],
         'show' => ['notify_no'],
         'retry' => ['notify_no'],
     ];

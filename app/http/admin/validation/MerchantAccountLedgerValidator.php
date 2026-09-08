@@ -21,6 +21,8 @@ class MerchantAccountLedgerValidator extends Validator
         'biz_type' => 'sometimes|integer|min:0',
         'event_type' => 'sometimes|integer|min:0',
         'direction' => 'sometimes|integer|in:0,1',
+        'start_time' => 'sometimes|date_format:Y-m-d H:i:s',
+        'end_time' => 'sometimes|date_format:Y-m-d H:i:s',
         'page' => 'sometimes|integer|min:1',
         'page_size' => 'sometimes|integer|min:1|max:100',
     ];
@@ -47,7 +49,7 @@ class MerchantAccountLedgerValidator extends Validator
      * @var array
      */
     protected array $scenes = [
-        'index' => ['keyword', 'merchant_id', 'biz_type', 'event_type', 'direction', 'page', 'page_size'],
+        'index' => ['keyword', 'merchant_id', 'biz_type', 'event_type', 'direction', 'start_time', 'end_time', 'page', 'page_size'],
         'show' => ['id'],
     ];
 }

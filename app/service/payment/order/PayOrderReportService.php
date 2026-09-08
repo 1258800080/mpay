@@ -38,6 +38,10 @@ class PayOrderReportService extends BaseService
         $row['service_fee_status_text'] = $this->textFromMap((int) ($row['service_fee_status'] ?? -1), TradeConstant::serviceFeeStatusMap());
         $row['settlement_status_text'] = $this->textFromMap((int) ($row['settlement_status'] ?? -1), TradeConstant::settlementStatusMap());
         $row['callback_status_text'] = $this->textFromMap((int) ($row['callback_status'] ?? -1), NotifyConstant::processStatusMap());
+        $merchantNotifyStatus = (int) ($row['merchant_notify_status'] ?? -1);
+        $row['merchant_notify_status_text'] = $merchantNotifyStatus < 0
+            ? '尚未创建'
+            : $this->textFromMap($merchantNotifyStatus, NotifyConstant::taskStatusMap());
         $row['channel_type_text'] = $this->textFromMap((int) ($row['channel_type'] ?? -1), RouteConstant::channelTypeMap());
         $row['channel_mode_text'] = $this->textFromMap((int) ($row['channel_mode'] ?? -1), RouteConstant::channelModeMap());
 

@@ -10,6 +10,8 @@ use app\model\payment\SettlementOrder;
 use app\repository\account\ledger\MerchantAccountLedgerRepository;
 use app\repository\payment\settlement\SettlementItemRepository;
 use app\repository\payment\settlement\SettlementOrderRepository;
+use app\repository\payment\trade\PayOrderRepository;
+use app\service\payment\order\PayOrderReportService;
 
 /**
  * 清算订单查询服务。
@@ -19,6 +21,8 @@ use app\repository\payment\settlement\SettlementOrderRepository;
  * @property SettlementOrderRepository $settlementOrderRepository 结算订单仓库
  * @property SettlementItemRepository $settlementItemRepository 结算明细仓库
  * @property MerchantAccountLedgerRepository $merchantAccountLedgerRepository 商户账户流水仓库
+ * @property PayOrderRepository $payOrderRepository 支付订单仓库
+ * @property PayOrderReportService $payOrderReportService 支付订单展示格式化服务
  */
 class SettlementOrderQueryService extends BaseService
 {
@@ -28,12 +32,16 @@ class SettlementOrderQueryService extends BaseService
      * @param SettlementOrderRepository $settlementOrderRepository 结算订单仓库
      * @param SettlementItemRepository $settlementItemRepository 结算明细仓库
      * @param MerchantAccountLedgerRepository $merchantAccountLedgerRepository 商户账户流水仓库
+     * @param PayOrderRepository $payOrderRepository 支付订单仓库
+     * @param PayOrderReportService $payOrderReportService 支付订单展示格式化服务
      * @return void
      */
     public function __construct(
         protected SettlementOrderRepository $settlementOrderRepository,
         protected SettlementItemRepository $settlementItemRepository,
-        protected MerchantAccountLedgerRepository $merchantAccountLedgerRepository
+        protected MerchantAccountLedgerRepository $merchantAccountLedgerRepository,
+        protected PayOrderRepository $payOrderRepository,
+        protected PayOrderReportService $payOrderReportService
     ) {
     }
 
@@ -145,7 +153,7 @@ class SettlementOrderQueryService extends BaseService
      *
      * @param string $settleNo 清算单号
      * @param int|null $merchantId 商户ID
-     * @return array{settlement_order: SettlementOrder, items: array, account_ledgers: \Illuminate\Support\Collection, timeline: array<int, array<string, mixed>>} 详情结构
+     * @return array{settlement_order: SettlementOrder, related_pay_no: string, items: array, account_ledgers: \Illuminate\Support\Collection, account_ledgers_view: array<int, array<string, mixed>>, timeline: array<int, array<string, mixed>>} 详情结构
      * @throws ValidationException
      * @throws ResourceNotFoundException
      */
@@ -171,12 +179,46 @@ class SettlementOrderQueryService extends BaseService
             $accountLedgers = $this->merchantAccountLedgerRepository->listByBizNo((string) $settlementOrder->settle_no);
         }
 
+        $accountLedgerRows = [];
+        foreach ($accountLedgers as $ledger) {
+            $accountLedgerRows[] = $this->payOrderReportService->formatLedgerRow($ledger->toArray());
+        }
+
         return [
             'settlement_order' => $settlementOrder,
+            'related_pay_no' => $this->resolveRelatedPayNo($settlementOrder),
             'items' => $this->settlementItemRepository->listBySettleNo($settleNo),
             'account_ledgers' => $accountLedgers,
+            'account_ledgers_view' => $accountLedgerRows,
             'timeline' => $this->buildTimeline($settlementOrder),
         ];
+    }
+
+    /**
+     * 根据结算追踪号定位原支付单。
+     *
+     * 同一追踪号可能存在多次支付尝试，优先返回成功支付单；没有成功单时返回最近一次尝试。
+     *
+     * @param SettlementOrder $settlementOrder 结算订单
+     * @return string 关联支付单号
+     */
+    private function resolveRelatedPayNo(SettlementOrder $settlementOrder): string
+    {
+        $traceNo = trim((string) $settlementOrder->trace_no);
+        if ($traceNo === '') {
+            return '';
+        }
+
+        $payOrders = $this->payOrderRepository
+            ->listByTraceNo($traceNo, ['pay_no', 'merchant_id', 'status', 'attempt_no', 'id'])
+            ->filter(static fn ($payOrder): bool => (int) $payOrder->merchant_id === (int) $settlementOrder->merchant_id)
+            ->values();
+        $successOrder = $payOrders->first(
+            static fn ($payOrder): bool => (int) $payOrder->status === TradeConstant::ORDER_STATUS_SUCCESS
+        );
+        $relatedOrder = $successOrder ?: $payOrders->first();
+
+        return $relatedOrder ? (string) $relatedOrder->pay_no : '';
     }
 
     /**
@@ -354,6 +396,16 @@ class SettlementOrderQueryService extends BaseService
         $cycleType = (string) ($filters['cycle_type'] ?? '');
         if ($cycleType !== '') {
             $query->where('s.cycle_type', (int) $cycleType);
+        }
+
+        $startTime = trim((string) ($filters['start_time'] ?? ''));
+        if ($startTime !== '') {
+            $query->where('s.created_at', '>=', $startTime);
+        }
+
+        $endTime = trim((string) ($filters['end_time'] ?? ''));
+        if ($endTime !== '') {
+            $query->where('s.created_at', '<', $endTime);
         }
 
         return $query;

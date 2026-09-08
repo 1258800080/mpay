@@ -44,11 +44,11 @@ Route::group('/api/cashier', function () {
     Route::get('/pay-order-status', [CashierController::class, 'payOrderStatus'])->name('cashierPayOrderStatus')->setParams(['real_name' => '收银台支付单状态']);
 })->middleware([Cors::class]);
 
-// ePay V1 开放支付兼容入口。
+// ePay V1 公开协议入口直接保留 .php 路径，由 Webman 路由承接。
 Route::group('', function () {
-    Route::any('/submit', [EpayV1Controller::class, 'submit'])->name('epayV1Submit')->setParams(['real_name' => 'ePay V1 页面跳转支付']);
-    Route::post('/mapi', [EpayV1Controller::class, 'mapi'])->name('epayV1Mapi')->setParams(['real_name' => 'ePay V1 接口支付']);
-    Route::any('/api', [EpayV1Controller::class, 'api'])->name('epayV1Api')->setParams(['real_name' => 'ePay V1 标准 API']);
+    Route::any('/submit.php', [EpayV1Controller::class, 'submit'])->name('epayV1Submit')->setParams(['real_name' => 'ePay V1 页面跳转支付']);
+    Route::post('/mapi.php', [EpayV1Controller::class, 'mapi'])->name('epayV1Mapi')->setParams(['real_name' => 'ePay V1 接口支付']);
+    Route::any('/api.php', [EpayV1Controller::class, 'api'])->name('epayV1Api')->setParams(['real_name' => 'ePay V1 标准 API']);
 })->middleware([Cors::class]);
 
 // ePay V2 开放支付标准接口。

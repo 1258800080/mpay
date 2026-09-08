@@ -37,6 +37,7 @@ Route::group('/merapi', function () {
         // 会话与当前账号
         Route::post('/logout', [AuthController::class, 'logout'])->name('merchantApiAuthLogout')->setParams(['real_name' => '退出登录']);
         Route::get('/user/profile', [AuthController::class, 'profile'])->name('merchantApiUserProfile')->setParams(['real_name' => '当前登录账号']);
+        Route::get('/dashboard/overview', [MerchantPortalController::class, 'dashboardOverview'])->name('merchantApiDashboardOverview')->setParams(['real_name' => '商户工作台总览']);
 
         // 商户资料
         Route::group('/merchant', function () {
@@ -106,6 +107,7 @@ Route::group('/merapi', function () {
 
         // 交易订单
         Route::get('/pay-orders', [PayOrderController::class, 'index'])->name('merchantApiPayOrdersIndex')->setParams(['real_name' => '支付订单']);
+        Route::get('/pay-orders/{payNo}', [PayOrderController::class, 'show'])->name('merchantApiPayOrdersShow')->setParams(['real_name' => '支付订单详情']);
 
         Route::group('/refund-orders', function () {
             Route::get('', [RefundOrderController::class, 'index'])->name('merchantApiRefundOrdersIndex')->setParams(['real_name' => '退款订单']);

@@ -6,6 +6,7 @@ use app\common\base\BaseService;
 use app\common\constant\CommonConstant;
 use app\common\constant\NotifyConstant;
 use app\common\constant\PaymentExceptionConstant;
+use app\common\constant\TradeConstant;
 use app\exception\ResourceNotFoundException;
 use app\exception\ValidationException;
 use app\model\payment\PayOrder;
@@ -101,6 +102,10 @@ class PayOrderQueryService extends BaseService
             $query->where('po.merchant_id', $merchantFilter);
         }
 
+        if (($channelId = (int) ($filters['channel_id'] ?? 0)) > 0) {
+            $query->where('po.channel_id', $channelId);
+        }
+
         if (($payTypeId = (int) ($filters['pay_type_id'] ?? 0)) > 0) {
             $query->where('po.pay_type_id', $payTypeId);
         }
@@ -115,6 +120,23 @@ class PayOrderQueryService extends BaseService
 
         if (array_key_exists('callback_status', $filters) && $filters['callback_status'] !== '') {
             $query->where('po.callback_status', (int) $filters['callback_status']);
+        }
+
+        if (!empty($filters['abnormal'])) {
+            $query->whereIn('po.status', [
+                TradeConstant::ORDER_STATUS_FAILED,
+                TradeConstant::ORDER_STATUS_TIMEOUT,
+            ]);
+        }
+
+        $startTime = trim((string) ($filters['start_time'] ?? ''));
+        if ($startTime !== '') {
+            $query->where('po.created_at', '>=', $startTime);
+        }
+
+        $endTime = trim((string) ($filters['end_time'] ?? ''));
+        if ($endTime !== '') {
+            $query->where('po.created_at', '<', $endTime);
         }
 
         if (!empty($filters['late_duplicate'])) {
@@ -173,7 +195,7 @@ class PayOrderQueryService extends BaseService
      * @param string $payNo 支付单号
      * @param int|null $merchantId 商户ID
      * @param bool $includeActions 是否返回后台可操作项
-     * @return array{pay_order: PayOrder, biz_order: \app\model\payment\BizOrder|null, pay_order_view: array<string, mixed>|null, timeline: array<int, array<string, mixed>>, account_ledgers: iterable, account_ledgers_view: array<int, array<string, mixed>>, notify_tasks: array<int, array<string, mixed>>, callback_logs: array<int, array<string, mixed>>} 支付详情结构
+     * @return array{pay_order: PayOrder, biz_order: \app\model\payment\BizOrder|null, pay_order_view: array<string, mixed>|null, timeline: array<int, array<string, mixed>>, account_ledgers: iterable, account_ledgers_view: array<int, array<string, mixed>>, notify_tasks: array<int, array<string, mixed>>, callback_logs: array<int, array<string, mixed>>, related_refunds: array<int, array<string, mixed>>, related_settlements: array<int, array<string, mixed>>} 支付详情结构
      * @throws ValidationException
      * @throws ResourceNotFoundException
      */
@@ -198,6 +220,8 @@ class PayOrderQueryService extends BaseService
         $detailRow = $this->buildPayOrderQuery($merchantId, $includeActions)
             ->where('po.pay_no', $payNo)
             ->first();
+        $refundOrders = $this->loadRefundOrders($payOrder);
+        $settlementOrders = $this->loadSettlementOrders($payOrder);
         $accountLedgers = $this->loadPayLedgers($payOrder);
         $accountLedgerRows = [];
         foreach ($accountLedgers as $ledger) {
@@ -210,8 +234,8 @@ class PayOrderQueryService extends BaseService
         $timeline = $this->payOrderReportService->buildTroubleshootingTimeline(
             $payOrder,
             $bizOrder,
-            $this->loadRefundOrders($payOrder),
-            $this->loadSettlementOrders($payOrder),
+            $refundOrders,
+            $settlementOrders,
             $accountLedgers->all(),
             $notifyTasks,
             $callbackLogs,
@@ -244,6 +268,8 @@ class PayOrderQueryService extends BaseService
             'account_ledgers_view' => $accountLedgerRows,
             'notify_tasks' => $notifyTasks,
             'callback_logs' => $callbackLogs,
+            'related_refunds' => $this->formatRelatedRefunds($refundOrders),
+            'related_settlements' => $this->formatRelatedSettlements($settlementOrders),
             'channel_query_logs' => $channelQueryLogs,
             'operation_logs' => $operationLogs,
         ];
@@ -270,6 +296,56 @@ class PayOrderQueryService extends BaseService
         }
 
         return $ledgers;
+    }
+
+    /**
+     * 格式化支付单关联退款摘要。
+     *
+     * 详情页只需要关联单号、状态、金额和时间，不暴露退款扩展配置。
+     *
+     * @param array<int, \app\model\payment\RefundOrder> $refundOrders 退款订单
+     * @return array<int, array<string, mixed>> 退款摘要
+     */
+    private function formatRelatedRefunds(array $refundOrders): array
+    {
+        $statusMap = TradeConstant::refundStatusMap();
+
+        return array_map(function ($refundOrder) use ($statusMap): array {
+            $status = (int) $refundOrder->status;
+
+            return [
+                'refund_no' => (string) $refundOrder->refund_no,
+                'merchant_refund_no' => (string) $refundOrder->merchant_refund_no,
+                'status' => $status,
+                'status_text' => (string) ($statusMap[$status] ?? '未知'),
+                'refund_amount_text' => $this->formatAmount((int) $refundOrder->refund_amount),
+                'created_at_text' => $this->formatDateTime($refundOrder->created_at, '—'),
+            ];
+        }, $refundOrders);
+    }
+
+    /**
+     * 格式化支付单关联结算摘要。
+     *
+     * @param array<int, \app\model\payment\SettlementOrder> $settlementOrders 结算订单
+     * @return array<int, array<string, mixed>> 结算摘要
+     */
+    private function formatRelatedSettlements(array $settlementOrders): array
+    {
+        $statusMap = TradeConstant::settlementStatusMap();
+
+        return array_map(function ($settlementOrder) use ($statusMap): array {
+            $status = (int) $settlementOrder->status;
+
+            return [
+                'settle_no' => (string) $settlementOrder->settle_no,
+                'status' => $status,
+                'status_text' => (string) ($statusMap[$status] ?? '未知'),
+                'gross_amount_text' => $this->formatAmount((int) $settlementOrder->gross_amount),
+                'net_amount_text' => $this->formatAmount((int) $settlementOrder->net_amount),
+                'created_at_text' => $this->formatDateTime($settlementOrder->created_at, '—'),
+            ];
+        }, $settlementOrders);
     }
 
     /**
@@ -392,6 +468,7 @@ class PayOrderQueryService extends BaseService
                 't.icon as pay_type_icon',
             ])
             ->selectRaw("COALESCE((SELECT ff.freeze_no FROM ma_merchant_fund_freeze ff WHERE ff.pay_no = po.pay_no AND ff.status = 1 AND ff.remaining_amount > 0 ORDER BY ff.id DESC LIMIT 1), '') AS freeze_no")
+            ->selectRaw("COALESCE((SELECT nt.status FROM ma_notify_task nt WHERE nt.pay_no = po.pay_no ORDER BY nt.id DESC LIMIT 1), -1) AS merchant_notify_status")
             ->selectRaw("COALESCE((SELECT ff.freeze_type FROM ma_merchant_fund_freeze ff WHERE ff.pay_no = po.pay_no AND ff.status = 1 AND ff.remaining_amount > 0 ORDER BY ff.id DESC LIMIT 1), 0) AS freeze_type")
             ->selectRaw("COALESCE((SELECT ff.remaining_amount FROM ma_merchant_fund_freeze ff WHERE ff.pay_no = po.pay_no AND ff.status = 1 AND ff.remaining_amount > 0 ORDER BY ff.id DESC LIMIT 1), 0) AS freeze_remaining_amount")
             ->selectRaw("COALESCE((SELECT ff.reason FROM ma_merchant_fund_freeze ff WHERE ff.pay_no = po.pay_no AND ff.status = 1 AND ff.remaining_amount > 0 ORDER BY ff.id DESC LIMIT 1), '') AS freeze_reason")

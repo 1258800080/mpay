@@ -3,6 +3,7 @@
 namespace app\service\install;
 
 use app\common\base\BaseService;
+use app\common\util\EpayPlatformKeyFile;
 use app\common\util\RsaKeyPairGenerator;
 use RuntimeException;
 
@@ -35,13 +36,18 @@ class KeyGeneratorService extends BaseService
     /**
      * 写入 ePay 平台 RSA 密钥文件。
      *
+     * Docker 安装通过 EPAY_PLATFORM_KEY_DIR 指向持久化配置目录；源码安装未配置
+     * 该变量时仍写入项目根目录。安装完成后需重启后端，让 config() 加载新密钥。
+     *
      * @param bool $overwrite 是否覆盖已有密钥
      * @return array{private: string, public: string, created: bool} 写入结果
+     * @throws RuntimeException 密钥目录或 PEM 文件无法写入时抛出
      */
     public function writePlatformKeys(bool $overwrite = false): array
     {
-        $privatePath = base_path(false) . DIRECTORY_SEPARATOR . 'epay-platform-private.pem';
-        $publicPath = base_path(false) . DIRECTORY_SEPARATOR . 'epay-platform-public.pem';
+        EpayPlatformKeyFile::ensureDirectory();
+        $privatePath = EpayPlatformKeyFile::privatePath();
+        $publicPath = EpayPlatformKeyFile::publicPath();
 
         if (!$overwrite && is_file($privatePath) && is_file($publicPath)) {
             return ['private' => $privatePath, 'public' => $publicPath, 'created' => false];
@@ -54,6 +60,8 @@ class KeyGeneratorService extends BaseService
         if (file_put_contents($publicPath, $pair['public_key'] . PHP_EOL, LOCK_EX) === false) {
             throw new RuntimeException('写入平台公钥失败');
         }
+        @chmod($privatePath, 0600);
+        @chmod($publicPath, 0644);
 
         return ['private' => $privatePath, 'public' => $publicPath, 'created' => true];
     }

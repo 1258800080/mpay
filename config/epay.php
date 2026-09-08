@@ -1,7 +1,6 @@
 <?php
 
-$platformPrivateKeyPath = base_path(false) . DIRECTORY_SEPARATOR . 'epay-platform-private.pem';
-$platformPublicKeyPath = base_path(false) . DIRECTORY_SEPARATOR . 'epay-platform-public.pem';
+use app\common\util\EpayPlatformKeyFile;
 
 return [
     'charset' => 'UTF-8',
@@ -12,7 +11,7 @@ return [
         'sign_type' => 'RSA',
         'timestamp_ttl' => 300,
         'transfer_rate' => '0.01',
-        'platform_private_key' => is_file($platformPrivateKeyPath) ? trim((string) file_get_contents($platformPrivateKeyPath)) : '',
-        'platform_public_key' => is_file($platformPublicKeyPath) ? trim((string) file_get_contents($platformPublicKeyPath)) : '',
+        'platform_private_key' => EpayPlatformKeyFile::privateKey(),
+        'platform_public_key' => EpayPlatformKeyFile::publicKey(),
     ],
 ];

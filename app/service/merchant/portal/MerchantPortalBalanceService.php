@@ -3,6 +3,8 @@
 namespace app\service\merchant\portal;
 
 use app\common\base\BaseService;
+use app\common\constant\FundFreezeConstant;
+use app\repository\account\funds\MerchantPortalFundsRepository;
 use app\service\account\funds\MerchantAccountService;
 use app\service\account\ledger\MerchantAccountLedgerService;
 
@@ -23,11 +25,13 @@ class MerchantPortalBalanceService extends BaseService
      * @param MerchantPortalSupportService $supportService 支持服务
      * @param MerchantAccountService $merchantAccountService 商户账户服务
      * @param MerchantAccountLedgerService $merchantAccountLedgerService 商户账户流水服务
+     * @param MerchantPortalFundsRepository $fundsRepository 商户资金摘要仓库
      */
     public function __construct(
         protected MerchantPortalSupportService $supportService,
         protected MerchantAccountService $merchantAccountService,
-        protected MerchantAccountLedgerService $merchantAccountLedgerService
+        protected MerchantAccountLedgerService $merchantAccountLedgerService,
+        protected MerchantPortalFundsRepository $fundsRepository
     ) {
     }
 
@@ -45,10 +49,27 @@ class MerchantPortalBalanceService extends BaseService
         $snapshot['available_balance_text'] = $this->formatAmount((int) ($snapshot['available_balance'] ?? 0));
         $snapshot['frozen_balance_text'] = $this->formatAmount((int) ($snapshot['frozen_balance'] ?? 0));
         $snapshot['withdrawable_balance_text'] = $snapshot['available_balance_text'];
+        $summary = $this->fundsRepository->cumulativeSummary($merchantId);
+        foreach (['credited_amount', 'refund_amount', 'service_fee_amount', 'pending_settlement_amount'] as $key) {
+            $summary[$key . '_text'] = $this->formatAmount((int) ($summary[$key] ?? 0));
+        }
+        $activeFreezes = $this->fundsRepository->activeFreezes($merchantId)->map(function ($row): array {
+            return [
+                'id' => (int) $row->id,
+                'freeze_no' => (string) $row->freeze_no,
+                'pay_no' => (string) ($row->pay_no ?? ''),
+                'freeze_type_text' => FundFreezeConstant::typeMap()[(int) $row->freeze_type] ?? '未知',
+                'remaining_amount_text' => $this->formatAmount((int) $row->remaining_amount),
+                'reason' => (string) ($row->reason ?? ''),
+                'frozen_at_text' => $this->formatDateTime($row->frozen_at ?? null, '—'),
+            ];
+        })->values()->all();
 
         return [
             'merchant' => $merchant,
             'snapshot' => $snapshot,
+            'summary' => $summary,
+            'active_freezes' => $activeFreezes,
         ];
     }
 

@@ -69,6 +69,16 @@ class MerchantFundFreezeService extends BaseService
             $query->where('f.status', (int) $status);
         }
 
+        $startTime = trim((string) ($filters['start_time'] ?? ''));
+        if ($startTime !== '') {
+            $query->where('f.created_at', '>=', $startTime);
+        }
+
+        $endTime = trim((string) ($filters['end_time'] ?? ''));
+        if ($endTime !== '') {
+            $query->where('f.created_at', '<', $endTime);
+        }
+
         $paginator = $query
             ->orderByDesc('f.id')
             ->paginate(max(1, $pageSize), ['*'], 'page', max(1, $page));

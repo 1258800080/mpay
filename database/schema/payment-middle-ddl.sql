@@ -369,7 +369,8 @@ CREATE TABLE IF NOT EXISTS `ma_pay_order` (
   KEY `idx_channel_request_no` (`channel_request_no`),
   KEY `idx_channel_trade_no` (`channel_trade_no`),
   KEY `idx_channel_id_status` (`channel_id`, `status`),
-  KEY `idx_poll_group_id` (`poll_group_id`)
+  KEY `idx_poll_group_id` (`poll_group_id`),
+  KEY `idx_created_id` (`created_at`, `id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='支付单表';
 
 CREATE TABLE IF NOT EXISTS `ma_refund_order` (
@@ -414,7 +415,8 @@ CREATE TABLE IF NOT EXISTS `ma_refund_order` (
   KEY `idx_channel_refund_no` (`channel_refund_no`),
   KEY `idx_channel_request_no` (`channel_request_no`),
   KEY `idx_pay_no` (`pay_no`),
-  KEY `idx_account_reverse` (`account_reverse_status`, `account_reverse_due_amount`, `id`)
+  KEY `idx_account_reverse` (`account_reverse_status`, `account_reverse_due_amount`, `id`),
+  KEY `idx_created_id` (`created_at`, `id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='退款单表';
 
 CREATE TABLE IF NOT EXISTS `ma_transfer_order` (
@@ -543,7 +545,9 @@ CREATE TABLE IF NOT EXISTS `ma_merchant_fund_freeze` (
   UNIQUE KEY `uk_freeze_no` (`freeze_no`),
   KEY `idx_pay_status` (`pay_no`, `status`),
   KEY `idx_merchant_status_available` (`merchant_id`, `status`, `available_at`),
-  KEY `idx_trace_no` (`trace_no`)
+  KEY `idx_trace_no` (`trace_no`),
+  KEY `idx_merchant_created` (`merchant_id`, `created_at`, `id`),
+  KEY `idx_created_id` (`created_at`, `id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='商户资金冻结明细表';
 
 CREATE TABLE IF NOT EXISTS `ma_merchant_account_ledger` (
@@ -566,7 +570,9 @@ CREATE TABLE IF NOT EXISTS `ma_merchant_account_ledger` (
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_idempotency_key` (`idempotency_key`),
   KEY `idx_trace_no` (`trace_no`),
-  KEY `idx_merchant_biz` (`merchant_id`, `biz_type`, `biz_no`)
+  KEY `idx_merchant_biz` (`merchant_id`, `biz_type`, `biz_no`),
+  KEY `idx_merchant_created` (`merchant_id`, `created_at`, `id`),
+  KEY `idx_created_id` (`created_at`, `id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='商户余额流水表';
 
 CREATE TABLE IF NOT EXISTS `ma_settlement_order` (
@@ -597,7 +603,8 @@ CREATE TABLE IF NOT EXISTS `ma_settlement_order` (
   UNIQUE KEY `uk_cycle` (`merchant_id`, `channel_id`, `cycle_type`, `cycle_key`),
   UNIQUE KEY `uk_settle_no` (`settle_no`),
   KEY `idx_trace_no` (`trace_no`),
-  KEY `idx_merchant_status_created` (`merchant_id`, `status`, `created_at`)
+  KEY `idx_merchant_status_created` (`merchant_id`, `status`, `created_at`),
+  KEY `idx_created_id` (`created_at`, `id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='清算单表';
 
 CREATE TABLE IF NOT EXISTS `ma_settlement_item` (
@@ -662,7 +669,8 @@ CREATE TABLE IF NOT EXISTS `ma_pay_callback_log` (
   KEY `idx_channel_created` (`channel_id`, `created_at`),
   KEY `idx_callback_type` (`callback_type`),
   KEY `idx_request_hash` (`request_hash`),
-  KEY `idx_verify_status` (`verify_status`)
+  KEY `idx_verify_status` (`verify_status`),
+  KEY `idx_process_created` (`process_status`, `created_at`, `id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='支付回调日志表';
 
 CREATE TABLE IF NOT EXISTS `ma_pay_order_operation_log` (
@@ -726,7 +734,8 @@ CREATE TABLE IF NOT EXISTS `ma_notify_task` (
   UNIQUE KEY `uk_event_ref` (`event_type`, `ref_no`),
   KEY `idx_pay_no` (`pay_no`),
   KEY `idx_status_retry` (`status`, `next_retry_at`),
-  KEY `idx_merchant_group` (`merchant_id`, `merchant_group_id`)
+  KEY `idx_merchant_group` (`merchant_id`, `merchant_group_id`),
+  KEY `idx_status_created` (`status`, `created_at`, `id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='商户通知任务表';
 
 CREATE TABLE IF NOT EXISTS `ma_system_config` (

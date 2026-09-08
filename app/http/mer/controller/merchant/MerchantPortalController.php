@@ -29,6 +29,22 @@ class MerchantPortalController extends BaseController
     }
 
     /**
+     * 当前商户业务工作台总览。
+     *
+     * @param Request $request 请求对象
+     * @return Response 响应对象
+     */
+    public function dashboardOverview(Request $request): Response
+    {
+        $merchantId = $this->currentMerchantId($request);
+        if ($merchantId <= 0) {
+            return $this->fail('登录上下文异常，请刷新后重试');
+        }
+
+        return $this->success($this->merchantPortalService->dashboardOverview($merchantId));
+    }
+
+    /**
      * 当前商户资料。
      *
      * @param Request $request 请求对象

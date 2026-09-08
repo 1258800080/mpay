@@ -6,6 +6,7 @@ use app\common\base\BaseService;
 use app\common\constant\NotifyConstant;
 use app\common\constant\TradeConstant;
 use app\repository\ops\dashboard\AdminDashboardRepository;
+use app\service\ops\exception\PaymentExceptionQueryService;
 
 /**
  * 管理后台运营首页聚合服务。
@@ -18,10 +19,12 @@ class AdminDashboardService extends BaseService
      * 构造方法。
      *
      * @param AdminDashboardRepository $adminDashboardRepository 运营首页查询仓库
+     * @param PaymentExceptionQueryService $paymentExceptionQueryService 异常中心查询服务
      * @return void
      */
     public function __construct(
-        protected AdminDashboardRepository $adminDashboardRepository
+        protected AdminDashboardRepository $adminDashboardRepository,
+        protected PaymentExceptionQueryService $paymentExceptionQueryService
     ) {
     }
 
@@ -42,19 +45,69 @@ class AdminDashboardService extends BaseService
         $notifySummary = $this->adminDashboardRepository->notifySummary();
         $callbackSummary = $this->adminDashboardRepository->callbackSummary($todayStart, $todayEnd);
         $channelSummary = $this->adminDashboardRepository->channelSummary($today);
+        $tasks = $this->tasks($todayPay, $pendingSettlement, $notifySummary, $callbackSummary, $channelSummary);
+        $alerts = $this->alerts($todayStart, $todayEnd, $today);
+        $exceptionSummary = $this->paymentExceptionQueryService->attentionSummary();
 
         return [
             'generated_at' => $this->formatDateTime($this->now()),
             'stat_date' => $today,
             'metrics' => $this->metrics($todayPay, $todayRefund, $pendingSettlement, $notifySummary, $callbackSummary, $channelSummary),
             'health' => $this->health($todayPay, $notifySummary, $callbackSummary, $channelSummary),
-            'tasks' => $this->tasks($todayPay, $pendingSettlement, $notifySummary, $callbackSummary, $channelSummary),
-            'alerts' => $this->alerts($todayStart, $todayEnd, $today),
+            'work_items' => $this->workItems($tasks, $alerts, $exceptionSummary),
+            'attention_summary' => $exceptionSummary,
             'pay_trend' => $this->payTrend(7),
             'pay_type_share' => $this->payTypeShare($todayStart, $todayEnd),
             'abnormal_channels' => $this->abnormalChannels($today),
             'recent_orders' => $this->recentOrders(),
         ];
+    }
+
+    /**
+     * 合并并去重首页待办，避免同一通知或回调问题在多个区域重复出现。
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    private function workItems(array $tasks, array $alerts, array $exceptionSummary): array
+    {
+        $items = [];
+        foreach (array_merge($tasks, $alerts) as $item) {
+            $key = (string) ($item['key'] ?? '');
+            if ($key === '' || (int) ($item['count'] ?? 0) <= 0) {
+                continue;
+            }
+            if (!isset($items[$key]) || (int) $item['count'] > (int) $items[$key]['count']) {
+                $items[$key] = $item;
+            }
+        }
+
+        $items['payment_exception'] = [
+            'key' => 'payment_exception',
+            'title' => '待处理业务异常',
+            'count' => (int) ($exceptionSummary['open_exception_count'] ?? 0),
+            'description' => '需要运营继续处置的支付业务异常。',
+            'path' => '/transaction/exception-center',
+            'query' => ['tab' => 'exception'],
+            'tone' => 'danger',
+        ];
+        $items['recovery_suspended'] = [
+            'key' => 'recovery_suspended',
+            'title' => '已暂停恢复任务',
+            'count' => (int) ($exceptionSummary['suspended_recovery_count'] ?? 0),
+            'description' => '达到重试上限并暂停自动调度的可靠恢复任务。',
+            'path' => '/transaction/exception-center',
+            'query' => ['tab' => 'recovery', 'status' => 3],
+            'tone' => 'danger',
+        ];
+
+        $items = array_values(array_filter($items, static fn (array $item): bool => (int) ($item['count'] ?? 0) > 0));
+        $weights = ['danger' => 0, 'warning' => 1, 'primary' => 2, 'success' => 3];
+        usort($items, static function (array $left, array $right) use ($weights): int {
+            $toneOrder = ($weights[$left['tone'] ?? 'primary'] ?? 2) <=> ($weights[$right['tone'] ?? 'primary'] ?? 2);
+            return $toneOrder !== 0 ? $toneOrder : ((int) ($right['count'] ?? 0) <=> (int) ($left['count'] ?? 0));
+        });
+
+        return $items;
     }
 
     /**
@@ -96,18 +149,16 @@ class AdminDashboardService extends BaseService
      */
     private function health(array $pay, array $notify, array $callback, array $channel): array
     {
-        $successRate = $pay['total_count'] > 0 ? $pay['success_count'] * 100 / $pay['total_count'] : 100;
-        $score = 100;
-        $score -= max(0, (int) ceil((95 - $successRate) * 2));
-        $score -= min(20, $notify['failed_count'] * 2);
-        $score -= min(15, $callback['failed_count'] * 3);
-        $score -= min(20, $channel['abnormal_count'] * 5);
-        $score = max(0, min(100, $score));
+        $successRateBp = $pay['total_count'] > 0
+            ? (int) floor($pay['success_count'] * 10000 / $pay['total_count'])
+            : 10000;
+        $hasError = $notify['failed_count'] > 0 || $callback['failed_count'] > 0 || $channel['abnormal_count'] > 0;
+        $needsAttention = $hasError || ($pay['total_count'] > 0 && $successRateBp < 9500);
 
         return [
-            'score' => $score,
-            'score_text' => number_format($score, 0),
-            'status_text' => $score >= 90 ? '稳定' : ($score >= 70 ? '关注' : '异常'),
+            'status' => $hasError ? 'error' : ($needsAttention ? 'attention' : 'normal'),
+            'status_text' => $hasError ? '异常' : ($needsAttention ? '关注' : '正常'),
+            'tone' => $hasError ? 'danger' : ($needsAttention ? 'warning' : 'success'),
             'enabled_channel_count' => $channel['enabled_count'],
             'total_channel_count' => $channel['total_count'],
             'enabled_channel_text' => $channel['enabled_count'] . ' / ' . $channel['total_count'],
@@ -126,11 +177,14 @@ class AdminDashboardService extends BaseService
      */
     private function tasks(array $pay, array $settlement, array $notify, array $callback, array $channel): array
     {
+        $todayStart = date('Y-m-d 00:00:00');
+        $todayEnd = date('Y-m-d 00:00:00', strtotime($todayStart . ' +1 day'));
+
         return [
             ['key' => 'notify_failed', 'title' => '失败通知', 'count' => $notify['failed_count'], 'description' => '商户通知投递失败，需要重试或排查商户响应', 'path' => '/transaction/merchant-notify-task', 'query' => ['status' => NotifyConstant::TASK_STATUS_FAILED], 'tone' => $notify['failed_count'] > 0 ? 'danger' : 'success'],
             ['key' => 'settlement_pending', 'title' => '待清算', 'count' => $settlement['pending_count'], 'description' => '待入账或待人工处理的清算单', 'path' => '/transaction/settlement-order', 'query' => ['status' => TradeConstant::SETTLEMENT_STATUS_PENDING], 'tone' => $settlement['pending_count'] > 0 ? 'warning' : 'success'],
-            ['key' => 'abnormal_order', 'title' => '异常订单', 'count' => $pay['abnormal_count'], 'description' => '今日失败或超时支付单', 'path' => '/transaction/pay-order', 'query' => [], 'tone' => $pay['abnormal_count'] > 0 ? 'danger' : 'success'],
-            ['key' => 'callback_failed', 'title' => '回调失败', 'count' => $callback['failed_count'], 'description' => '今日上游回调验签或处理失败', 'path' => '/transaction/callback-log', 'query' => ['process_status' => NotifyConstant::PROCESS_STATUS_FAILED], 'tone' => $callback['failed_count'] > 0 ? 'danger' : 'success'],
+            ['key' => 'abnormal_order', 'title' => '异常订单', 'count' => $pay['abnormal_count'], 'description' => '今日失败或超时支付单', 'path' => '/transaction/pay-order', 'query' => ['abnormal' => 1, 'start_time' => $todayStart, 'end_time' => $todayEnd], 'tone' => $pay['abnormal_count'] > 0 ? 'danger' : 'success'],
+            ['key' => 'callback_failed', 'title' => '回调失败', 'count' => $callback['failed_count'], 'description' => '今日上游回调验签或处理失败', 'path' => '/transaction/callback-log', 'query' => ['process_status' => NotifyConstant::PROCESS_STATUS_FAILED, 'start_time' => $todayStart, 'end_time' => $todayEnd], 'tone' => $callback['failed_count'] > 0 ? 'danger' : 'success'],
             ['key' => 'channel_abnormal', 'title' => '通道健康告警', 'count' => $channel['abnormal_count'], 'description' => '今日通道失败、耗时或限额异常', 'path' => '/channel/channel-monitor', 'query' => [], 'tone' => $channel['abnormal_count'] > 0 ? 'danger' : 'success'],
         ];
     }
@@ -320,6 +374,7 @@ class AdminDashboardService extends BaseService
                 'total_count' => (int) ($row->total_count ?? 0),
                 'success_count' => (int) ($row->success_count ?? 0),
                 'pay_amount' => $amount,
+                'pay_amount_yuan' => round($amount / 100, 2),
                 'pay_amount_text' => $this->formatAmount($amount),
             ];
         }
@@ -347,6 +402,7 @@ class AdminDashboardService extends BaseService
                 'name' => (string) ($row->name ?? '未知方式'),
                 'count' => (int) ($row->count_value ?? 0),
                 'amount' => $amount,
+                'amount_yuan' => round($amount / 100, 2),
                 'amount_text' => $this->formatAmount($amount),
                 'rate_bp' => $rateBp,
                 'rate_text' => $this->formatRate($rateBp),

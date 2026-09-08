@@ -23,6 +23,9 @@ class RefundOrderValidator extends Validator
         'pay_type_id' => 'sometimes|integer|min:1',
         'status' => 'sometimes|integer|in:0,1,2,3,4',
         'channel_mode' => 'sometimes|integer|in:0,1',
+        'channel_id' => 'sometimes|integer|min:1',
+        'start_time' => 'sometimes|date_format:Y-m-d H:i:s',
+        'end_time' => 'sometimes|date_format:Y-m-d H:i:s',
         'page' => 'sometimes|integer|min:1',
         'page_size' => 'sometimes|integer|min:1|max:100',
     ];
@@ -49,7 +52,7 @@ class RefundOrderValidator extends Validator
      * @var array
      */
     protected array $scenes = [
-        'index' => ['search_field', 'keyword', 'merchant_id', 'pay_type_id', 'status', 'channel_mode', 'page', 'page_size'],
+        'index' => ['search_field', 'keyword', 'merchant_id', 'channel_id', 'pay_type_id', 'status', 'channel_mode', 'start_time', 'end_time', 'page', 'page_size'],
     ];
 }
 
