@@ -2,7 +2,7 @@ FROM webdevops/php-nginx:8.2-alpine
 
 WORKDIR /app
 
-# 安装系统依赖和PHP扩展（包含Webman必需的pcntl、posix、event）
+# 安装系统依赖和PHP扩展（含Webman必需的pcntl、posix、event）
 RUN apk add --no-cache freetype libpng libjpeg-turbo freetype-dev libpng-dev libjpeg-turbo-dev libevent-dev \
     && docker-php-ext-configure gd --with-freetype --with-jpeg \
     && docker-php-ext-install -j$(nproc) gd pdo pdo_mysql bcmath opcache pcntl posix \
@@ -12,7 +12,7 @@ COPY . /app
 
 RUN mkdir -p /app/storage /app/bootstrap/cache && chmod -R 777 /app/storage /app/bootstrap/cache
 
-# Nginx反向代理到Webman默认8787端口
+# 配置Nginx反向代理到Webman默认8787端口
 RUN cat > /etc/nginx/nginx.conf << 'EOF'
 worker_processes auto;
 error_log /var/log/nginx/error.log warn;
@@ -43,10 +43,13 @@ http {
 }
 EOF
 
-# 启动脚本：后台运行Webman，前台运行Nginx保持容器存活
-RUN echo '#!/bin/sh
+# 生成启动脚本：后台启动Webman，前台运行Nginx保持容器存活
+RUN cat > /start.sh << 'EOF'
+#!/bin/sh
 php /app/start.php start -d
-nginx -g "daemon off;"' > /start.sh && chmod +x /start.sh
+nginx -g "daemon off;"
+EOF
+RUN chmod +x /start.sh
 
 ENV PHP_MEMORY_LIMIT=256M
 
