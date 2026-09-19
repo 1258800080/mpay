@@ -2,11 +2,10 @@ FROM webdevops/php-nginx:8.2-alpine
 
 WORKDIR /app
 
-# 安装系统依赖和PHP扩展（含Webman必需的pcntl、posix、event）
-RUN apk add --no-cache freetype libpng libjpeg-turbo freetype-dev libpng-dev libjpeg-turbo-dev libevent-dev \
+# 安装系统依赖和PHP基础扩展（Webman必需的pcntl、posix）
+RUN apk add --no-cache freetype libpng libjpeg-turbo freetype-dev libpng-dev libjpeg-turbo-dev \
     && docker-php-ext-configure gd --with-freetype --with-jpeg \
-    && docker-php-ext-install -j$(nproc) gd pdo pdo_mysql bcmath opcache pcntl posix \
-    && pecl install event && docker-php-ext-enable event
+    && docker-php-ext-install -j$(nproc) gd pdo pdo_mysql bcmath opcache pcntl posix
 
 COPY . /app
 
@@ -43,7 +42,7 @@ http {
 }
 EOF
 
-# 生成启动脚本：后台启动Webman，前台运行Nginx保持容器存活
+# 生成启动脚本
 RUN cat > /start.sh << 'EOF'
 #!/bin/sh
 php /app/start.php start -d
