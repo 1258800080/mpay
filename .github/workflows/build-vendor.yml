@@ -1,0 +1,33 @@
+name: Build Vendor Dependencies
+
+on:
+  push:
+    branches: [ master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup PHP 8.2
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: gd, pdo, pdo_mysql, bcmath, opcache
+          tools: composer:v2
+
+      - name: 配置阿里云镜像加速
+        run: composer config -g repo.packagist composer https://mirrors.aliyun.com/composer/
+
+      - name: 安装依赖
+        run: composer install --optimize-autoloader --no-dev --no-interaction --ignore-platform-reqs
+
+      - name: 提交vendor到仓库
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f vendor/
+          git commit -m "Auto build vendor dependencies" || echo "No vendor changes"
+          git push
