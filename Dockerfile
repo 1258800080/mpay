@@ -8,7 +8,8 @@ RUN apk add --no-cache freetype libpng libjpeg-turbo freetype-dev libpng-dev lib
 
 COPY . /app
 
-RUN chmod -R 777 /app/storage /app/bootstrap/cache
+# 先确保目录存在，再设置权限
+RUN mkdir -p /app/storage /app/bootstrap/cache && chmod -R 777 /app/storage /app/bootstrap/cache
 
 ENV WEB_DOCUMENT_ROOT=/app/public
 ENV PHP_MEMORY_LIMIT=256M
