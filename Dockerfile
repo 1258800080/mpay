@@ -15,10 +15,15 @@ RUN apk add --no-cache \
     php82-fileinfo \
     php82-session \
     php82-curl \
-    php82-redis
+    php82-redis \
+    composer
 
 WORKDIR /app
 COPY . /app
+
+# 阿里云镜像加速安装依赖，忽略平台校验
+RUN composer config -g repo.packagist composer https://mirrors.aliyun.com/composer/ \
+    && composer install --optimize-autoloader --no-dev --no-interaction --ignore-platform-reqs
 
 RUN mkdir -p /app/runtime /app/public/install && chmod -R 777 /app/runtime /app/config /app/public
 
